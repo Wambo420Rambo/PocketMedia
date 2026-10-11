@@ -115,6 +115,8 @@ pub struct PopupState {
     pub focus_visible: bool,
     /// Highlighted row while the Recently used / All media list is open.
     pub dropdown: Option<usize>,
+    /// Result line shown in the footer after an import, until the popup reopens.
+    pub status: Option<String>,
 }
 
 impl PopupState {
@@ -130,6 +132,7 @@ impl PopupState {
             focus: Focus::Search,
             focus_visible: false,
             dropdown: None,
+            status: None,
         }
     }
 
@@ -168,6 +171,7 @@ impl PopupState {
     /// Fresh start each time the popup opens: empty search with focus, top of the list.
     /// The chosen list and type filter are kept.
     pub fn reset_for_open(&mut self) {
+        self.status = None;
         self.search.clear();
         self.focus = Focus::Search;
         self.focus_visible = false;
@@ -188,6 +192,17 @@ impl PopupState {
     pub fn set_list(&mut self, list: ListKind) {
         self.list = list;
         self.dropdown = None;
+        self.reset_view();
+    }
+
+    /// After an import: unfiltered All media from the top, so new items show first.
+    pub fn show_imported(&mut self, status: String) {
+        self.list = ListKind::All;
+        self.filter = TypeFilter::All;
+        self.search.clear();
+        self.dropdown = None;
+        self.focus = Focus::Search;
+        self.status = Some(status);
         self.reset_view();
     }
 

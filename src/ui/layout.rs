@@ -63,19 +63,39 @@ pub enum TextStyle {
     Tiny,
     /// 16px medium: empty-state heading.
     Heading,
+    /// 21px medium: panel titles ("Add media", "Review files").
+    Title,
+    /// 13px: names in the import review.
+    Row,
 }
 
 impl TextStyle {
+    pub const ALL: [TextStyle; 7] = [
+        TextStyle::Medium,
+        TextStyle::Body,
+        TextStyle::Small,
+        TextStyle::Tiny,
+        TextStyle::Heading,
+        TextStyle::Title,
+        TextStyle::Row,
+    ];
+
     pub fn size(self) -> f32 {
         match self {
             TextStyle::Medium | TextStyle::Body => 14.0,
             TextStyle::Small => 12.0,
             TextStyle::Tiny => 11.0,
             TextStyle::Heading => 16.0,
+            TextStyle::Title => 21.0,
+            TextStyle::Row => 13.0,
         }
     }
     pub fn medium(self) -> bool {
-        matches!(self, TextStyle::Medium | TextStyle::Heading)
+        matches!(self, TextStyle::Medium | TextStyle::Heading | TextStyle::Title)
+    }
+    /// CSS line box height (line-height 1.45).
+    pub fn line(self) -> f32 {
+        self.size() * 1.45
     }
 }
 

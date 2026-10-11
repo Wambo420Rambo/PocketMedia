@@ -9,15 +9,16 @@ use windows::Win32::Graphics::Direct2D::Common::{
 use windows::Win32::Graphics::Direct2D::{
     D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_FACTORY_TYPE_SINGLE_THREADED,
     D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES,
-    D2D1_ROUNDED_RECT, D2D1CreateFactory, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1SolidColorBrush,
+    D2D1_DASH_STYLE_CUSTOM, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ROUNDED_RECT, D2D1_STROKE_STYLE_PROPERTIES,
+    D2D1CreateFactory, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1SolidColorBrush, ID2D1StrokeStyle,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
     DWRITE_FONT_WEIGHT_MEDIUM, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_HIT_TEST_METRICS,
     DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_NEAR, DWRITE_TEXT_ALIGNMENT,
-    DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING,
+    DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING,
     DWRITE_TEXT_METRICS, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
-    DWRITE_WORD_WRAPPING_NO_WRAP, DWriteCreateFactory, IDWriteFactory, IDWriteInlineObject,
+    DWRITE_LINE_SPACING_METHOD_UNIFORM, DWRITE_WORD_WRAPPING_NO_WRAP, DWRITE_WORD_WRAPPING_WRAP, DWriteCreateFactory, IDWriteFactory, IDWriteInlineObject,
     DWRITE_FONT_AXIS_TAG_WEIGHT, DWRITE_FONT_AXIS_VALUE, IDWriteTextFormat, IDWriteTextFormat3, IDWriteTextLayout,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN;
@@ -47,6 +48,7 @@ impl Color {
 pub enum Align {
     Start,
     Center,
+    End,
 }
 
 impl Align {
@@ -54,9 +56,13 @@ impl Align {
         match self {
             Align::Start => DWRITE_TEXT_ALIGNMENT_LEADING,
             Align::Center => DWRITE_TEXT_ALIGNMENT_CENTER,
+            Align::End => DWRITE_TEXT_ALIGNMENT_TRAILING,
         }
     }
 }
+
+/// CSS line-height used by the wireframe (1.45) for wrapped text.
+const LINE_HEIGHT: f32 = 1.45;
 
 struct Format {
     style: TextStyle,
@@ -69,6 +75,8 @@ pub struct Gfx {
     factory: ID2D1Factory,
     dwrite: IDWriteFactory,
     formats: Vec<Format>,
+    /// 3px dash, 2px gap: the wireframe's 1px dashed border.
+    dashed: ID2D1StrokeStyle,
     target: Option<(ID2D1HwndRenderTarget, ID2D1SolidColorBrush)>,
 }
 
@@ -104,7 +112,7 @@ impl Gfx {
         let dwrite: IDWriteFactory = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)? };
         let family = font_family(&dwrite);
         let mut formats = Vec::new();
-        for style in [TextStyle::Medium, TextStyle::Body, TextStyle::Small, TextStyle::Tiny, TextStyle::Heading] {
+        for style in TextStyle::ALL {
             let weight = if style.medium() { DWRITE_FONT_WEIGHT_MEDIUM } else { DWRITE_FONT_WEIGHT_NORMAL };
             // SAFETY: valid HSTRINGs; sizes are positive constants.
             let format = unsafe {
@@ -127,7 +135,10 @@ impl Gfx {
             let ellipsis = unsafe { dwrite.CreateEllipsisTrimmingSign(&format)? };
             formats.push(Format { style, format, ellipsis });
         }
-        Ok(Self { factory, dwrite, formats, target: None })
+        let dash_props = D2D1_STROKE_STYLE_PROPERTIES { dashStyle: D2D1_DASH_STYLE_CUSTOM, ..Default::default() };
+        // SAFETY: plain property struct and a dash array that outlives the call.
+        let dashed = unsafe { factory.CreateStrokeStyle(&dash_props, Some(&[3.0, 2.0]))? };
+        Ok(Self { factory, dwrite, formats, dashed, target: None })
     }
 
     fn format(&self, style: TextStyle) -> &Format {
@@ -139,6 +150,29 @@ impl Gfx {
         let wide: Vec<u16> = text.encode_utf16().collect();
         // SAFETY: `wide` outlives the call; the format is live.
         unsafe { self.dwrite.CreateTextLayout(&wide, &self.format(style).format, max_w.max(0.0), max_h.max(0.0)) }.ok()
+    }
+
+    /// A word-wrapped layout `width` wide with the wireframe's 1.45 line height.
+    fn wrapped(&self, text: &str, style: TextStyle, width: f32) -> Option<IDWriteTextLayout> {
+        let layout = self.layout(text, style, width, 10_000.0)?;
+        let lh = style.size() * LINE_HEIGHT;
+        // SAFETY: layout is live; plain values.
+        unsafe {
+            layout.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP).ok()?;
+            layout.SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM, lh, lh * 0.8).ok()?;
+        }
+        Some(layout)
+    }
+
+    /// Height of `text` wrapped to `width` (lines x line height), in DIPs.
+    pub fn wrapped_height(&self, text: &str, style: TextStyle, width: f32) -> f32 {
+        let Some(layout) = self.wrapped(text, style, width) else { return 0.0 };
+        let mut m = DWRITE_TEXT_METRICS::default();
+        // SAFETY: out-pointer to a local struct.
+        match unsafe { layout.GetMetrics(&mut m) } {
+            Ok(()) => m.lineCount.max(1) as f32 * style.size() * LINE_HEIGHT,
+            Err(_) => style.size() * LINE_HEIGHT,
+        }
     }
 
     /// Advance width of `text` in DIPs.
@@ -294,6 +328,23 @@ impl Painter<'_> {
             let _ = layout.SetTrimming(&trimming, &f.ellipsis);
             self.target.DrawTextLayout(pt(r.x, r.y), &layout, self.brush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
         }
+    }
+
+    /// Word-wrapped text starting at (x, y), `width` wide.
+    pub fn text_wrapped(&self, s: &str, x: f32, y: f32, width: f32, style: TextStyle, c: Color) {
+        let Some(layout) = self.gfx.wrapped(s, style, width) else { return };
+        self.color(c);
+        // SAFETY: layout is live; called during a frame.
+        unsafe { self.target.DrawTextLayout(pt(x, y), &layout, self.brush, D2D1_DRAW_TEXT_OPTIONS_NONE) };
+    }
+
+    /// 1px dashed border inside `r` (CSS `border: 1px dashed`).
+    pub fn stroke_dashed(&self, r: Rect, radius: f32, c: Color) {
+        self.color(c);
+        let r = r.inset(0.5);
+        let rr = D2D1_ROUNDED_RECT { rect: rect_f(r), radiusX: radius - 0.5, radiusY: radius - 0.5 };
+        // SAFETY: called during a frame; the stroke style is owned by Gfx.
+        unsafe { self.target.DrawRoundedRectangle(&rr, self.brush, 1.0, &self.gfx.dashed) };
     }
 
     pub fn push_clip(&self, r: Rect) {

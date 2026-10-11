@@ -29,6 +29,7 @@ use windows::core::w;
 
 use crate::popup_state::{Focus, ListKind, PopupState, TypeFilter};
 use crate::target::{self, NoTarget, Target};
+use crate::ui::add_view::AddHit;
 use crate::ui::d2d::Gfx;
 use crate::ui::layout::{self, COLUMNS, Hit, HitView, Layout, TextStyle};
 use crate::ui::paint::{self, Ui};
@@ -39,8 +40,14 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 const EMPTY_ACTIONS: [&str; 3] = ["Clear filters", "Show all media", "Add media"];
 const WHEEL_STEP: f32 = 48.0;
 
+mod add;
+
 struct View {
     state: PopupState,
+    /// Add media panel, shown in place of the gallery while open.
+    add: Option<crate::add_media::AddMedia>,
+    add_hover: AddHit,
+    add_pressed: AddHit,
     gfx: Gfx,
     layout: Option<Layout>,
     dpi: u32,
@@ -115,6 +122,9 @@ pub fn create(instance: HINSTANCE) -> Result<(), String> {
     VIEW.with(|v| {
         *v.borrow_mut() = Some(View {
             state: PopupState::new(sample::items(), sample::recent()),
+            add: None,
+            add_hover: AddHit::None,
+            add_pressed: AddHit::None,
             gfx,
             layout: None,
             dpi: 96,
@@ -170,7 +180,11 @@ pub fn toggle_from_hotkey() {
 pub fn open(captured: Result<Target, NoTarget>) {
     paste::cancel();
     app(|a| *a.target.borrow_mut() = captured);
-    with_view(|v| v.state.reset_for_open());
+    with_view(|v| {
+        v.state.reset_for_open();
+        // The shortcut always opens the quick picker, never a half-finished import.
+        v.add = None;
+    });
     position_near_cursor();
     let h = hwnd();
     // SAFETY: our own window.
@@ -188,6 +202,8 @@ pub fn close(restore_focus: bool) {
     }
     with_view(|v| {
         v.state.dropdown = None;
+        v.add_hover = AddHit::None;
+        v.add_pressed = AddHit::None;
         v.hover = Hit::None;
         v.pressed = Hit::None;
         v.scroll_drag = None;
@@ -307,6 +323,9 @@ impl View {
     }
 
     fn paint(&mut self) {
+        if self.add.is_some() {
+            return self.add_paint();
+        }
         let (search_offset, caret_x, selection_w) = self.search_metrics();
         let plus_w = self.gfx.measure("+", TextStyle::Body);
         self.ensure_layout();
@@ -331,8 +350,9 @@ impl View {
         let s = &mut self.state;
         match hit {
             Hit::Close => return Effect::Close(true),
-            // Open manager and Add media are later phases.
-            Hit::OpenManager | Hit::AddMedia => {}
+            // Open manager is Phase 2b.
+            Hit::OpenManager => {}
+            Hit::AddMedia => self.open_add(),
             Hit::Chip(i) => s.set_filter(TypeFilter::ORDER[i]),
             Hit::List => s.dropdown = if s.dropdown.is_some() { None } else { Some(list_index(s.list)) },
             Hit::DropdownRow(i) => {
@@ -368,6 +388,9 @@ impl View {
     }
 
     fn mouse_down(&mut self, x: f32, y: f32, screen: POINT) -> Effect {
+        if self.add.is_some() {
+            return self.add_mouse_down(x, y);
+        }
         let hit = self.hit(x, y);
         if self.state.dropdown.is_some() && !matches!(hit, Hit::DropdownRow(_) | Hit::List) {
             self.state.dropdown = None; // a click outside only closes the list
@@ -403,6 +426,9 @@ impl View {
     }
 
     fn mouse_up(&mut self, x: f32, y: f32) -> Effect {
+        if self.add.is_some() {
+            return self.add_mouse_up(x, y);
+        }
         if self.scroll_drag.take().is_some() {
             return Effect::Capture(false);
         }
@@ -421,6 +447,9 @@ impl View {
     }
 
     fn mouse_move(&mut self, x: f32, y: f32) {
+        if self.add.is_some() {
+            return self.add_mouse_move(x, y);
+        }
         if let Some((start_y, start_scroll)) = self.scroll_drag {
             let n = self.state.visible().len();
             let l = self.ensure_layout();
@@ -433,12 +462,18 @@ impl View {
     }
 
     fn wheel(&mut self, delta: i16) {
+        if self.add.is_some() {
+            return self.add_wheel(delta);
+        }
         self.state.dropdown = None;
         self.state.scroll -= delta as f32 / 120.0 * WHEEL_STEP;
         self.clamp_scroll();
     }
 
     fn key(&mut self, vk: VIRTUAL_KEY, ctrl: bool, shift: bool, alt: bool) -> Effect {
+        if self.add.is_some() {
+            return self.add_key(vk, ctrl, shift);
+        }
         let s = &mut self.state;
         if let Some(row) = s.dropdown {
             match vk {
@@ -558,6 +593,9 @@ impl View {
             u if u < 0x20 || u == 0x7F => return, // control keys are handled in WM_KEYDOWN
             u => String::from_utf16_lossy(&[u]),
         };
+        if self.add.is_some() {
+            return self.add_insert(&text);
+        }
         // Typing while the gallery has focus goes to the search box.
         if matches!(self.state.focus, Focus::Search | Focus::Gallery) && self.state.dropdown.is_none() {
             self.state.focus = Focus::Search;
@@ -598,7 +636,13 @@ fn run(effect: Effect) {
         }
         Effect::PasteText => {
             if let Some(text) = clipboard_text() {
-                with_view(|v| v.search_edit(|f| f.insert(&text)));
+                with_view(|v| {
+                    if v.add.is_some() {
+                        v.add_insert(&text);
+                    } else {
+                        v.search_edit(|f| f.insert(&text));
+                    }
+                });
             }
         }
         Effect::Capture(true) => {
@@ -688,6 +732,7 @@ extern "system" fn popup_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
             with_view(|v| {
                 v.tracking_leave = false;
                 v.hover = Hit::None;
+                v.add_hover = AddHit::None;
             });
             Effect::None
         }
@@ -710,7 +755,7 @@ extern "system" fn popup_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
             with_view(|v| {
                 v.wheel(((wparam.0 >> 16) & 0xFFFF) as i16);
                 if let Some((x, y)) = cursor_dip(v) {
-                    v.hover = v.hit(x, y);
+                    v.mouse_move(x, y);
                 }
             });
             Effect::None
@@ -729,7 +774,11 @@ extern "system" fn popup_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
             Effect::None
         }
         WM_SETCURSOR if (lparam.0 & 0xFFFF) as u32 == HTCLIENT => {
-            let beam = with_view(|v| v.hover == Hit::Search).unwrap_or(false);
+            let beam = with_view(|v| match v.add {
+                Some(_) => matches!(v.add_hover, AddHit::RowInput(_)),
+                None => v.hover == Hit::Search,
+            })
+            .unwrap_or(false);
             // SAFETY: system cursors are shared resources; no ownership.
             unsafe {
                 if let Ok(c) = LoadCursorW(None, if beam { IDC_IBEAM } else { IDC_ARROW }) {
@@ -771,10 +820,25 @@ extern "system" fn popup_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
 
 // ---------------------------------------------------------------- self-test hooks
 
+/// A popup element the self-test can point at.
+#[derive(Clone, Copy, Debug)]
+pub enum TestTarget {
+    Gallery(Hit),
+    Add(AddHit),
+}
+
 /// Screen-space centre of a popup element, for the self-test to click.
-pub fn element_center(element: Hit) -> Option<POINT> {
+pub fn element_center(target: TestTarget) -> Option<POINT> {
     let h = hwnd();
     with_view(|v| {
+        let element = match target {
+            TestTarget::Gallery(hit) if v.add.is_none() => hit,
+            TestTarget::Add(hit) => {
+                let r = v.add_element(hit)?;
+                return Some(to_screen(h, v.dpi, r));
+            }
+            _ => return None,
+        };
         let n = v.state.visible().len();
         let scroll = v.state.scroll;
         let action = v.state.empty().map(|e| e.action());
@@ -797,23 +861,31 @@ pub fn element_center(element: Hit) -> Option<POINT> {
             Hit::None => layout::Rect::new(l.title.right() + 20.0, l.titlebar.y + 10.0, 1.0, 1.0),
             _ => return None,
         };
-        let (cx, cy) = r.center();
-        let s = v.dpi as f32 / 96.0;
-        let mut pt = POINT { x: (cx * s).round() as i32, y: (cy * s).round() as i32 };
-        // SAFETY: our own window; pt is a local.
-        let _ = unsafe { ClientToScreen(h, &mut pt) };
-        Some(pt)
+        Some(to_screen(h, v.dpi, r))
     })
     .flatten()
+}
+
+fn to_screen(h: HWND, dpi: u32, r: layout::Rect) -> POINT {
+    let (cx, cy) = r.center();
+    let s = dpi as f32 / 96.0;
+    let mut pt = POINT { x: (cx * s).round() as i32, y: (cy * s).round() as i32 };
+    // SAFETY: our own window; pt is a local.
+    let _ = unsafe { ClientToScreen(h, &mut pt) };
+    pt
 }
 
 /// "list=… filter=… count=… names=a|b|c" for self-test checks.
 pub fn describe_state() -> String {
     with_view(|v| {
+        if let Some(d) = v.describe_add() {
+            return d;
+        }
         let s = &v.state;
         let names: Vec<&str> = s.visible().iter().map(|i| i.name.as_str()).collect();
         format!(
-            "list={:?} filter={:?} query={:?} focus={:?} count={} names={}",
+            "screen=gallery status={:?} list={:?} filter={:?} query={:?} focus={:?} count={} names={}",
+            s.status.as_deref().unwrap_or(""),
             s.list,
             s.filter,
             s.search.text(),

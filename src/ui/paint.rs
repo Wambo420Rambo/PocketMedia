@@ -6,18 +6,18 @@ use crate::popup_state::{Focus, ListKind, PopupState, TypeFilter};
 
 pub const BG: Color = Color::rgb(0x191D26);
 const TITLEBAR: Color = Color::rgb(0x1D222D);
-const SURFACE: Color = Color::rgb(0x242A36);
-const RAISED: Color = Color::rgb(0x2B3240);
-const TEXT: Color = Color::rgb(0xF2F0FC);
-const MUTED: Color = Color::rgb(0xB0B9CD);
-const BORDER: Color = Color::rgb(0x424B60);
-const ACCENT: Color = Color::rgb(0xAB93FF);
-const ON_ACCENT: Color = Color::rgb(0x201533);
+pub const SURFACE: Color = Color::rgb(0x242A36);
+pub const RAISED: Color = Color::rgb(0x2B3240);
+pub const TEXT: Color = Color::rgb(0xF2F0FC);
+pub const MUTED: Color = Color::rgb(0xB0B9CD);
+pub const BORDER: Color = Color::rgb(0x424B60);
+pub const ACCENT: Color = Color::rgb(0xAB93FF);
+pub const ON_ACCENT: Color = Color::rgb(0x201533);
 const SOFT: Color = Color::rgb(0x35304E);
-const SOFT_TEXT: Color = Color::rgb(0xD1C4FF);
+pub const SOFT_TEXT: Color = Color::rgb(0xD1C4FF);
 const DANGER: Color = Color::rgb(0xFFA5B7);
 /// Keyboard focus ring (the wireframe uses the browser's light focus ring).
-const RING: Color = TEXT;
+pub const RING: Color = TEXT;
 
 /// Pointer and window facts that are not part of `PopupState`.
 pub struct Ui {
@@ -60,19 +60,26 @@ fn quiet_button(p: &Painter, r: Rect, hovered: bool, enabled: bool) {
     }
 }
 
+/// Title bar shared by every popup screen: background, bottom border, title, ×.
+pub fn title_bar(p: &Painter, bar: Rect, title: Rect, close: Rect, close_hovered: bool, close_ring: bool) {
+    p.fill(bar, 0.0, TITLEBAR);
+    p.line(bar.x, bar.bottom() - 0.5, bar.right(), bar.bottom() - 0.5, 1.0, BORDER);
+    p.text("PocketMedia", title, TextStyle::Medium, TEXT, Align::Start, true);
+    quiet_button(p, close, close_hovered, true);
+    p.text("×", close, TextStyle::Body, TEXT, Align::Center, true);
+    if close_ring {
+        p.stroke(close.inset(-2.0), 8.0, 2.0, RING);
+    }
+}
+
 fn titlebar(p: &Painter, s: &PopupState, l: &Layout, ui: &Ui) {
-    p.fill(l.titlebar, 0.0, TITLEBAR);
-    p.line(l.titlebar.x, l.titlebar.bottom() - 0.5, l.titlebar.right(), l.titlebar.bottom() - 0.5, 1.0, BORDER);
-    p.text("PocketMedia", l.title, TextStyle::Medium, TEXT, Align::Start, true);
+    title_bar(p, l.titlebar, l.title, l.close, ui.hover == Hit::Close, s.focus_visible && s.focus == Focus::Close);
     if ui.shortcut_ok {
         p.text(ui.shortcut_label, l.shortcut, TextStyle::Small, MUTED, Align::Start, true);
     } else {
         let r = Rect::new(l.shortcut.x - 40.0, l.shortcut.y, l.shortcut.w + 80.0, l.shortcut.h);
         p.text("Shortcut unavailable", r, TextStyle::Small, DANGER, Align::Center, true);
     }
-    quiet_button(p, l.close, ui.hover == Hit::Close, true);
-    p.text("×", l.close, TextStyle::Body, TEXT, Align::Center, true);
-    ring(p, s, Focus::Close, l.close, 6.0);
 }
 
 fn top_actions(p: &Painter, s: &PopupState, l: &Layout, ui: &Ui) {
@@ -207,7 +214,10 @@ fn gallery(p: &Painter, s: &PopupState, l: &Layout, ui: &Ui) {
         p.fill(thumb, 6.0, RAISED);
         p.stroke(thumb, 6.0, 1.0, BORDER);
         let inner = thumb.inset(1.0);
-        let (fw, fh) = fit_media(inner.w, inner.h, item.width, item.height, ui.dpi);
+        // Unknown size (fake imports): a square box and no size badge, as in focused-13.
+        let known = item.width > 0 && item.height > 0;
+        let (pw, ph) = if known { (item.width, item.height) } else { (300, 300) };
+        let (fw, fh) = fit_media(inner.w, inner.h, pw, ph, ui.dpi);
         let media = Rect::new(inner.x + (inner.w - fw) / 2.0, inner.y + (inner.h - fh) / 2.0, fw, fh);
         p.fill(media, 3.0, SOFT);
         p.stroke(media, 3.0, 1.0, SOFT_TEXT);
@@ -218,12 +228,14 @@ fn gallery(p: &Painter, s: &PopupState, l: &Layout, ui: &Ui) {
         p.fill(badge_r, 4.0, SURFACE);
         p.text(badge, badge_r, TextStyle::Tiny, TEXT, Align::Center, true);
 
-        let size = format!("{} × {}", item.width, item.height);
-        let sw = p.gfx().measure(&size, TextStyle::Tiny) + 8.0;
-        let sh = 11.0 * 1.45 + 2.0;
-        let size_r = Rect::new(inner.right() - 4.0 - sw, inner.bottom() - 4.0 - sh, sw, sh);
-        p.fill(size_r, 3.0, SURFACE);
-        p.text(&size, size_r, TextStyle::Tiny, MUTED, Align::Center, true);
+        if known {
+            let size = format!("{} × {}", item.width, item.height);
+            let sw = p.gfx().measure(&size, TextStyle::Tiny) + 8.0;
+            let sh = 11.0 * 1.45 + 2.0;
+            let size_r = Rect::new(inner.right() - 4.0 - sw, inner.bottom() - 4.0 - sh, sw, sh);
+            p.fill(size_r, 3.0, SURFACE);
+            p.text(&size, size_r, TextStyle::Tiny, MUTED, Align::Center, true);
+        }
 
         p.text(&item.name, Layout::name(tile), TextStyle::Small, TEXT, Align::Start, true);
     }
@@ -236,8 +248,9 @@ fn gallery(p: &Painter, s: &PopupState, l: &Layout, ui: &Ui) {
 
 fn footer(p: &Painter, s: &PopupState, l: &Layout, ui: &Ui) {
     p.line(l.footer.x, l.footer.y + 0.5, l.footer.right(), l.footer.y + 0.5, 1.0, BORDER);
+    let hint = s.status.as_deref().unwrap_or("Click / Enter to paste · Drag to attach · Esc to close");
     p.text(
-        "Click / Enter to paste · Drag to attach · Esc to close",
+        hint,
         l.footer_text,
         TextStyle::Small,
         MUTED,

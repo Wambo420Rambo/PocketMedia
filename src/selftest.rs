@@ -26,12 +26,14 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP,
     KEYEVENTF_UNICODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
     MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT, SendInput, VIRTUAL_KEY,
-    VK_A, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LWIN, VK_MENU, VK_OEM_PERIOD, VK_RETURN, VK_RIGHT, VK_TAB,
+    VK_A, VK_BACK, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LWIN, VK_MENU, VK_OEM_PERIOD, VK_RETURN, VK_RIGHT, VK_TAB,
 };
 use windows::Win32::UI::Shell::{NOTIFYICONIDENTIFIER, Shell_NotifyIconGetRect};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{HSTRING, PCWSTR};
 
+use crate::popup::TestTarget as Target;
+use crate::ui::add_view::AddHit;
 use crate::ui::layout::Hit;
 use crate::{StatusKind, WM_SELFTEST, app, assets, exit, popup, test_target};
 
@@ -56,6 +58,15 @@ static DESCRIBE: Mutex<String> = Mutex::new(String::new());
 enum El {
     Neutral,
     Search,
+    AddMediaButton,
+    AddChooseFiles,
+    AddImportExisting,
+    AddRow(usize),
+    AddChooseAgain,
+    AddCancel,
+    AddAdd,
+    AddBack,
+    AddMain,
     Chip(usize),
     List,
     Row(usize),
@@ -70,6 +81,15 @@ impl El {
         match self {
             El::Neutral => 0,
             El::Search => 2,
+            El::AddMediaButton => 3,
+            El::AddChooseFiles => 200,
+            El::AddImportExisting => 201,
+            El::AddRow(i) => 210 + i as isize,
+            El::AddChooseAgain => 230,
+            El::AddCancel => 231,
+            El::AddAdd => 232,
+            El::AddBack => 233,
+            El::AddMain => 234,
             El::Chip(i) => 10 + i as isize,
             El::List => 20,
             El::Row(i) => 30 + i as isize,
@@ -80,10 +100,25 @@ impl El {
         }
     }
 
+    fn target(code: isize) -> Target {
+        Target::Add(match code {
+            200 => AddHit::ChooseFiles,
+            201 => AddHit::ImportExisting,
+            210..=229 => AddHit::RowInput((code - 210) as usize),
+            230 => AddHit::ChooseAgain,
+            231 => AddHit::Cancel,
+            232 => AddHit::Add,
+            233 => AddHit::Back,
+            234 => AddHit::Main,
+            _ => return Target::Gallery(Self::hit(code)),
+        })
+    }
+
     fn hit(code: isize) -> Hit {
         match code {
             1 => Hit::Close,
             2 => Hit::Search,
+            3 => Hit::AddMedia,
             10..=13 => Hit::Chip((code - 10) as usize),
             20 => Hit::List,
             30..=31 => Hit::DropdownRow((code - 30) as usize),
@@ -148,7 +183,7 @@ pub fn on_ui_command(wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         CMD_FOCUS => unsafe { SetForegroundWindow(hwnd(lparam.0)) }.0 as isize,
         CMD_POPUP => popup::hwnd().0 as isize,
         CMD_HOTKEY_OK => app(|a| a.hotkey_ok.get()) as isize,
-        CMD_POINT => match popup::element_center(El::hit(lparam.0)) {
+        CMD_POINT => match popup::element_center(El::target(lparam.0)) {
             Some(pt) => ((pt.x as u32 as u64) << 32 | pt.y as u32 as u64) as isize,
             None => isize::MIN,
         },
@@ -347,6 +382,27 @@ impl Session {
         ok
     }
 
+    /// Checks that the popup's state description contains every `needle`.
+    fn state_has(&self, r: &mut Report, name: &str, needles: &[&str]) -> bool {
+        let d = self.describe();
+        r.check(name, needles.iter().all(|n| d.contains(n)), &d)
+    }
+
+    /// Replaces the text of Add media row `row` (empty text = select all + Backspace).
+    fn rename(&self, r: &mut Report, row: usize, text: &str) -> bool {
+        if !self.click(r, El::AddRow(row)) || !guard(r, &self.allowed) {
+            return false;
+        }
+        press(&[VK_CONTROL, VK_A]);
+        if text.is_empty() {
+            press(&[VK_BACK]);
+            std::thread::sleep(Duration::from_millis(150));
+            true
+        } else {
+            self.type_text(r, text)
+        }
+    }
+
     /// Checks the popup's visible list against the expected names.
     fn expect(&self, r: &mut Report, name: &str, expected: &[&str]) {
         let d = self.describe();
@@ -373,7 +429,11 @@ impl Session {
     }
 
     fn wheel_gallery(&self, r: &mut Report, notches: i32) -> bool {
-        let Some((x, y)) = self.point(El::GalleryGap) else { return false };
+        self.wheel_at(r, El::GalleryGap, notches)
+    }
+
+    fn wheel_at(&self, r: &mut Report, el: El, notches: i32) -> bool {
+        let Some((x, y)) = self.point(el) else { return false };
         if !guard(r, &self.allowed) {
             return false;
         }
@@ -546,6 +606,11 @@ fn run_input_tests(r: &mut Report, t: &Session) -> bool {
     t.click(r, El::EmptyAction);
     t.expect(r, "Show all media switches to All media", &ALL);
 
+    // 11. Add media, fake files.
+    if !add_media_test(r, t) {
+        return false;
+    }
+
     // 11. Clicking outside closes the popup.
     if let Some(rect) = window_rect(target) {
         if !guard(r, &t.allowed) {
@@ -557,6 +622,106 @@ fn run_input_tests(r: &mut Report, t: &Session) -> bool {
         mouse_button(false);
         r.check("clicking outside closes popup", wait_until(1500, || !is_visible(popup)), "");
     }
+    true
+}
+
+fn add_media_test(r: &mut Report, t: &Session) -> bool {
+    if !t.open(r) {
+        return false;
+    }
+    t.click(r, El::AddMediaButton);
+    t.park();
+    t.shot(r, "focused-11-add-media-start");
+    t.state_has(r, "Add media opens on its start page", &["screen=add stage=start"]);
+
+    t.click(r, El::AddChooseFiles);
+    t.park();
+    t.shot(r, "focused-12-add-media-files-review");
+    t.state_has(
+        r,
+        "Choose files shows the review list with fixed extensions",
+        &["stage=review", "can_add=true", "label=\"Add 4 files\"", "rows=Cat.png:ok|Wave.gif:ok|Clip (2).mp4:ok|IMG_4821.png:ok|Portrait.png:skip"],
+    );
+    t.wheel_at(r, El::AddMain, 10);
+    t.park();
+    t.shot(r, "focused-12-add-media-files-review-scrolled1");
+    // Choose again sits at the end of the list, visible now.
+    t.click(r, El::AddChooseAgain);
+    t.state_has(r, "Choose again returns to the start page", &["stage=start"]);
+    t.click(r, El::AddChooseFiles);
+    t.click(r, El::AddBack);
+    t.state_has(r, "← on the review returns to the start page", &["stage=start"]);
+    t.click(r, El::AddChooseFiles);
+
+    // Renames, in the order of screens 12b-12e.
+    let steps: [(usize, &str, &str, &[&str], &str); 4] = [
+        (3, "Birthday confetti", "focused-12b-add-media-rename-valid", &["Birthday confetti.png:ok", "can_add=true"], "rename to a valid name keeps Add enabled"),
+        (0, "Cat/photo", "focused-12c-add-media-rename-illegal-char", &["Cat/photo.png:IllegalChar", "can_add=false"], "\"Cat/photo\" is an error and disables Add"),
+        (0, "", "focused-12d-add-media-rename-empty", &["rows=.png:Empty|", "can_add=false"], "an empty name is an error and disables Add"),
+        (0, "Birthday confetti", "focused-12e-add-media-rename-duplicate", &["Birthday confetti.png:ok|", "Birthday confetti.png:Taken", "can_add=false"], "the same name as another row is an error and disables Add"),
+    ];
+    for (row, text, shot, needles, name) in steps {
+        if !t.rename(r, row, text) {
+            return false;
+        }
+        t.shot(r, shot);
+        t.state_has(r, name, needles);
+    }
+    // More of the rules, through the real text box.
+    for (text, needle) in [("Cat.", "Cat..png:TrailingSpaceOrPeriod"), ("CON", "CON.png:Reserved"), ("cat photo ", "TrailingSpaceOrPeriod")] {
+        if !t.rename(r, 0, text) {
+            return false;
+        }
+        t.state_has(r, &format!("\"{text}\" is rejected"), &[needle, "can_add=false"]);
+    }
+    if !t.rename(r, 0, "Cat photo") {
+        return false;
+    }
+    t.state_has(r, "fixing the name enables Add again", &["Cat photo.png:ok", "can_add=true"]);
+
+    t.click(r, El::AddAdd);
+    t.park();
+    t.shot(r, "focused-13-add-media-result");
+    t.expect(
+        r,
+        "added files appear first in All media (focused-13)",
+        &[
+            "Birthday confetti.png", "Clip (2).mp4", "Wave.gif", "Cat photo.png", "Reaction.gif", "Portrait.png",
+            "Celebration.mp4", "Wallpaper.jpg", "Hello.gif", "Race clip.mp4", "Square.png", "Happy dance.gif",
+        ],
+    );
+    t.state_has(r, "the result line reports added and skipped files", &["4 files added · 1 duplicate skipped"]);
+    t.wheel_gallery(r, 10);
+    t.park();
+    t.shot(r, "focused-13-add-media-result-scrolled1");
+    t.wheel_gallery(r, -10);
+
+    t.click(r, El::AddMediaButton);
+    t.click(r, El::AddImportExisting);
+    t.park();
+    t.shot(r, "focused-14-add-media-folder-review");
+    t.state_has(
+        r,
+        "a second import of the same names is blocked (focused-14)",
+        &["Wave.gif:Taken", "Clip (2).mp4:Taken", "can_add=false"],
+    );
+    t.wheel_at(r, El::AddMain, 10);
+    t.park();
+    t.shot(r, "focused-14-add-media-folder-review-scrolled1");
+
+    t.click(r, El::AddCancel);
+    t.park();
+    t.shot(r, "focused-15-add-media-cancelled");
+    t.state_has(r, "Cancel returns to the gallery unchanged (focused-15)", &["screen=gallery", "count=12"]);
+
+    t.click(r, El::AddMediaButton);
+    if !guard(r, &t.allowed) {
+        return false;
+    }
+    press(&[VK_ESCAPE]);
+    std::thread::sleep(Duration::from_millis(150));
+    t.state_has(r, "Escape leaves Add media without closing the popup", &["screen=gallery"]);
+    r.check("popup still open after Escape in Add media", is_visible(t.popup), "");
     true
 }
 

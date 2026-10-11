@@ -7,6 +7,8 @@
 
 #![windows_subsystem = "windows"]
 
+mod add_media;
+mod names;
 mod paste;
 mod popup;
 mod popup_state;
