@@ -32,8 +32,6 @@ use crate::ui::widgets::TextMetrics;
 use crate::winutil::{self, WM_MOUSELEAVE};
 
 const WHEEL_STEP: f32 = 48.0;
-const OPEN_FOLDER_NOTE: &str = "Open folder needs real files, which arrive in Phase 3. These items are fake.";
-const MEDIA_FOLDER_NOTE: &str = "Open folder needs the real Media folder, which arrives in Phase 3.";
 const SHORTCUT_NOTE: &str = "Changing the shortcut is not built yet.";
 const BACKUP_NOTE: &str = "Back up library arrives in Phase 6.";
 
@@ -57,10 +55,14 @@ struct View {
 enum Effect {
     None,
     Hide,
+    /// Hide this window and open the quick popup.
+    QuickPopup,
     Capture(bool),
     PasteText,
     /// Activate a control once no state is borrowed (keyboard Enter/Space).
     Deferred(MHit),
+    /// Show the Add media file or folder picker (modal).
+    Pick(crate::dialogs::Pick),
 }
 
 thread_local! {
@@ -68,6 +70,8 @@ thread_local! {
     static VIEW: RefCell<Option<View>> = const { RefCell::new(None) };
     static POSITIONING: Cell<bool> = const { Cell::new(false) };
     static TITLE_PAGE: Cell<Option<Page>> = const { Cell::new(None) };
+    /// Self-test only: the folder Open folder was asked to show.
+    static OPENED: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 /// Runs `f` with the view. Returns None if the window does not exist yet or the
@@ -120,6 +124,7 @@ fn create() -> Result<(), String> {
     WINDOW.with(|c| c.set(hwnd));
     winutil::style_frame(hwnd);
     let mut state = ManagerState::new();
+    state.settings = crate::settings_state::SettingsPage::with_saved(crate::store::settings());
     library::with(|lib| state.sync(lib));
     VIEW.with(|v| {
         *v.borrow_mut() = Some(View {
@@ -189,6 +194,7 @@ pub fn destroy() {
 pub fn reset() {
     with_view(|v| {
         v.state = ManagerState::new();
+        v.state.settings = crate::settings_state::SettingsPage::with_saved(crate::store::settings());
         v.add = None;
         library::with(|lib| v.state.sync(lib));
     });
@@ -255,7 +261,11 @@ impl View {
 
     /// Over the × button (which must not drag the window).
     fn over_close(&self, x: f32, y: f32) -> bool {
-        if self.on_settings() { self.settings_hit(x, y) == SHit::Close } else { self.hit(x, y) == MHit::Close }
+        if self.on_settings() {
+            matches!(self.settings_hit(x, y), SHit::Close | SHit::QuickPopup)
+        } else {
+            matches!(self.hit(x, y), MHit::Close | MHit::QuickPopup)
+        }
     }
 
     fn hit(&self, x: f32, y: f32) -> MHit {
@@ -318,6 +328,7 @@ impl View {
         let s = &mut self.state;
         match hit {
             MHit::Close => return Effect::Hide,
+            MHit::QuickPopup => return Effect::QuickPopup,
             MHit::Nav(i) => {
                 library::with(|lib| s.navigate(Nav::ORDER[i], lib));
                 self.hover = MHit::None;
@@ -334,10 +345,10 @@ impl View {
                 library::with(|lib| s.search_changed(lib));
                 s.focus = MFocus::Search;
             }
-            MHit::Rename => library::with_mut(|lib| s.apply_rename(lib)),
-            MHit::OpenFolder => s.status = Some(OPEN_FOLDER_NOTE.into()),
+            MHit::Rename => rename_selected(s),
+            MHit::OpenFolder => s.status = show_selected_in_explorer(s),
             MHit::Recycle => s.ask_recycle(),
-            MHit::ConfirmMove => library::with_mut(|lib| s.confirm_recycle(lib)),
+            MHit::ConfirmMove => recycle_selected(s),
             MHit::ConfirmCancel => s.cancel_recycle(),
             _ => {}
         }
@@ -348,6 +359,7 @@ impl View {
     fn focus_for(hit: MHit) -> Option<MFocus> {
         Some(match hit {
             MHit::Close => MFocus::Close,
+            MHit::QuickPopup => MFocus::QuickPopup,
             MHit::Nav(i) => MFocus::Nav(i),
             MHit::AddMedia => MFocus::AddMedia,
             MHit::Search | MHit::SearchClear => MFocus::Search,
@@ -392,6 +404,7 @@ impl View {
             }
             AddOutcome::Capture(on) => Effect::Capture(on),
             AddOutcome::PasteText => Effect::PasteText,
+            AddOutcome::Pick(kind) => Effect::Pick(kind),
         }
     }
 
@@ -626,6 +639,7 @@ impl View {
             focus if press => {
                 let hit = match focus {
                     MFocus::Close => MHit::Close,
+                    MFocus::QuickPopup => MHit::QuickPopup,
                     MFocus::AddMedia => MHit::AddMedia,
                     MFocus::ClearFilters => MHit::ClearFilters,
                     MFocus::EmptyAction => MHit::EmptyAction,
@@ -658,6 +672,7 @@ impl View {
     fn settings_focus_for(hit: SHit) -> Option<SFocus> {
         Some(match hit {
             SHit::Close => SFocus::Close,
+            SHit::QuickPopup => SFocus::QuickPopup,
             SHit::Nav(i) => SFocus::Nav(i),
             SHit::Profile(_) => SFocus::Profile,
             SHit::Video | SHit::VideoRow(_) => SFocus::Video,
@@ -701,6 +716,7 @@ impl View {
         let st = &mut self.state.settings;
         match hit {
             SHit::Close => return Effect::Hide,
+            SHit::QuickPopup => return Effect::QuickPopup,
             SHit::Nav(i) if Nav::ORDER[i] == Nav::Settings => {} // already here; keep the draft
             SHit::Nav(i) => {
                 let s = &mut self.state;
@@ -717,15 +733,24 @@ impl View {
             }
             SHit::Change => st.show_note(SHORTCUT_NOTE),
             SHit::CloseAfter => st.toggle_close_after(),
-            SHit::OpenFolder => st.show_note(MEDIA_FOLDER_NOTE),
+            SHit::OpenFolder => {
+                let note = open_media_folder();
+                self.state.settings.show_note(&note);
+            }
             SHit::ChooseFolder => {
-                self.add = Some(AddPanel::for_import());
+                self.add = Some(AddPanel::for_settings());
                 self.s_hover = SHit::None;
+                return Effect::Pick(crate::dialogs::Pick::Folder);
             }
             SHit::Backup => st.show_note(BACKUP_NOTE),
             SHit::Autostart => st.toggle_autostart(),
             SHit::Cancel => st.cancel(),
-            SHit::Save => st.save(),
+            SHit::Save => {
+                st.save();
+                if let Err(e) = crate::store::save_settings(st.saved) {
+                    st.show_note(&format!("Settings could not be saved: {e}"));
+                }
+            }
             SHit::None | SHit::Caption => {}
         }
         Effect::None
@@ -780,6 +805,7 @@ impl View {
             SFocus::CloseAfter | SFocus::Autostart => SHit::None,
             focus if press => match focus {
                 SFocus::Close => SHit::Close,
+                SFocus::QuickPopup => SHit::QuickPopup,
                 SFocus::Change => SHit::Change,
                 SFocus::OpenFolder => SHit::OpenFolder,
                 SFocus::ChooseFolder => SHit::ChooseFolder,
@@ -864,8 +890,26 @@ fn run(effect: Effect) {
     match effect {
         Effect::None => {}
         Effect::Hide => hide(),
+        Effect::QuickPopup => {
+            hide();
+            // Paste goes to the app remembered when the popup last opened, if it still exists.
+            let target = crate::app(|a| a.target.borrow().clone());
+            crate::popup::open(target);
+        }
         Effect::Capture(true) => winutil::set_capture(h),
         Effect::Capture(false) => winutil::release_capture(),
+        Effect::Pick(kind) => {
+            let source = crate::dialogs::pick(h, kind);
+            // SAFETY: our own window; back in front after the picker.
+            let _ = unsafe { SetForegroundWindow(h) };
+            let effect = with_view(|v| {
+                let outcome = v.add.as_mut().map_or(AddOutcome::None, |a| a.picked(source));
+                v.add_outcome(outcome)
+            });
+            if let Some(effect) = effect {
+                run(effect);
+            }
+        }
         Effect::PasteText => {
             if let Some(text) = winutil::clipboard_text(h) {
                 with_view(|v| v.insert_text(&text));
@@ -879,6 +923,97 @@ fn run(effect: Effect) {
     }
     sync_title(h);
     winutil::invalidate(h);
+}
+
+/// A worker result. Returns true if the Manager's Add media panel owned it.
+pub fn on_job(ev: &crate::jobs::Event) -> bool {
+    let effect = with_view(|v| {
+        if !v.add.as_ref().is_some_and(|a| a.owns(ev)) {
+            return None;
+        }
+        let outcome = v.add.as_mut()?.on_job(ev);
+        Some(v.add_outcome(outcome))
+    })
+    .flatten();
+    let handled = effect.is_some();
+    if let Some(effect) = effect {
+        run(effect);
+    }
+    handled
+}
+
+fn media_path(rel: &str) -> Option<std::path::PathBuf> {
+    crate::paths::get().map(|p| crate::import::media_file(&p.media, rel))
+}
+
+/// Rename: the file first, then the record. A failure changes nothing.
+fn rename_selected(s: &mut ManagerState) {
+    let plan = library::with(|lib| {
+        let id = s.selected.filter(|_| s.can_rename())?;
+        let item = lib.get(id)?;
+        let new_rel = lib.renamed_path(id, s.rename.text().trim_start())?;
+        (item.path != new_rel).then(|| (item.path.clone(), new_rel))
+    });
+    if let Some((old, new)) = plan {
+        let (Some(from), Some(to)) = (media_path(&old), media_path(&new)) else { return };
+        if let Err(e) = crate::fileops::move_no_replace(&from, &to) {
+            s.status = Some(if e.kind() == std::io::ErrorKind::AlreadyExists {
+                "A file with that name is already in the Media folder. Choose another name.".into()
+            } else {
+                format!("Could not rename the file: {e}")
+            });
+            return;
+        }
+    }
+    library::with_mut(|lib| s.apply_rename(lib));
+    if let Err(e) = library::persist() {
+        s.status = Some(format!("Renamed, but {e}."));
+    }
+}
+
+/// Move to Recycle Bin (after the confirmation): the managed copy only.
+fn recycle_selected(s: &mut ManagerState) {
+    let Some((name, rel)) = library::with(|lib| s.selected_item(lib).map(|i| (i.name.clone(), i.path.clone()))) else { return };
+    let Some(path) = media_path(&rel) else { return };
+    match crate::fileops::recycle(&path) {
+        Ok(()) => {
+            library::with_mut(|lib| s.confirm_recycle(lib));
+            if let Err(e) = library::persist() {
+                s.status = Some(format!("{name} is in the Recycle Bin, but {e}."));
+            }
+        }
+        Err(e) => {
+            s.cancel_recycle();
+            s.status = Some(format!("Could not move {name} to the Recycle Bin: {e}. It is still in your library."));
+        }
+    }
+}
+
+/// Open folder in the inspector: File Explorer with the file selected. Under
+/// the self-test Explorer is not started; the path is recorded instead.
+fn show_selected_in_explorer(s: &ManagerState) -> Option<String> {
+    let rel = library::with(|lib| s.selected_item(lib).map(|i| i.path.clone()))?;
+    let path = media_path(&rel)?;
+    if crate::app(|a| a.quiet.get()) {
+        OPENED.with(|o| *o.borrow_mut() = Some(path.display().to_string()));
+        return None;
+    }
+    crate::fileops::show_in_explorer(&path).err().map(|e| format!("Could not open File Explorer: {e}."))
+}
+
+/// Opens the real Media folder in File Explorer and returns the line to show.
+/// Under the self-test, Explorer is not started (it would take the foreground
+/// from the test); the path that would open is recorded for `describe`.
+fn open_media_folder() -> String {
+    let Some(p) = crate::paths::get() else { return "The Media folder is not set up.".into() };
+    if crate::app(|a| a.quiet.get()) {
+        OPENED.with(|o| *o.borrow_mut() = Some(p.media.display().to_string()));
+        return "Opened the Media folder.".into();
+    }
+    match winutil::open_folder(&p.media) {
+        Ok(()) => "Opened the Media folder.".into(),
+        Err(e) => format!("Could not open the Media folder: {e}."),
+    }
 }
 
 /// Window title (taskbar, Alt+Tab) follows the page.
@@ -1008,8 +1143,19 @@ extern "system" fn manager_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
 pub fn element_center(hit: MHit) -> Option<POINT> {
     let h = hwnd();
     with_view(|v| {
-        if v.add.is_some() || v.state.page != Page::Library {
+        if v.add.is_some() {
             return None;
+        }
+        // The title bar is the same on both pages.
+        if v.state.page == Page::Settings {
+            let f = v.settings_layout().frame;
+            let r = match hit {
+                MHit::Close => f.close,
+                MHit::QuickPopup => f.quick_popup,
+                MHit::Nav(i) => *f.nav.get(i)?,
+                _ => return None,
+            };
+            return Some(winutil::rect_center_on_screen(h, v.dpi, r));
         }
         let r = library::with(|lib| {
             let l = v.layout(lib);
@@ -1018,6 +1164,7 @@ pub fn element_center(hit: MHit) -> Option<POINT> {
             let confirm = insp.and_then(|i| i.confirm.as_ref());
             Some(match hit {
                 MHit::Close => l.frame.close,
+                MHit::QuickPopup => l.frame.quick_popup,
                 MHit::Nav(i) => *l.frame.nav.get(i)?,
                 MHit::AddMedia => l.add_media,
                 MHit::Search => l.search.outer,
@@ -1066,6 +1213,7 @@ pub fn settings_element_center(hit: SHit) -> Option<POINT> {
         let l = v.settings_layout();
         let r = match hit {
             SHit::Close => l.frame.close,
+            SHit::QuickPopup => l.frame.quick_popup,
             SHit::Nav(i) => *l.frame.nav.get(i)?,
             SHit::Profile(i) => l.choices.get(i)?.card,
             SHit::Video => l.video.control,
@@ -1086,6 +1234,15 @@ pub fn settings_element_center(hit: SHit) -> Option<POINT> {
         Some(winutil::rect_center_on_screen(h, v.dpi, r))
     })
     .flatten()
+}
+
+/// Self-test only: takes the saved settings from the store again (after it was re-read).
+pub fn reload_settings() {
+    with_view(|v| {
+        let page = crate::settings_state::SettingsPage::with_saved(crate::store::settings());
+        v.state.settings = page;
+    });
+    winutil::invalidate(hwnd());
 }
 
 /// Self-test only: puts the Settings page at a scroll offset (clamped), to
@@ -1112,7 +1269,7 @@ pub fn describe() -> String {
             return format!(
                 "screen=settings profile={:?} video={:?} close_after={} autostart={} saved={:?}/{:?}/{}/{} dirty={} \
                  focus={:?} focus_visible={} video_open={} scroll={:.0} max_scroll={:.0} autostart_visible={} \
-                 line={:?} nav_selected={}",
+                 line={:?} opened={:?} media={:?} nav_selected={}",
                 d.profile,
                 d.video_preview,
                 d.close_after_insert,
@@ -1129,6 +1286,8 @@ pub fn describe() -> String {
                 l.max_scroll(),
                 visible(l.autostart.control),
                 st.status_line(),
+                OPENED.with(|o| o.borrow().clone().unwrap_or_default()),
+                crate::paths::media_text(),
                 Nav::ORDER.iter().filter(|n| v.state.nav_selected(**n)).map(|n| n.label()).collect::<Vec<_>>().join("+"),
             );
         }
@@ -1138,7 +1297,7 @@ pub fn describe() -> String {
             let scrollbar = v.layout(lib).grid.scrollbar(names.len(), s.scroll).is_some();
             format!(
                 "screen=manager filter={:?} sort={:?} query={:?} focus={:?} selected={:?} rename={:?} error={:?} \
-                 can_rename={} confirming={} status={:?} scrollbar={scrollbar} total={} count={} names={}",
+                 can_rename={} confirming={} status={:?} scrollbar={scrollbar} opened={:?} total={} count={} names={}",
                 s.filter,
                 s.sort,
                 s.search.text(),
@@ -1149,6 +1308,7 @@ pub fn describe() -> String {
                 s.can_rename(),
                 s.confirming,
                 s.status.as_deref().unwrap_or(""),
+                OPENED.with(|o| o.borrow().clone().unwrap_or_default()),
                 lib.items.len(),
                 names.len(),
                 names.join("|")

@@ -9,7 +9,7 @@
 use std::cell::{Cell, RefCell};
 
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::ValidateRect;
+use windows::Win32::Graphics::Gdi::{ScreenToClient, ValidateRect};
 use windows::Win32::System::Ole::DROPEFFECT_COPY;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -59,12 +59,16 @@ enum Effect {
     OpenManager,
     /// Activate a control once no state is borrowed (keyboard Enter/Space).
     Deferred(Hit),
+    /// Show the Add media file or folder picker (modal).
+    Pick(crate::dialogs::Pick),
 }
 
 thread_local! {
     static POPUP: Cell<HWND> = Cell::new(HWND::default());
     static VIEW: RefCell<Option<View>> = const { RefCell::new(None) };
     static DRAGGING: Cell<bool> = const { Cell::new(false) };
+    /// A picker is open: losing activation to it must not close the popup.
+    static MODAL: Cell<bool> = const { Cell::new(false) };
     static POSITIONING: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -161,8 +165,11 @@ pub fn open(captured: Result<Target, NoTarget>) {
     app(|a| *a.target.borrow_mut() = captured);
     with_view(|v| {
         v.state.reset_for_open();
-        // The shortcut always opens the quick picker, never a half-finished import.
-        v.add = None;
+        // The shortcut always opens the quick picker, never a half-finished
+        // review; an import that is still copying stays on screen.
+        if !v.add.as_ref().is_some_and(AddPanel::busy) {
+            v.add = None;
+        }
     });
     position_near_cursor();
     let h = hwnd();
@@ -172,6 +179,30 @@ pub fn open(captured: Result<Target, NoTarget>) {
         let _ = SetForegroundWindow(h);
     }
     invalidate();
+}
+
+/// A short line in the popup's footer, in place of the hint (e.g. "Copied to clipboard").
+pub fn show_status(text: &str) {
+    with_view(|v| v.state.status = Some(text.into()));
+    invalidate();
+}
+
+/// A worker result. Returns true if the popup's Add media panel owned it.
+pub fn on_job(ev: &crate::jobs::Event) -> bool {
+    let effect = with_view(|v| {
+        if !v.add.as_ref().is_some_and(|a| a.owns(ev)) {
+            return None;
+        }
+        let a = v.add.as_mut()?;
+        let outcome = a.on_job(ev);
+        Some(v.add_outcome(outcome))
+    })
+    .flatten();
+    let handled = effect.is_some();
+    if let Some(effect) = effect {
+        run(effect);
+    }
+    handled
 }
 
 /// Hides the popup. With `restore_focus`, focus goes back to the remembered app.
@@ -317,11 +348,18 @@ impl View {
                 s.set_list(ListKind::BOTH[i]);
                 s.focus = Focus::List;
             }
-            Hit::ClearHistory => library::with_mut(|lib| {
-                if s.history_enabled(lib) {
-                    s.clear_history(lib);
+            Hit::ClearHistory => {
+                let cleared = library::with_mut(|lib| {
+                    let on = s.history_enabled(lib);
+                    if on {
+                        s.clear_history(lib);
+                    }
+                    on
+                });
+                if cleared && let Err(e) = library::persist() {
+                    s.status = Some(format!("History cleared, but {e}."));
                 }
-            }),
+            }
             Hit::EmptyAction => library::with(|lib| s.run_empty_action(lib)),
             Hit::Tile(_) => return Effect::Activate,
             Hit::SearchClear => {
@@ -366,6 +404,7 @@ impl View {
             }
             AddOutcome::Capture(on) => Effect::Capture(on),
             AddOutcome::PasteText => Effect::PasteText,
+            AddOutcome::Pick(kind) => Effect::Pick(kind),
         }
     }
 
@@ -628,6 +667,20 @@ fn run(effect: Effect) {
             close(false);
             manager::show();
         }
+        Effect::Pick(kind) => {
+            MODAL.with(|m| m.set(true));
+            let source = crate::dialogs::pick(hwnd(), kind);
+            MODAL.with(|m| m.set(false));
+            // SAFETY: our own window; back in front after the picker.
+            let _ = unsafe { SetForegroundWindow(hwnd()) };
+            let effect = with_view(|v| {
+                let outcome = v.add.as_mut().map_or(AddOutcome::None, |a| a.picked(source));
+                v.add_outcome(outcome)
+            });
+            if let Some(effect) = effect {
+                run(effect);
+            }
+        }
         Effect::Deferred(hit) => {
             if let Some(effect) = with_view(|v| v.activate(hit)) {
                 run(effect);
@@ -662,6 +715,20 @@ extern "system" fn popup_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
         WM_SIZE => {
             with_view(|v| v.layout = None);
             Effect::None
+        }
+        WM_NCHITTEST => {
+            // The title bar (outside ×) moves the popup, like a normal caption.
+            let mut pt = winutil::lparam_point(lparam);
+            // SAFETY: our own window; pt is a local.
+            let _ = unsafe { ScreenToClient(hwnd, &mut pt) };
+            let caption = with_view(|v| {
+                let (x, y) = winutil::to_dip(pt, v.dpi);
+                let l = v.ensure_layout();
+                let (bar, close, w) = (l.titlebar, l.close, l.width);
+                let add_close = v.add.is_some() && x > w - 48.0;
+                bar.contains(x, y) && !close.contains(x, y) && !add_close
+            });
+            return LRESULT(if caption == Some(true) { HTCAPTION as isize } else { HTCLIENT as isize });
         }
         WM_MOUSEMOVE => {
             with_view(|v| {
@@ -732,7 +799,7 @@ extern "system" fn popup_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
         WM_ACTIVATE => {
             // Clicking outside closes the popup, except while dragging out of it.
             let inactive = (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE;
-            if inactive && is_visible() && !DRAGGING.with(|d| d.get()) {
+            if inactive && is_visible() && !DRAGGING.with(|d| d.get()) && !MODAL.with(|m| m.get()) {
                 Effect::Close(false)
             } else {
                 Effect::None

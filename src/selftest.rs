@@ -35,11 +35,12 @@ use windows::core::{HSTRING, PCWSTR};
 use crate::popup::TestTarget as Target;
 use crate::ui::add_view::AddHit;
 use crate::ui::layout::Hit;
-use crate::library::{self, Library};
 use crate::{StatusKind, WM_SELFTEST, app, assets, exit, manager, popup, test_target};
 
 mod manager_test;
+mod seed;
 mod settings_test;
+mod window_test;
 
 const CMD_TARGET: usize = 1;
 const CMD_STATUS: usize = 2;
@@ -57,6 +58,12 @@ const CMD_MANAGER_ADD_POINT: usize = 13;
 const CMD_SETTINGS_POINT: usize = 14;
 /// lparam = scroll offset in DIPs (clamped; a large value means the end).
 const CMD_SETTINGS_SCROLL: usize = 15;
+/// Forgets the app to paste into (as when the popup opens from the tray).
+const CMD_FORGET_TARGET: usize = 16;
+/// Puts `store::describe()` in DESCRIBE.
+const CMD_STORE_DESCRIBE: usize = 17;
+/// Reads the store from disk again, as a restart would, and reloads the Settings page.
+const CMD_STORE_REOPEN: usize = 18;
 const CONFLICT_TITLE: &str = "PocketMedia - shortcut not available";
 
 static EXIT_CODE: AtomicI32 = AtomicI32::new(0);
@@ -202,6 +209,23 @@ pub fn on_ui_command(wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         CMD_MANAGER => manager::hwnd().0 as isize,
         CMD_MANAGER_POINT => pack(manager::element_center(manager_test::decode(lparam.0))),
         CMD_SETTINGS_POINT => pack(manager::settings_element_center(settings_test::decode(lparam.0))),
+        CMD_STORE_DESCRIBE => {
+            if let Ok(mut d) = DESCRIBE.lock() {
+                *d = crate::store::describe();
+            }
+            0
+        }
+        CMD_STORE_REOPEN => {
+            if let Some(p) = crate::paths::get() {
+                crate::store::init(&p.data);
+            }
+            manager::reload_settings();
+            0
+        }
+        CMD_FORGET_TARGET => {
+            app(|a| *a.target.borrow_mut() = Err(crate::target::NoTarget::Shell));
+            0
+        }
         CMD_SETTINGS_SCROLL => {
             manager::set_settings_scroll(lparam.0 as f32);
             0
@@ -217,8 +241,11 @@ pub fn on_ui_command(wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             0
         }
         CMD_RESET => {
-            // Fresh fake library and windows, so each test section starts the same.
-            library::with_mut(|lib| *lib = Library::sample());
+            // Fresh library files and windows, so each test section starts the same.
+            crate::store::reset_for_test();
+            if let Err(e) = seed::reset_library() {
+                note(&format!("could not create the test library: {e}"));
+            }
             popup::reset();
             manager::reset();
             0
@@ -319,6 +346,8 @@ fn script(r: &mut Report, out: &Path, main: isize) {
         if hotkey_ok { "RegisterHotKey succeeded" } else { "failed - is another PocketMedia running?" },
     );
 
+    folders_test(r);
+
     let work = primary_work_area();
     r.info(&format!("primary work area {work:?}"));
 
@@ -355,6 +384,13 @@ fn script(r: &mut Report, out: &Path, main: isize) {
         return;
     }
 
+    // Real files to import, and the library as the wireframe's 8 real files.
+    match seed::make_source(out) {
+        Ok((files, folder)) => crate::dialogs::set_test_pick(files, folder),
+        Err(e) => r.info(&format!("could not create the import source: {e}")),
+    }
+    send(main, CMD_RESET, 0);
+
     let t = Session { main, out: out.to_path_buf(), allowed: allowed.to_vec(), target, popup: send(main, CMD_POPUP, 0) };
     if !run_input_tests(r, &t) {
         r.info("input tests stopped early");
@@ -363,7 +399,18 @@ fn script(r: &mut Report, out: &Path, main: isize) {
         press(&[VK_ESCAPE]);
         wait_until(1500, || !is_visible(t.popup));
     }
+    // A second start must keep what is already in the folders.
+    let marker = crate::paths::get().map(|p| p.data.join("self-test-marker.txt"));
+    if let Some(m) = &marker {
+        let _ = std::fs::write(m, b"kept");
+    }
     conflict_test(r, out, &exe);
+    if let Some(m) = &marker {
+        let kept = std::fs::read(m).is_ok_and(|b| b == b"kept");
+        r.check("starting again keeps the folders' contents", kept, &m.display().to_string());
+        let _ = std::fs::remove_file(m);
+    }
+    blocked_folder_test(r, out, &exe);
     stop_child(&mut target_proc);
 }
 
@@ -427,6 +474,12 @@ impl Session {
         let ok = wait_until(2000, || is_visible(self.popup) && foreground() == self.popup);
         std::thread::sleep(Duration::from_millis(200));
         ok
+    }
+
+    /// Waits (up to `ms`) until the popup's description contains `needle`
+    /// (imports run on a worker thread).
+    fn wait_state(&self, needle: &str, ms: u64) -> bool {
+        wait_until(ms, || self.describe().contains(needle))
     }
 
     /// Checks that the popup's state description contains every `needle`.
@@ -671,7 +724,57 @@ fn run_input_tests(r: &mut Report, t: &Session) -> bool {
     }
 
     // 12. The Manager, from a fresh fake library.
-    manager_test::run(r, t) && settings_test::run(r, t)
+    manager_test::run(r, t) && settings_test::run(r, t) && window_test::run(r, t)
+}
+
+/// Files in the test library's Media folders (not counting temporary files).
+fn count_files(out: &Path) -> usize {
+    crate::import::FOLDERS
+        .iter()
+        .filter_map(|f| std::fs::read_dir(out.join("app").join("Media").join(f)).ok())
+        .flat_map(|d| d.flatten())
+        .filter(|e| !e.file_name().to_string_lossy().starts_with(crate::import::PARTIAL_PREFIX))
+        .count()
+}
+
+/// After the first import: the copies are real, sorted into their folders, the
+/// sources are untouched, and the library file lists them.
+fn import_on_disk(r: &mut Report, out: &Path) {
+    let media = out.join("app").join("Media");
+    let src = out.join("import-src");
+    let same = |copy: &str, source: &str| std::fs::read(media.join(copy)).ok() == std::fs::read(src.join(source)).ok().filter(|b| !b.is_empty());
+    r.check(
+        "copies have the source's exact bytes, under the reviewed names",
+        same("Pictures/Cat photo.png", "Cat.png")
+            && same("Pictures/Birthday confetti.png", "IMG_4821.png")
+            && same("GIFs/Wave.gif", "Wave.gif")
+            && same("GIFs/Hello (2).gif", "Hello.gif")
+            && same("Videos/Clip.mp4", "Clip.mp4"),
+        "",
+    );
+    r.check(
+        "the library's own Hello.gif was not overwritten",
+        std::fs::read(media.join("GIFs/Hello.gif")).ok() != std::fs::read(src.join("Hello.gif")).ok(),
+        "",
+    );
+    r.check("the duplicate was not copied", count_files(out) == 13, &format!("{} files", count_files(out)));
+    let unchanged = seed::source_unchanged(out);
+    r.check("the source files are unchanged", unchanged.is_ok(), &format!("{unchanged:?}"));
+    let leftovers = crate::import::cleanup_partials(&media);
+    r.check("no temporary files are left", leftovers == 0, &format!("{leftovers}"));
+    let stored: Option<serde_json::Value> = std::fs::read_to_string(out.join("app").join("Data").join("pocketmedia.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok());
+    let entry = |path: &str| {
+        stored.as_ref().and_then(|v| v["items"].as_array()).and_then(|items| items.iter().find(|i| i["path"] == path).cloned())
+    };
+    let cat = entry("Pictures/Cat photo.png");
+    r.check(
+        "the library file lists the new files with their folder and SHA-256",
+        cat.as_ref().is_some_and(|c| c["hash"].as_str().is_some_and(|h| h.len() == 64) && c["name"] == "Cat photo.png")
+            && entry("GIFs/Hello (2).gif").is_some(),
+        &format!("{cat:?}"),
+    );
 }
 
 fn add_media_test(r: &mut Report, t: &Session) -> bool {
@@ -684,12 +787,18 @@ fn add_media_test(r: &mut Report, t: &Session) -> bool {
     t.state_has(r, "Add media opens on its start page", &["screen=add stage=start"]);
 
     t.click(r, El::AddChooseFiles);
+    t.wait_state("stage=review", 8000);
     t.park();
     t.shot(r, "focused-12-add-media-files-review");
     t.state_has(
         r,
-        "Choose files shows the review list with fixed extensions",
-        &["stage=review", "can_add=true", "label=\"Add 4 files\"", "rows=Cat.png:ok|Wave.gif:ok|Clip (2).mp4:ok|IMG_4821.png:ok|Portrait.png:skip"],
+        "Choose files checks the real files: duplicate skipped, taken name numbered",
+        &[
+            "stage=review",
+            "can_add=true",
+            "label=\"Add 5 files\"",
+            "rows=Cat.png:ok|Wave.gif:ok|Clip.mp4:ok|IMG_4821.png:ok|Portrait.png:skip|Hello (2).gif:ok-numbered",
+        ],
     );
     t.wheel_at(r, El::AddMain, 10);
     t.park();
@@ -698,9 +807,11 @@ fn add_media_test(r: &mut Report, t: &Session) -> bool {
     t.click(r, El::AddChooseAgain);
     t.state_has(r, "Choose again returns to the start page", &["stage=start"]);
     t.click(r, El::AddChooseFiles);
+    t.wait_state("stage=review", 8000);
     t.click(r, El::AddBack);
     t.state_has(r, "← on the review returns to the start page", &["stage=start"]);
     t.click(r, El::AddChooseFiles);
+    t.wait_state("stage=review", 8000);
 
     // Renames, in the order of screens 12b-12e.
     let steps: [(usize, &str, &str, &[&str], &str); 4] = [
@@ -717,7 +828,13 @@ fn add_media_test(r: &mut Report, t: &Session) -> bool {
         t.state_has(r, name, needles);
     }
     // More of the rules, through the real text box.
-    for (text, needle) in [("Cat.", "Cat..png:TrailingSpaceOrPeriod"), ("CON", "CON.png:Reserved"), ("cat photo ", "TrailingSpaceOrPeriod")] {
+    for (text, needle) in [
+        ("Cat.", "Cat..png:TrailingSpaceOrPeriod"),
+        ("CON", "CON.png:Reserved"),
+        ("cat photo ", "TrailingSpaceOrPeriod"),
+        ("Square", "Square.png:Taken"),
+        ("a:b", "a:b.png:IllegalChar"),
+    ] {
         if !t.rename(r, 0, text) {
             return false;
         }
@@ -729,17 +846,14 @@ fn add_media_test(r: &mut Report, t: &Session) -> bool {
     t.state_has(r, "fixing the name enables Add again", &["Cat photo.png:ok", "can_add=true"]);
 
     t.click(r, El::AddAdd);
+    t.wait_state("screen=gallery", 15000);
     t.park();
     t.shot(r, "focused-13-add-media-result");
-    t.expect(
-        r,
-        "added files appear first in All media (focused-13)",
-        &[
-            "Birthday confetti.png", "Clip (2).mp4", "Wave.gif", "Cat photo.png", "Reaction.gif", "Portrait.png",
-            "Celebration.mp4", "Wallpaper.jpg", "Hello.gif", "Race clip.mp4", "Square.png", "Happy dance.gif",
-        ],
-    );
-    t.state_has(r, "the result line reports added and skipped files", &["4 files added · 1 duplicate skipped"]);
+    let mut expected = vec!["Hello (2).gif", "Birthday confetti.png", "Clip.mp4", "Wave.gif", "Cat photo.png"];
+    expected.extend(ALL);
+    t.expect(r, "added files appear first in All media (focused-13)", &expected);
+    t.state_has(r, "the result line reports added and skipped files", &["5 files added · 1 duplicate skipped"]);
+    import_on_disk(r, &t.out);
     t.wheel_gallery(r, 10);
     t.park();
     t.shot(r, "focused-13-add-media-result-scrolled1");
@@ -747,12 +861,17 @@ fn add_media_test(r: &mut Report, t: &Session) -> bool {
 
     t.click(r, El::AddMediaButton);
     t.click(r, El::AddImportExisting);
+    t.wait_state("stage=review", 8000);
     t.park();
     t.shot(r, "focused-14-add-media-folder-review");
     t.state_has(
         r,
-        "a second import of the same names is blocked (focused-14)",
-        &["Wave.gif:Taken", "Clip (2).mp4:Taken", "can_add=false"],
+        "a folder import takes subfolders and skips what is already there (focused-14)",
+        &[
+            "rows=Cat.png:skip|Clip.mp4:skip|Hello.gif:skip|IMG_4821.png:skip|Portrait.png:skip|Wave.gif:skip|notes.txt:unsupported|Wave.gif:skip|Clip (2).mp4:ok-numbered",
+            "summary=\"1 ready to add · 7 duplicates skipped · 1 not supported\"",
+            "can_add=true",
+        ],
     );
     t.wheel_at(r, El::AddMain, 10);
     t.park();
@@ -761,7 +880,8 @@ fn add_media_test(r: &mut Report, t: &Session) -> bool {
     t.click(r, El::AddCancel);
     t.park();
     t.shot(r, "focused-15-add-media-cancelled");
-    t.state_has(r, "Cancel returns to the gallery unchanged (focused-15)", &["screen=gallery", "count=12"]);
+    t.state_has(r, "Cancel returns to the gallery unchanged (focused-15)", &["screen=gallery", "count=13"]);
+    r.check("Cancel on the review copies nothing", count_files(&t.out) == 13, &format!("{} files", count_files(&t.out)));
 
     t.click(r, El::AddMediaButton);
     if !guard(r, &t.allowed) {
@@ -836,6 +956,67 @@ fn drag_test(r: &mut Report, t: &Session) {
     r.check("drag copied, original file kept", assets().file.exists(), &assets().file.display().to_string());
     let (kind, text) = status(t.main);
     r.check("app records drag result", kind == 1, &text);
+}
+
+/// The folders beside the program.
+fn folders_test(r: &mut Report) {
+    let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)) else {
+        r.check("program folder found", false, "current_exe failed");
+        return;
+    };
+    r.info(&format!("program folder: {}", dir.display()));
+    for rel in [r"Media\Pictures", r"Media\GIFs", r"Media\Videos", "Data", "Cache"] {
+        let path = dir.join(rel);
+        r.check(&format!("folder {rel} exists beside the program"), path.is_dir(), &path.display().to_string());
+    }
+}
+
+/// A copy of the program in a folder where a file named "Media" blocks the
+/// Media folder: it must say which folder failed, leave the file alone and exit.
+fn blocked_folder_test(r: &mut Report, out: &Path, exe: &Path) {
+    let dir = out.join("blocked-folder");
+    let _ = std::fs::remove_dir_all(&dir);
+    let copy = dir.join("pocketmedia.exe");
+    let blocker = dir.join("Media");
+    let prepared = std::fs::create_dir_all(&dir)
+        .and_then(|()| std::fs::copy(exe, &copy))
+        .and_then(|_| std::fs::write(&blocker, b"not a folder"));
+    if let Err(e) = prepared {
+        r.check("prepare the blocked-folder copy", false, &e.to_string());
+        return;
+    }
+    let Ok(mut child) = Command::new(&copy).arg("--exit-after-start").spawn() else {
+        r.check("blocked-folder copy launched", false, "spawn failed");
+        return;
+    };
+    let mut boxed = 0isize;
+    let shown = wait_until(5000, || {
+        boxed = find_window("#32770", Some(crate::paths::FAILURE_TITLE), child.id());
+        boxed != 0
+    });
+    if r.check("a folder that cannot be created shows a message", shown, "") {
+        std::thread::sleep(Duration::from_millis(300));
+        let text = longest_child_text(boxed);
+        r.check(
+            "the message names the folder and what to do",
+            text.contains(&blocker.display().to_string()) && text.contains("Move it to a folder you can write to"),
+            &text.replace('\n', " / "),
+        );
+        save_capture(r, &out.join("screens").join("folder-error.png"), capture_window(boxed));
+        post(boxed, WM_CLOSE, 0, 0);
+    }
+    let mut code = None;
+    let exited = wait_until(5000, || {
+        code = child.try_wait().ok().flatten().and_then(|s| s.code());
+        code.is_some()
+    });
+    r.check("it exits without starting", exited && code == Some(2), &format!("exit code {code:?}"));
+    if !exited {
+        let _ = child.kill();
+    }
+    let untouched = std::fs::read(&blocker).is_ok_and(|b| b == b"not a folder");
+    r.check("the file in the way is left alone", untouched, "");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 fn conflict_test(r: &mut Report, out: &Path, exe: &Path) {

@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-# serde/serde_json are allowed by RULES but not needed until the store (Phase 3).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct2D",
@@ -14,6 +15,8 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
     "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
     "Win32_Storage_Xps",
     "Win32_System_Com",
     "Win32_System_DataExchange",

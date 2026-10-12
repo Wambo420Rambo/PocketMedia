@@ -1,5 +1,6 @@
-//! Phases 1-2 only: fake in-memory data from the wireframe. No files.
-//! Phase 3 replaces this with the real library.
+//! The media item types, plus the wireframe's 8 example items. The
+//! app shows the real library; the examples remain for unit tests and as the
+//! files the self-test creates (`selftest/seed.rs`).
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MediaKind {
@@ -18,14 +19,54 @@ impl MediaKind {
     }
 }
 
-#[derive(Clone, Debug)]
+impl MediaKind {
+    /// The folder under Media that holds this kind.
+    pub fn folder(self) -> &'static str {
+        match self {
+            MediaKind::Gif => "GIFs",
+            MediaKind::Picture => "Pictures",
+            MediaKind::Video => "Videos",
+        }
+    }
+}
+
+/// One media file in the library.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Item {
     pub id: u32,
+    /// File name with extension, as shown and searched.
     pub name: String,
     pub kind: MediaKind,
-    /// Pixel size; 0 when unknown (fake imports have no real file to read).
+    /// Pixel size; 0 when unknown.
     pub width: u32,
     pub height: u32,
+    /// Relative to the Media folder, `/`-separated: `Pictures/Cat.png`.
+    pub path: String,
+    pub size: u64,
+    /// SHA-256 as hex; empty until needed (hashing happens only during import).
+    pub hash: String,
+    /// Seconds since 1970 when it was added.
+    pub added: u64,
+    /// Where it was imported from (information only).
+    pub source: Option<String>,
+}
+
+impl Item {
+    /// An item stored at `<kind folder>/<name>`.
+    pub fn new(id: u32, name: &str, kind: MediaKind, width: u32, height: u32) -> Self {
+        Item {
+            id,
+            name: name.into(),
+            kind,
+            width,
+            height,
+            path: format!("{}/{name}", kind.folder()),
+            size: 0,
+            hash: String::new(),
+            added: 0,
+            source: None,
+        }
+    }
 }
 
 pub fn items() -> Vec<Item> {
@@ -41,25 +82,11 @@ pub fn items() -> Vec<Item> {
         (8, "Reaction.gif", Gif, 400, 200),
     ]
     .into_iter()
-    .map(|(id, name, kind, width, height)| Item { id, name: name.into(), kind, width, height })
+    .map(|(id, name, kind, width, height)| Item::new(id, name, kind, width, height))
     .collect()
 }
 
 /// Recently used order, most recent first (as in the wireframe).
 pub fn recent() -> Vec<u32> {
     vec![1, 2, 3, 6, 7, 4, 5, 8]
-}
-
-/// Phase 2a only: the files "chosen" in Add media (the wireframe's example batch):
-/// (source name, kind, status, automatic new name, auto-renamed).
-pub fn import_rows() -> Vec<(&'static str, MediaKind, crate::add_media::RowStatus, Option<&'static str>, bool)> {
-    use crate::add_media::RowStatus::{Copy, Skip};
-    use MediaKind::*;
-    vec![
-        ("Cat.png", Picture, Copy, None, false),
-        ("Wave.gif", Gif, Copy, None, false),
-        ("Clip.mp4", Video, Copy, Some("Clip (2).mp4"), true),
-        ("IMG_4821.png", Picture, Copy, None, false),
-        ("Portrait.png", Picture, Skip, None, false),
-    ]
 }

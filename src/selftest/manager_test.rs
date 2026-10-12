@@ -22,6 +22,7 @@ pub(super) fn code(h: MHit) -> isize {
     match h {
         MHit::None => 0,
         MHit::Close => 1,
+        MHit::QuickPopup => 3,
         MHit::Caption => 2,
         MHit::Nav(i) => 10 + i as isize,
         MHit::AddMedia => 20,
@@ -45,6 +46,7 @@ pub(super) fn code(h: MHit) -> isize {
 pub(super) fn decode(c: isize) -> MHit {
     match c {
         1 => MHit::Close,
+        3 => MHit::QuickPopup,
         2 => MHit::Caption,
         10..=14 => MHit::Nav((c - 10) as usize),
         20 => MHit::AddMedia,
@@ -235,12 +237,21 @@ pub(super) fn run(r: &mut Report, t: &Session) -> bool {
         "Rename keeps the extension and the item (focused-28)",
         &["selected=\"Renamed clip.mp4\"", "status=\"Renamed to Renamed clip.mp4.\"", "|Renamed clip.mp4|"],
     );
+    let media = t.out.join("app").join("Media");
+    r.check(
+        "Rename renames the file on disk",
+        media.join("Videos").join("Renamed clip.mp4").is_file() && !media.join("Videos").join("Race clip.mp4").exists(),
+        "",
+    );
 
     // focused-30: Open folder (fake data has no files yet).
     m.click(r, MHit::OpenFolder);
     m.park();
     m.shot(r, "focused-30-manager-open-folder");
-    m.has(r, "Open folder says it needs real files (focused-30)", &["Phase 3"]);
+    // Explorer is not started under the self-test (it would take the foreground);
+    // the file it would select is checked. Opening it for real is a manual check.
+    let selected = media.join("Videos").join("Renamed clip.mp4").display().to_string();
+    m.has(r, "Open folder shows the file in File Explorer (focused-30)", &[&format!("opened={selected:?}")]);
 
     // focused-29: Move to Recycle Bin asks first.
     m.click(r, MHit::Recycle);
@@ -252,7 +263,12 @@ pub(super) fn run(r: &mut Report, t: &Session) -> bool {
     m.has(r, "Cancel keeps the item", &["confirming=false", "total=8", "selected=\"Renamed clip.mp4\""]);
     m.click(r, MHit::Recycle);
     m.click(r, MHit::ConfirmMove);
-    m.has(r, "confirming removes it and selects the next item", &["total=7", "selected=\"Hello.gif\"", "removed"]);
+    m.has(
+        r,
+        "confirming moves it to the Recycle Bin and selects the next item",
+        &["total=7", "selected=\"Hello.gif\"", "Renamed clip.mp4 was moved to the Recycle Bin."],
+    );
+    r.check("the file left the Media folder", !media.join("Videos").join("Renamed clip.mp4").exists(), "");
 
     // focused-31: a search with no match.
     if !m.click(r, MHit::Search) || !guard(r, &t.allowed) {
@@ -281,14 +297,16 @@ pub(super) fn run(r: &mut Report, t: &Session) -> bool {
     m.shot(r, "state-manager-add-media");
     m.has(r, "Add media opens inside the Manager", &["host=manager", "stage=start"]);
     m.add_click(r, El::AddChooseFiles);
+    wait_until(8000, || m.describe().contains("stage=review"));
     m.has(r, "Choose files shows the review list in the Manager", &["stage=review", "can_add=true"]);
     m.add_click(r, El::AddAdd);
+    wait_until(15000, || m.describe().starts_with("screen=manager"));
     m.park();
     m.shot(r, "state-manager-after-import");
     m.has(
         r,
         "files added from the Manager show first, newest selected",
-        &["total=11", "selected=\"IMG_4821.png\"", "names=IMG_4821.png|Clip (2).mp4|Wave.gif|Cat.png|", "4 files added"],
+        &["total=12", "selected=\"Hello (2).gif\"", "names=Hello (2).gif|IMG_4821.png|Clip.mp4|Wave.gif|Cat.png|", "5 files added"],
     );
 
     // The popup sees the same library: the rename, the removal and the import.
@@ -297,7 +315,7 @@ pub(super) fn run(r: &mut Report, t: &Session) -> bool {
     }
     t.click(r, El::List);
     t.click(r, El::Row(1));
-    t.state_has(r, "the popup shows the Manager's changes", &["count=11", "names=IMG_4821.png|", "Hello.gif"]);
+    t.state_has(r, "the popup shows the Manager's changes", &["count=12", "names=Hello (2).gif|IMG_4821.png|", "Hello.gif"]);
     let d = t.describe();
     r.check("the removed item is gone from the popup too", !d.contains("Renamed clip") && !d.contains("Race clip"), &d);
     if guard(r, &t.allowed) {

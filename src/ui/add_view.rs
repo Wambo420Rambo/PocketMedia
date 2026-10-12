@@ -42,7 +42,7 @@ pub struct RowGeom {
     pub row: Rect,
     pub input: Option<Rect>,
     pub ext: Rect,
-    pub message: Option<(Rect, &'static str)>,
+    pub message: Option<(Rect, String)>,
     pub route: Rect,
 }
 
@@ -68,6 +68,8 @@ pub struct AddLayout {
     pub choose_files: Rect,
     pub import_existing: Rect,
     pub choice_text_w: f32,
+    /// Why choosing failed, under the choices.
+    pub error: Option<Rect>,
     // Review page
     pub summary: Rect,
     pub rows: Vec<RowGeom>,
@@ -124,6 +126,7 @@ impl AddLayout {
         let choice_h = |small: &str| 2.0 + 28.0 + TextStyle::Medium.line() + 4.0 + gfx.wrapped_height(small, TextStyle::Small, choice_text_w);
         let choose_files = Rect::new(x0, drop.bottom() + 16.0, inner_w, choice_h(CHOOSE_FILES.1));
         let import_existing = Rect::new(x0, choose_files.bottom() + 8.0, inner_w, choice_h(IMPORT_EXISTING.1));
+        let error = a.error.as_deref().map(|e| Rect::new(x0, import_existing.bottom() + 12.0, inner_w, gfx.wrapped_height(e, TextStyle::Small, inner_w)));
 
         // Review page.
         let summary = Rect::new(x0, top, inner_w, TextStyle::Small.line());
@@ -138,7 +141,7 @@ impl AddLayout {
                 RowStatus::Skip => (None, TextStyle::Row.line()),
             };
             let msg = row.message();
-            let msg_h = msg.map_or(0.0, |m| 3.0 + gfx.wrapped_height(m, TextStyle::Small, name_w));
+            let msg_h = msg.as_deref().map_or(0.0, |m| 3.0 + gfx.wrapped_height(m, TextStyle::Small, name_w));
             let inner_h = first_h + msg_h;
             let r = Rect::new(x0, y, inner_w, ROW_PAD + inner_h + ROW_PAD + 1.0);
             let ext = Rect::new(name_x + name_w - ext_w, y + ROW_PAD, ext_w, INPUT_H);
@@ -155,7 +158,7 @@ impl AddLayout {
         let content_h = if review {
             choose_again.bottom() + 18.0 - top
         } else {
-            import_existing.bottom() + 18.0 - top
+            error.map_or(import_existing.bottom(), |e| e.bottom()) + 18.0 - top
         };
 
         AddLayout {
@@ -177,6 +180,7 @@ impl AddLayout {
             choose_files,
             import_existing,
             choice_text_w,
+            error,
             summary,
             rows,
             note,
@@ -232,6 +236,9 @@ impl AddLayout {
             return AddHit::None;
         }
         if a.reviewing() {
+            if !a.editable() {
+                return AddHit::Main;
+            }
             if let Some(i) = self.rows.iter().position(|g| g.input.is_some_and(|r| r.contains(x, y))) {
                 return AddHit::RowInput(i);
             }
@@ -288,6 +295,9 @@ pub fn paint(p: &Painter, a: &AddMedia, l: &AddLayout, ui: &AddUi) {
         review(p, a, l, ui, &ring, &quiet);
     } else {
         start(p, l, ui, &ring);
+        if let (Some(r), Some(e)) = (l.error, a.error.as_deref()) {
+            p.text_wrapped(e, r.x, r.y, r.w, TextStyle::Small, ERROR);
+        }
     }
     if l.max_scroll() > 0.0 {
         let track = l.main.h;
@@ -393,16 +403,24 @@ fn review(
                 p.text(&row.source, r, TextStyle::Row, TEXT, Align::Start, true);
             }
         }
-        if let Some((r, m)) = g.message {
-            p.text_wrapped(m, r.x, r.y, r.w, TextStyle::Small, MUTED);
+        if let Some((r, m)) = &g.message {
+            let c = if matches!(row.outcome, Some(Err(_))) { ERROR } else { MUTED };
+            p.text_wrapped(m, r.x, r.y, r.w, TextStyle::Small, c);
         }
         let route_c = if row.status == RowStatus::Skip { MUTED } else { SOFT_TEXT };
-        let route = if row.status == RowStatus::Skip { "Skipped" } else { row.destination() };
+        let route = match (&row.outcome, row.status) {
+            (Some(Ok(_)), _) => "Added",
+            (Some(Err(_)), _) => "Not added",
+            (_, RowStatus::Skip) => "Skipped",
+            _ => row.destination(),
+        };
         p.text(route, g.route, TextStyle::Small, route_c, Align::End, true);
         p.line(g.row.x, g.row.bottom() - 0.5, g.row.right(), g.row.bottom() - 0.5, 1.0, BORDER);
     }
     p.text_wrapped(NOTE, l.note.x, l.note.y, l.note.w, TextStyle::Small, MUTED);
-    quiet(l.choose_again, AddHit::ChooseAgain);
-    p.text("Choose again", l.choose_again, TextStyle::Body, TEXT, Align::Center, true);
-    ring(AddFocus::ChooseAgain, l.choose_again, 6.0);
+    if a.editable() {
+        quiet(l.choose_again, AddHit::ChooseAgain);
+        p.text("Choose again", l.choose_again, TextStyle::Body, TEXT, Align::Center, true);
+        ring(AddFocus::ChooseAgain, l.choose_again, 6.0);
+    }
 }

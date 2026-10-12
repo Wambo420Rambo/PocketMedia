@@ -9,6 +9,7 @@ use super::layout::{Rect, TextStyle, text_button_w};
 use super::manager_view::{Frame, FrameHit, FrameLook, paint_border, paint_frame};
 use super::widgets::{self, ACCENT, BG, BORDER, MUTED, SOFT, SURFACE, TEXT};
 use crate::manager_state::Nav;
+use crate::paths;
 use crate::settings_state::{Profile, SFocus, SettingsPage, VideoPreview};
 
 /// The settings column is at most 700 wide; panels leave 10 for the scrollbar gutter.
@@ -42,7 +43,6 @@ const SHORTCUT_TITLE: &str = "Global shortcut";
 pub const SHORTCUT: &str = "Win + Alt + .";
 const CLOSE_AFTER_TITLE: &str = "Close after inserting";
 const FOLDER_TITLE: &str = "Media folder";
-pub const MEDIA_FOLDER: &str = "C:\\PocketMedia\\Media";
 const IMPORT_TITLE: &str = "Import your existing media";
 const IMPORT_DESC: &str = "Select a folder. Supported files from it and all subfolders are sorted and copied into Pictures, GIFs and Videos. Original files stay where they are.";
 const BACKUP_TITLE: &str = "Back up library";
@@ -56,6 +56,7 @@ pub enum SHit {
     None,
     Caption,
     Close,
+    QuickPopup,
     Nav(usize),
     Profile(usize),
     Video,
@@ -204,7 +205,7 @@ impl SettingsLayout {
         // Library: media folder, import, backup.
         let p2 = section(2, &mut y);
         let open = (text_button_w(gfx.measure("Open folder", TextStyle::Body)), BUTTON_H);
-        let folder = row(gfx, ix, iw, p2 + PANEL_PAD, false, Some(MEDIA_FOLDER), open);
+        let folder = row(gfx, ix, iw, p2 + PANEL_PAD, false, Some(&paths::media_text()), open);
         let import = row(gfx, ix, iw, folder.area.bottom(), true, Some(IMPORT_DESC), (CHOOSE_W, CHOOSE_H));
         let backup_w = text_button_w(gfx.measure("Back up library", TextStyle::Body));
         let backup = row(gfx, ix, iw, import.area.bottom(), true, Some(BACKUP_DESC), (backup_w, BUTTON_H));
@@ -252,6 +253,7 @@ impl SettingsLayout {
     pub fn focus_rect(&self, s: &SettingsPage, f: SFocus) -> Option<Rect> {
         Some(match f {
             SFocus::Close => self.frame.close,
+            SFocus::QuickPopup => self.frame.quick_popup,
             SFocus::Nav(i) => *self.frame.nav.get(i)?,
             SFocus::Profile => self.choices[s.draft.profile.index()].card,
             SFocus::Video => self.video.control,
@@ -269,7 +271,7 @@ impl SettingsLayout {
     /// Scroll offset that brings `f` fully into the scroll area.
     pub fn scroll_to_show(&self, s: &SettingsPage, f: SFocus) -> f32 {
         let Some(r) = self.focus_rect(s, f) else { return s.scroll };
-        let inside = matches!(f, SFocus::Close | SFocus::Nav(_) | SFocus::Cancel | SFocus::Save);
+        let inside = matches!(f, SFocus::Close | SFocus::QuickPopup | SFocus::Nav(_) | SFocus::Cancel | SFocus::Save);
         if inside {
             return s.scroll;
         }
@@ -295,6 +297,7 @@ impl SettingsLayout {
         }
         match self.frame.hit(x, y) {
             Some(FrameHit::Close) => return SHit::Close,
+            Some(FrameHit::QuickPopup) => return SHit::QuickPopup,
             Some(FrameHit::Caption) => return SHit::Caption,
             Some(FrameHit::Nav(i)) => return SHit::Nav(i),
             None => {}
@@ -349,11 +352,13 @@ pub fn paint(p: &Painter, s: &SettingsPage, l: &SettingsLayout, ui: &SettingsUi)
     let look = FrameLook {
         hover: match ui.hover {
             SHit::Close => Some(FrameHit::Close),
+            SHit::QuickPopup => Some(FrameHit::QuickPopup),
             SHit::Nav(i) => Some(FrameHit::Nav(i)),
             _ => None,
         },
         ring: match s.focus {
             SFocus::Close if s.focus_visible => Some(FrameHit::Close),
+            SFocus::QuickPopup if s.focus_visible => Some(FrameHit::QuickPopup),
             SFocus::Nav(i) if s.focus_visible => Some(FrameHit::Nav(i)),
             _ => None,
         },
@@ -395,7 +400,7 @@ pub fn paint(p: &Painter, s: &SettingsPage, l: &SettingsLayout, ui: &SettingsUi)
     let hot = hover(SHit::CloseAfter);
     widgets::checkbox(p, l.close_after.control, s.draft.close_after_insert, hot, ring(SFocus::CloseAfter));
 
-    title_and_desc(p, &l.folder, FOLDER_TITLE, Some(MEDIA_FOLDER));
+    title_and_desc(p, &l.folder, FOLDER_TITLE, Some(&paths::media_text()));
     widgets::quiet_button(p, l.folder.control, "Open folder", TextStyle::Body, hover(SHit::OpenFolder), true);
     widgets::ring(p, ring(SFocus::OpenFolder), l.folder.control, 6.0);
     separator(p, &l.import);

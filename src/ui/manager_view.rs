@@ -36,6 +36,7 @@ pub enum MHit {
     /// The title bar outside the × button: drags the window.
     Caption,
     Close,
+    QuickPopup,
     Nav(usize),
     AddMedia,
     Search,
@@ -83,15 +84,21 @@ pub struct Frame {
     pub title: Rect,
     pub caption: Rect,
     pub close: Rect,
+    /// "Quick popup": hides this window and opens the popup (not in the wireframe;
+    /// asked for by the owner).
+    pub quick_popup: Rect,
     pub sidebar: Rect,
     pub labels: [Rect; 2],
     pub nav: [Rect; 5],
 }
 
+pub const QUICK_POPUP: &str = "Quick popup";
+
 /// What the frame has under the pointer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameHit {
     Close,
+    QuickPopup,
     Caption,
     Nav(usize),
 }
@@ -104,6 +111,8 @@ impl Frame {
         let title = Rect::new(1.0 + 14.0 + 9.0, 1.0, title_w, TITLE_H - 1.0);
         let caption = Rect::new(title.right() + 9.0, 1.0, gfx.measure(caption, TextStyle::Small) + 2.0, TITLE_H - 1.0);
         let close = Rect::new(width - 1.0 - 14.0 - 32.0, 1.0 + (TITLE_H - 1.0 - 28.0) / 2.0, 32.0, 28.0);
+        let qw = text_button_w(gfx.measure(QUICK_POPUP, TextStyle::Small));
+        let quick_popup = Rect::new(close.x - 8.0 - qw, close.y, qw, close.h);
 
         // Sidebar: padding 18 10; labels 11px with margins 12 8 8; buttons 36 + 5.
         let body_y = Self::body_y();
@@ -121,7 +130,7 @@ impl Frame {
             *slot = Rect::new(nav_x, y, nav_w, BUTTON_H);
             y += BUTTON_H + NAV_GAP;
         }
-        Frame { width, height, titlebar, title, caption, close, sidebar, labels: [lib_label, types_label], nav }
+        Frame { width, height, titlebar, title, caption, close, quick_popup, sidebar, labels: [lib_label, types_label], nav }
     }
 
     /// Top of everything under the title bar.
@@ -132,6 +141,8 @@ impl Frame {
     pub fn hit(&self, x: f32, y: f32) -> Option<FrameHit> {
         if self.close.contains(x, y) {
             Some(FrameHit::Close)
+        } else if self.quick_popup.contains(x, y) {
+            Some(FrameHit::QuickPopup)
         } else if self.titlebar.contains(x, y) {
             Some(FrameHit::Caption)
         } else {
@@ -151,6 +162,9 @@ pub fn paint_frame(p: &Painter, f: &Frame, caption: &str, selected: &dyn Fn(Nav)
     p.clear(BG);
     let close = Some(FrameHit::Close);
     widgets::title_bar(p, f.titlebar, f.title, f.close, look.hover == close, look.ring == close);
+    let qp = Some(FrameHit::QuickPopup);
+    widgets::quiet_button(p, f.quick_popup, QUICK_POPUP, TextStyle::Small, look.hover == qp, true);
+    widgets::ring(p, look.ring == qp, f.quick_popup, 6.0);
     p.text(caption, f.caption, TextStyle::Small, MUTED, Align::Start, true);
 
     p.fill(f.sidebar, 0.0, SIDEBAR);
@@ -311,6 +325,7 @@ impl ManagerLayout {
         }
         match self.frame.hit(x, y) {
             Some(FrameHit::Close) => return MHit::Close,
+            Some(FrameHit::QuickPopup) => return MHit::QuickPopup,
             Some(FrameHit::Caption) => return MHit::Caption,
             Some(FrameHit::Nav(i)) => return MHit::Nav(i),
             None => {}
@@ -369,6 +384,7 @@ pub fn paint(p: &Painter, s: &ManagerState, lib: &Library, l: &ManagerLayout, ui
     let ring = |f: MFocus| s.focus_visible && s.focus == f;
     let frame_hit = |h: MHit| match h {
         MHit::Close => Some(FrameHit::Close),
+        MHit::QuickPopup => Some(FrameHit::QuickPopup),
         MHit::Nav(i) => Some(FrameHit::Nav(i)),
         _ => None,
     };
@@ -376,6 +392,7 @@ pub fn paint(p: &Painter, s: &ManagerState, lib: &Library, l: &ManagerLayout, ui
         hover: frame_hit(ui.hover),
         ring: match s.focus {
             MFocus::Close if s.focus_visible => Some(FrameHit::Close),
+            MFocus::QuickPopup if s.focus_visible => Some(FrameHit::QuickPopup),
             MFocus::Nav(i) if s.focus_visible => Some(FrameHit::Nav(i)),
             _ => None,
         },

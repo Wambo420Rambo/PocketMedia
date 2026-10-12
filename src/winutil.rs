@@ -161,3 +161,15 @@ pub fn clipboard_text(owner: HWND) -> Option<String> {
         text
     }
 }
+
+/// Opens a folder in File Explorer.
+pub fn open_folder(dir: &std::path::Path) -> Result<(), String> {
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows::core::{HSTRING, w};
+    let file = HSTRING::from(dir.as_os_str());
+    // SAFETY: the HSTRINGs outlive the call; no owner window or parameters.
+    let result = unsafe { ShellExecuteW(None, w!("open"), &file, None, None, SW_SHOWNORMAL) };
+    // ShellExecute returns a value above 32 on success.
+    if result.0 as usize > 32 { Ok(()) } else { Err(format!("Windows returned error {}", result.0 as usize)) }
+}

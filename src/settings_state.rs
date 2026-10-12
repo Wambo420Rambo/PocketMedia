@@ -1,9 +1,12 @@
 //! The Settings page: saved values, the staged draft the user edits, and
 //! keyboard focus. Save commits the draft, Cancel discards it. No drawing, no Win32.
 //!
-//! Values live in memory only. The JSON store arrives in Phase 3.
+//! Saved values live in the store (`store.rs`); Save writes them there.
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Profile {
     LessMemory,
     OpenFaster,
@@ -31,7 +34,8 @@ impl Profile {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum VideoPreview {
     HoverOnly,
     Off,
@@ -52,7 +56,9 @@ impl VideoPreview {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// Saved in the store; a missing field takes its default.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Settings {
     pub profile: Profile,
     pub video_preview: VideoPreview,
@@ -70,6 +76,7 @@ impl Default for Settings {
 /// Keyboard focus targets on the Settings page, in Tab order.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SFocus {
+    QuickPopup,
     Close,
     Nav(usize),
     /// The resource-usage radio group (one Tab stop; arrows choose).
@@ -110,7 +117,11 @@ impl Default for SettingsPage {
 
 impl SettingsPage {
     pub fn new() -> Self {
-        let saved = Settings::default();
+        Self::with_saved(Settings::default())
+    }
+
+    /// The page for settings loaded from the store.
+    pub fn with_saved(saved: Settings) -> Self {
         Self { saved, draft: saved, scroll: 0.0, focus: SFocus::Profile, focus_visible: false, video_open: None, note: None }
     }
 
@@ -186,7 +197,7 @@ impl SettingsPage {
     }
 
     pub fn focus_order(&self) -> Vec<SFocus> {
-        let mut order = vec![SFocus::Close];
+        let mut order = vec![SFocus::QuickPopup, SFocus::Close];
         order.extend((0..5).map(SFocus::Nav));
         order.extend([
             SFocus::Profile,
@@ -300,7 +311,7 @@ mod tests {
         assert!(!p.focus_order().contains(&SFocus::Save));
         p.focus = SFocus::Cancel;
         p.tab(false);
-        assert_eq!(p.focus, SFocus::Close, "wraps past the disabled Save");
+        assert_eq!(p.focus, SFocus::QuickPopup, "wraps past the disabled Save");
         p.toggle_autostart();
         p.focus = SFocus::Cancel;
         p.tab(false);

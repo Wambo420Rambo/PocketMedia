@@ -4,23 +4,34 @@
 //! hand-back, paste of a test PNG and dragging it out.
 //! The quick popup drawn with Direct2D/DirectWrite over fake items.
 //! Add media and the Manager over the same fake, in-memory library.
-//! No real files, settings or persistence yet.
+//! The real library: the Media, Data and Cache folders beside the
+//! program, the library file `Data\pocketmedia.json`, import, names on disk,
+//! search and the Recycle Bin.
 
 #![windows_subsystem = "windows"]
 
 mod add_media;
 mod add_panel;
+mod dialogs;
+mod digest;
+mod fileops;
+mod import;
+mod jobs;
 mod library;
 mod manager;
 mod manager_state;
+mod media_info;
 mod names;
 mod paste;
+mod paths;
 mod popup;
 mod popup_state;
 mod sample;
 mod search;
 mod selftest;
 mod settings_state;
+mod sha256;
+mod store;
 mod target;
 mod test_png;
 mod test_target;
@@ -103,15 +114,11 @@ pub fn app<R>(f: impl FnOnce(&App) -> R) -> R {
     APP.with(f)
 }
 
-/// Records the result of the last paste/drag. Problems are shown as a tray
-/// notification, which never takes focus from the app being pasted into.
+/// Records the result of the last paste/drag (for the self-test log). It is never
+/// shown as a Windows notification; the popup shows its own short line instead.
 pub fn set_status(text: impl Into<String>, kind: StatusKind) {
     let text = text.into();
-    app(|a| *a.status.borrow_mut() = (text.clone(), kind));
-    let (main, quiet) = app(|a| (a.main.get(), a.quiet.get()));
-    if kind == StatusKind::Bad && !quiet {
-        tray::notify(main, "PocketMedia", &text, true);
-    }
+    app(|a| *a.status.borrow_mut() = (text, kind));
 }
 
 /// Command-line modes. Normal launch has no arguments.
@@ -138,6 +145,40 @@ fn main() {
         let _ = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
         std::process::exit(test_target::run(out));
     }
+    // The folders come first: without them there is nowhere to keep media.
+    let folders = paths::Paths::beside_exe()
+        .map_err(|e| (PathBuf::from("(program folder)"), e))
+        .and_then(|p| p.create().map(|()| p));
+    let folders = match (folders, &mode) {
+        // The self-test checks the folders beside the program, then works in its own
+        // fresh copy under the results folder, so it never touches a real library.
+        (Ok(_), Mode::SelfTest(out)) => {
+            let p = paths::Paths::under(&out.join("app"));
+            p.create().map(|()| p)
+        }
+        (other, _) => other,
+    };
+    let paths = match folders {
+        Ok(p) => p,
+        Err((dir, e)) => {
+            message_box(&paths::failure_message(&dir, &e), paths::FAILURE_TITLE, MB_ICONERROR);
+            std::process::exit(2);
+        }
+    };
+    let outcome = store::init(&paths.data);
+    let media = paths.media.clone();
+    paths::init(paths);
+    let quiet = matches!(mode, Mode::SelfTest(_));
+    if let Some(text) = outcome.message()
+        && !quiet
+    {
+        message_box(&text, "PocketMedia - library file", MB_ICONWARNING);
+    }
+    if let Some(text) = load_library(&media)
+        && !quiet
+    {
+        message_box(&text, "PocketMedia - library", MB_ICONINFORMATION);
+    }
     unsafe {
         // Ignore failure: it only fails if awareness was already set (e.g. by a manifest).
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -163,6 +204,39 @@ fn main() {
     }
     unsafe { OleUninitialize() };
     std::process::exit(selftest::exit_code());
+}
+
+/// Loads the library from the store and makes it agree with the Media folders
+/// (an interrupted import leaves no orphan or half-written file):
+/// leftover temporary copies are deleted, finished copies without a record are
+/// added, and records whose file is gone are removed. Returns a message when
+/// files were missing.
+fn load_library(media: &std::path::Path) -> Option<String> {
+    let data = store::with(|s| s.data.clone()).unwrap_or_default();
+    let mut lib = library::Library::from_store(&data);
+    import::cleanup_partials(media);
+    let records: Vec<(u32, String)> = lib.items.iter().map(|i| (i.id, i.path.clone())).collect();
+    let (orphans, missing) = import::reconcile(media, &records);
+    let missing_names: Vec<String> =
+        missing.iter().filter_map(|id| lib.get(*id).map(|i| i.name.clone())).collect();
+    for id in &missing {
+        lib.remove(*id);
+    }
+    for o in &orphans {
+        lib.adopt(o);
+    }
+    let changed = !orphans.is_empty() || !missing.is_empty();
+    library::set(lib);
+    if changed {
+        let _ = library::persist();
+    }
+    (!missing_names.is_empty()).then(|| {
+        format!(
+            "{} file(s) were no longer in the Media folder and were removed from the library:\n\n{}",
+            missing_names.len(),
+            missing_names.join("\n")
+        )
+    })
 }
 
 fn prepare_assets() -> std::io::Result<()> {
@@ -207,6 +281,7 @@ fn run(mode: &Mode) -> Result<(), String> {
             a.main.set(main);
             a.taskbar_created.set(RegisterWindowMessageW(w!("TaskbarCreated")));
         });
+        jobs::init(main);
 
         popup::create(instance.into())?;
         tray::add(main);
@@ -294,6 +369,14 @@ extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
                 LRESULT(0)
             }
             WM_SELFTEST => selftest::on_ui_command(wparam, lparam),
+            jobs::WM_JOB => {
+                for ev in jobs::take() {
+                    if !popup::on_job(&ev) {
+                        manager::on_job(&ev);
+                    }
+                }
+                LRESULT(0)
+            }
             WM_TIMER if wparam.0 == TIMER_PASTE => {
                 paste::tick();
                 LRESULT(0)

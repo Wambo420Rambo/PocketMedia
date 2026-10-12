@@ -1,4 +1,6 @@
 //! "Paste test PNG": copy, hand focus back to the target, verify, then Ctrl+V.
+//! When there is no app to paste into, the image stays on the clipboard and the
+//! popup says "Copied to clipboard" (no Windows notification).
 //!
 //! Ctrl+V is only sent once Windows reports the target (or a window it owns) as
 //! the foreground window and no modifier keys are held. If that does not happen
@@ -11,9 +13,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::target::{self, Elevation};
-use crate::{SHORTCUT_LABEL, StatusKind, TIMER_PASTE, app, assets, popup, set_status, transfer, tray};
+use crate::{StatusKind, TIMER_PASTE, app, assets, popup, set_status, transfer, tray};
 
 const TICK_MS: u32 = 25;
+const COPIED: &str = "Copied to clipboard";
 const MAX_TICKS: u32 = 40; // ~1 second
 
 thread_local! {
@@ -35,6 +38,7 @@ pub fn begin() {
 
     if let Err(e) = transfer::put_on_clipboard(main, &a.png, &a.image, &a.file) {
         set_status(format!("Copy failed: {e}"), StatusKind::Bad);
+        popup::show_status(&format!("Could not copy: {e}"));
         return;
     }
 
@@ -42,35 +46,22 @@ pub fn begin() {
     let t = match target {
         Ok(t) => t,
         Err(reason) => {
-            set_status(
-                format!(
-                    "Copied to the clipboard, but there is no app to paste into ({}). \
-                     Press Esc, click into the app you want, then press {SHORTCUT_LABEL}.",
-                    reason.describe()
-                ),
-                StatusKind::Bad,
-            );
+            set_status(format!("Copied to clipboard; no app to paste into ({}).", reason.describe()), StatusKind::Neutral);
+            popup::show_status(COPIED);
             return;
         }
     };
     if !t.still_exists() {
-        set_status(
-            "Copied to the clipboard, but the target window has closed. Nothing was pasted.",
-            StatusKind::Bad,
-        );
+        set_status("Copied to clipboard; the target window has closed.", StatusKind::Neutral);
+        popup::show_status(COPIED);
         return;
     }
     if target::process_elevation(Some(t.pid)) == Elevation::Elevated
         && target::process_elevation(None) != Elevation::Elevated
     {
-        set_status(
-            format!(
-                "Copied to the clipboard, but {} runs as administrator. Windows blocks \
-                 simulated paste from a normal app into it. Press Ctrl+V there yourself.",
-                t.exe
-            ),
-            StatusKind::Bad,
-        );
+        set_status(format!("Copied to clipboard; {} runs as administrator.", t.exe), StatusKind::Neutral);
+        // Windows blocks simulated paste from a normal app into an elevated one.
+        popup::show_status(&format!("{COPIED} - press Ctrl+V in {} yourself (it runs as administrator)", t.exe));
         return;
     }
 
@@ -110,7 +101,7 @@ pub fn tick() {
             }
             Err(e) => {
                 set_status(format!("Paste not sent: {e}"), StatusKind::Bad);
-                tray::notify(main, "PocketMedia - paste not sent", &e, true);
+                tray::set_tip(main, "PocketMedia - copied to clipboard");
             }
         }
         return;
@@ -129,7 +120,7 @@ pub fn tick() {
              press Ctrl+V yourself, or reopen the popup and drag it.",
             t.exe
         );
-        set_status(text.clone(), StatusKind::Bad);
-        tray::notify(main, "PocketMedia - paste not sent", &text, true);
+        set_status(text, StatusKind::Bad);
+        tray::set_tip(main, "PocketMedia - copied to clipboard");
     }
 }

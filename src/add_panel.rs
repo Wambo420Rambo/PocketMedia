@@ -9,7 +9,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_SPACE, VK_TAB, VK_UP, VK_V,
 };
 
-use crate::add_media::{AddFocus, AddMedia, RowStatus};
+use crate::add_media::{AddFocus, AddMedia, RowStatus, Stage};
+use crate::dialogs::Pick;
+use crate::import::Source;
+use crate::jobs::{self, Event, Job};
 use crate::library;
 use crate::ui::add_view::{self, AddHit, AddLayout, AddUi};
 use crate::ui::d2d::Gfx;
@@ -30,6 +33,9 @@ pub enum AddOutcome {
     Capture(bool),
     /// Ctrl+V in a name field: the host reads the clipboard and calls `insert`.
     PasteText,
+    /// Show the file or folder picker (outside any view borrow: it is modal),
+    /// then call `picked` with the result.
+    Pick(Pick),
 }
 
 /// The window size the panel is laid out in, in DIPs.
@@ -43,6 +49,12 @@ pub struct AddPanel {
     pub add: AddMedia,
     pub hover: AddHit,
     pressed: AddHit,
+    /// The scan or copy running for this panel.
+    job: Option<Job>,
+    /// Opened from Settings' "Choose folder…": closing the picker leaves the panel.
+    leave_if_no_pick: bool,
+    /// A save of the library file failed during this import.
+    save_error: Option<String>,
 }
 
 impl Default for AddPanel {
@@ -53,15 +65,100 @@ impl Default for AddPanel {
 
 impl AddPanel {
     pub fn new() -> Self {
-        Self { add: AddMedia::new(), hover: AddHit::None, pressed: AddHit::None }
+        Self { add: AddMedia::new(), hover: AddHit::None, pressed: AddHit::None, job: None, leave_if_no_pick: false, save_error: None }
     }
 
-    /// Settings' "Choose folder…": straight to the review of the chosen folder
-    /// (fake files in Phase 2, as for "Import your existing media").
-    pub fn for_import() -> Self {
-        let mut panel = Self::new();
-        library::with(|lib| panel.add.choose(&lib.items));
-        panel
+    /// Settings' "Choose folder…": the host shows the folder picker right away;
+    /// cancelling it goes back to Settings.
+    pub fn for_settings() -> Self {
+        Self { leave_if_no_pick: true, ..Self::new() }
+    }
+
+    /// A scan or copy is running: the host keeps the panel (and its window state).
+    pub fn busy(&self) -> bool {
+        self.add.busy()
+    }
+
+    /// The picker closed: start checking the chosen files, or stay (or leave).
+    pub fn picked(&mut self, source: Option<Source>) -> AddOutcome {
+        let leave = std::mem::take(&mut self.leave_if_no_pick);
+        let Some(source) = source else {
+            return if leave && self.add.stage == Stage::Start { AddOutcome::Leave } else { AddOutcome::None };
+        };
+        let Some(media) = crate::paths::get().map(|p| p.media.clone()) else {
+            self.add.scan_failed("The Media folder is not set up.".into());
+            return AddOutcome::None;
+        };
+        let known = library::with(|lib| lib.known_files(&media));
+        self.add.begin_scan();
+        self.job = Some(jobs::plan(source, known, media));
+        AddOutcome::None
+    }
+
+    /// The event belongs to this panel's running job.
+    pub fn owns(&self, ev: &Event) -> bool {
+        self.job.as_ref().map(|j| j.id) == Some(ev.job())
+    }
+
+    /// A result from this panel's worker. The library and the store are updated
+    /// here, one file at a time, so an interrupted import keeps every finished copy.
+    pub fn on_job(&mut self, ev: &Event) -> AddOutcome {
+        if self.job.as_ref().map(|j| j.id) != Some(ev.job()) {
+            return AddOutcome::None;
+        }
+        match ev {
+            Event::Planned { result: Ok(plan), .. } => {
+                self.job = None;
+                if !plan.library_hashes.is_empty() {
+                    library::with_mut(|lib| lib.set_hashes(&plan.library_hashes));
+                    self.note_save(library::persist());
+                }
+                library::with(|lib| self.add.load_plan(plan, &lib.names()));
+            }
+            Event::Planned { result: Err(e), .. } => {
+                self.job = None;
+                if self.add.stage == Stage::Scanning {
+                    self.add.scan_failed(e.clone());
+                }
+            }
+            Event::Copied { index, kind, result, .. } => {
+                if let Ok(c) = result {
+                    library::with_mut(|lib| lib.add_copied(c, *kind));
+                    self.note_save(library::persist());
+                }
+                self.add.copied(*index, result);
+            }
+            Event::Finished { stopped, .. } => {
+                self.job = None;
+                let mut status = self.add.finish(*stopped);
+                if let Some(e) = self.save_error.take() {
+                    status = format!("{status} Warning: {e}.");
+                }
+                return AddOutcome::Imported(status);
+            }
+        }
+        AddOutcome::None
+    }
+
+    fn note_save(&mut self, r: Result<(), String>) {
+        if let Err(e) = r {
+            self.save_error = Some(e);
+        }
+    }
+
+    /// Cancel / ← / Escape while work is running.
+    fn stop(&mut self) {
+        if let Some(job) = &self.job {
+            job.cancel();
+        }
+        match self.add.stage {
+            Stage::Scanning => {
+                self.job = None;
+                self.add.reset();
+            }
+            Stage::Copying { .. } => self.add.stop(),
+            _ => {}
+        }
     }
 
     pub fn layout(&self, gfx: &Gfx, area: Area) -> AddLayout {
@@ -114,7 +211,7 @@ impl AddPanel {
         let a = &mut self.add;
         a.focus_visible = false;
         match hit {
-            AddHit::RowInput(i) => {
+            AddHit::RowInput(i) if a.editable() => {
                 a.focus = AddFocus::Row(i);
                 let input_x = l.rows.get(i).and_then(|g| g.input).map_or(0.0, |r| r.x + 9.0);
                 let name = &mut a.rows[i].name;
@@ -122,7 +219,7 @@ impl AddPanel {
                 name.set_caret_utf16(pos);
                 AddOutcome::None
             }
-            AddHit::None | AddHit::Main => AddOutcome::None,
+            AddHit::None | AddHit::Main | AddHit::RowInput(_) => AddOutcome::None,
             other => {
                 a.focus = match other {
                     AddHit::Close => AddFocus::Close,
@@ -160,16 +257,26 @@ impl AddPanel {
     }
 
     fn activate(&mut self, gfx: &Gfx, area: Area, hit: AddHit) -> AddOutcome {
+        let busy = self.add.busy();
         let a = &mut self.add;
         match hit {
             AddHit::Close => return AddOutcome::CloseWindow,
+            AddHit::Cancel | AddHit::Back if busy => {
+                let scanning = self.add.stage == Stage::Scanning;
+                self.stop();
+                if scanning && hit == AddHit::Cancel {
+                    return AddOutcome::Leave;
+                }
+            }
             AddHit::Cancel => return AddOutcome::Leave,
             AddHit::Back if !a.reviewing() => return AddOutcome::Leave,
             AddHit::Back | AddHit::ChooseAgain => a.reset(),
-            AddHit::ChooseFiles | AddHit::ImportExisting => library::with(|lib| a.choose(&lib.items)),
+            AddHit::ChooseFiles => return AddOutcome::Pick(Pick::Files),
+            AddHit::ImportExisting => return AddOutcome::Pick(Pick::Folder),
             AddHit::Add => {
-                if let Some(status) = library::with_mut(|lib| a.import_into(&mut lib.items)) {
-                    return AddOutcome::Imported(status);
+                if let (Some(requests), Some(p)) = (a.begin_copy(), crate::paths::get()) {
+                    self.save_error = None;
+                    self.job = Some(jobs::copy(requests, p.media.clone()));
                 }
             }
             _ => {}
@@ -180,12 +287,18 @@ impl AddPanel {
 
     pub fn key(&mut self, gfx: &Gfx, area: Area, vk: VIRTUAL_KEY, ctrl: bool, shift: bool) -> AddOutcome {
         if vk == VK_ESCAPE {
+            if self.add.busy() {
+                let scanning = self.add.stage == Stage::Scanning;
+                self.stop();
+                return if scanning { AddOutcome::Leave } else { AddOutcome::None };
+            }
             return AddOutcome::Leave;
         }
+        let editable = self.add.editable();
         let a = &mut self.add;
         match (vk, a.focus) {
             (VK_TAB, _) => a.tab(shift),
-            (_, AddFocus::Row(i)) => {
+            (_, AddFocus::Row(i)) if editable => {
                 let f = &mut a.rows[i].name;
                 // Caret moves leave the name as it is; edits re-validate the batch.
                 let edited = match vk {
@@ -235,7 +348,7 @@ impl AddPanel {
                     _ => false,
                 };
                 if edited {
-                    library::with(|lib| a.edited(i, &lib.items));
+                    library::with(|lib| a.edited(i, &lib.names()));
                 }
             }
             (VK_RETURN | VK_SPACE, focus) => {
@@ -260,9 +373,9 @@ impl AddPanel {
     /// Typed or pasted text for the focused name field.
     pub fn insert(&mut self, text: &str) {
         let a = &mut self.add;
-        if let AddFocus::Row(i) = a.focus {
+        if let (AddFocus::Row(i), true) = (a.focus, a.editable()) {
             a.rows[i].name.insert(text);
-            library::with(|lib| a.edited(i, &lib.items));
+            library::with(|lib| a.edited(i, &lib.names()));
         }
     }
 
@@ -274,18 +387,27 @@ impl AddPanel {
             .iter()
             .map(|r| {
                 let state = match (r.status, r.error) {
+                    (RowStatus::Skip, _) if r.unsupported() => "unsupported".to_string(),
                     (RowStatus::Skip, _) => "skip".to_string(),
                     (_, Some(e)) => format!("{e:?}"),
+                    _ if r.auto_renamed => "ok-numbered".into(),
                     _ => "ok".into(),
                 };
                 format!("{}{}:{state}", r.name.text(), r.ext())
             })
             .collect();
         format!(
-            "screen=add stage={} can_add={} label={:?} rows={}",
-            if a.reviewing() { "review" } else { "start" },
+            "screen=add stage={} can_add={} label={:?} summary={:?} error={:?} rows={}",
+            match a.stage {
+                Stage::Start => "start",
+                Stage::Scanning => "scanning",
+                Stage::Review => "review",
+                Stage::Copying { .. } => "copying",
+            },
             a.can_add(),
             a.add_label(),
+            a.summary(),
+            a.error.as_deref().unwrap_or(""),
             rows.join("|")
         )
     }
@@ -300,9 +422,9 @@ impl AddPanel {
             AddHit::ChooseFiles if !a.reviewing() => l.choose_files,
             AddHit::ImportExisting if !a.reviewing() => l.import_existing,
             AddHit::RowInput(i) => l.rows.get(i)?.input?,
-            AddHit::ChooseAgain if a.reviewing() => l.choose_again,
+            AddHit::ChooseAgain if a.editable() => l.choose_again,
             AddHit::Cancel if a.reviewing() => l.cancel,
-            AddHit::Add if a.reviewing() => l.add,
+            AddHit::Add if a.editable() => l.add,
             // Somewhere in the scrolling area that is not a control: the summary line.
             AddHit::Main => Rect::new(l.main.x + l.main.w - 40.0, l.main.y + 4.0, 10.0, 8.0),
             _ => return None,

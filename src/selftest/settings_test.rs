@@ -9,6 +9,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_LEFT, VK_RETURN, V
 use super::manager_test;
 use super::{
     CMD_MANAGER, CMD_MANAGER_DESCRIBE, CMD_MANAGER_POINT, CMD_RESET, CMD_SETTINGS_POINT, CMD_SETTINGS_SCROLL,
+    CMD_STORE_DESCRIBE, CMD_STORE_REOPEN,
     DESCRIBE, El, Report, Session, capture_screen, describe_foreground, foreground, guard, is_visible, mouse_button,
     mouse_to, mouse_wheel, press, save_capture, send, unpack, wait_until, window_rect, window_text,
 };
@@ -24,6 +25,7 @@ fn code(h: SHit) -> isize {
     match h {
         SHit::None => 0,
         SHit::Close => 1,
+        SHit::QuickPopup => 3,
         // Not a control: a point inside the scroll area beside the panels' content.
         SHit::Caption => 2,
         SHit::Nav(i) => 10 + i as isize,
@@ -44,6 +46,7 @@ fn code(h: SHit) -> isize {
 pub(super) fn decode(c: isize) -> SHit {
     match c {
         1 => SHit::Close,
+        3 => SHit::QuickPopup,
         2 => SHit::Caption,
         10..=14 => SHit::Nav((c - 10) as usize),
         20..=21 => SHit::Profile((c - 20) as usize),
@@ -146,6 +149,56 @@ fn settle() {
     std::thread::sleep(Duration::from_millis(200));
 }
 
+fn store_file(name: &str) -> std::path::PathBuf {
+    crate::paths::get().map(|p| p.data.join(name)).unwrap_or_default()
+}
+
+fn read_json(name: &str) -> Option<serde_json::Value> {
+    std::fs::read_to_string(store_file(name)).ok().and_then(|t| serde_json::from_str(&t).ok())
+}
+
+fn store_describe(t: &Session) -> String {
+    send(t.main, CMD_STORE_DESCRIBE, 0);
+    DESCRIBE.lock().map(|d| d.clone()).unwrap_or_default()
+}
+
+/// The library file on disk, a simulated restart, and recovery
+/// from a corrupt file. Runs after two saves (Open faster, then the keyboard save).
+fn store_checks(r: &mut Report, s: &Set) {
+    let main = read_json("pocketmedia.json");
+    let bak = read_json("pocketmedia.json.bak");
+    r.check(
+        "the second save replaces the file",
+        main.as_ref().is_some_and(|v| {
+            let st = &v["settings"];
+            st["profile"] == "less_memory" && st["video_preview"] == "off" && st["autostart"] == true
+        }),
+        &format!("{main:?}"),
+    );
+    r.check(
+        "the previous good file is kept as the backup",
+        bak.as_ref().is_some_and(|v| v["settings"]["profile"] == "open_faster"),
+        &format!("{bak:?}"),
+    );
+
+    // A restart: the store is read again from disk and the page shows what it holds.
+    send(s.t.main, CMD_STORE_REOPEN, 0);
+    let d = store_describe(s.t);
+    r.check("after a restart the file loads cleanly", d.contains("outcome=loaded") && d.contains("version=1"), &d);
+    s.has(r, "after a restart the saved settings are back", &["saved=LessMemory/Off/true/true", "dirty=false"]);
+
+    // A damaged file: kept aside, reported, and the backup is used.
+    let _ = std::fs::write(store_file("pocketmedia.json"), "{\"version\": 1, \"settings\": {\"prof");
+    send(s.t.main, CMD_STORE_REOPEN, 0);
+    let d = store_describe(s.t);
+    r.check("a damaged file falls back to the backup", d.contains("outcome=restored-from-backup"), &d);
+    s.has(r, "the backup's settings are used", &["saved=OpenFaster/HoverOnly/true/false"]);
+    let kept = std::fs::read_dir(store_file("")).ok().map(|dir| {
+        dir.filter_map(|e| e.ok()).any(|e| e.file_name().to_string_lossy().starts_with("pocketmedia.json.corrupt-"))
+    });
+    r.check("the damaged file is kept, not deleted", kept == Some(true), "");
+}
+
 pub(super) fn run(r: &mut Report, t: &Session) -> bool {
     send(t.main, CMD_RESET, 0);
 
@@ -171,6 +224,11 @@ pub(super) fn run(r: &mut Report, t: &Session) -> bool {
             "line=\"\"",
         ],
     );
+    // The self-test runs in its own copy of the folders (test-results\app).
+    let used = crate::paths::get().map(|p| p.media.display().to_string()).unwrap_or_default();
+    let shown_ok = !used.is_empty() && s.describe().contains(&format!("media={used:?}"));
+    r.check("Settings shows the Media folder PocketMedia uses", shown_ok, &used);
+    let before_edits = std::fs::read(store_file("pocketmedia.json")).ok();
     let d = s.describe();
     r.check("only the Settings entry is highlighted", d.ends_with("nav_selected=Settings"), &d);
     let title = window_text(hwnd);
@@ -234,7 +292,14 @@ pub(super) fn run(r: &mut Report, t: &Session) -> bool {
     s.click(r, SHit::OpenFolder);
     s.park();
     s.shot(r, "focused-43-settings-open-folder");
-    s.has(r, "Open folder says the real folder arrives in Phase 3 (focused-43)", &["dirty=true", "Phase 3"]);
+    // Explorer is not started under the self-test (it would take the foreground); the
+    // path it would open is checked instead. Opening it for real is a manual check.
+    let media = crate::paths::media_text();
+    s.has(
+        r,
+        "Open folder opens the real Media folder (focused-43)",
+        &["dirty=true", "Opened the Media folder.", &format!("opened={media:?}")],
+    );
     s.click(r, SHit::Backup);
     s.shot(r, "focused-44-settings-backup");
     s.has(r, "Back up library says when it arrives (focused-44)", &["dirty=true", "Phase 6"]);
@@ -251,6 +316,11 @@ pub(super) fn run(r: &mut Report, t: &Session) -> bool {
         "Cancel discards the edits (focused-45)",
         &["profile=LessMemory video=HoverOnly close_after=true autostart=false", "dirty=false", "line=\"Changes discarded.\""],
     );
+    r.check(
+        "staged edits and Cancel write nothing to disk",
+        before_edits.is_some() && std::fs::read(store_file("pocketmedia.json")).ok() == before_edits,
+        "",
+    );
 
     // focused-46: Save commits; Save is disabled again.
     s.click(r, SHit::Profile(1));
@@ -259,6 +329,18 @@ pub(super) fn run(r: &mut Report, t: &Session) -> bool {
     s.has(r, "Save commits the edits (focused-46)", &["saved=OpenFaster/HoverOnly/true/false", "dirty=false", "line=\"Settings saved.\""]);
     s.click(r, SHit::Save);
     s.has(r, "a disabled Save does nothing", &["dirty=false", "line=\"Settings saved.\""]);
+    let saved = read_json("pocketmedia.json");
+    r.check(
+        "Save writes the library file (version 1, the saved settings)",
+        saved.as_ref().is_some_and(|v| v["version"] == 1 && v["settings"]["profile"] == "open_faster"),
+        &format!("{saved:?}"),
+    );
+    r.check("no temporary file is left after saving", !store_file("pocketmedia.json.tmp").exists(), "");
+    r.check(
+        "the file before the save is kept as the backup",
+        read_json("pocketmedia.json.bak").is_some_and(|v| v["settings"]["profile"] == "less_memory"),
+        "",
+    );
 
     // Leaving the page drops unsaved edits; saved ones stay.
     s.click(r, SHit::CloseAfter);
@@ -296,20 +378,24 @@ pub(super) fn run(r: &mut Report, t: &Session) -> bool {
         std::thread::sleep(Duration::from_millis(150));
         s.has(r, "Enter on Save commits", &["saved=LessMemory/Off/true/true", "dirty=false", "focus=Cancel"]);
     }
+    store_checks(r, &s);
 
     // "Choose folder…" opens Add media at its review step; leaving it returns here.
     s.scroll_to(LIBRARY_PANEL_SCROLL);
     s.click(r, SHit::ChooseFolder);
+    wait_until(8000, || s.describe().contains("stage=review"));
     s.park();
     s.shot(r, "state-settings-choose-folder");
     s.has(r, "Choose folder… opens Add media at the review step", &["host=manager", "stage=review"]);
     s.add_click(r, El::AddCancel);
     s.has(r, "Cancel in Add media returns to Settings", &["screen=settings", "focus=ChooseFolder"]);
     s.click(r, SHit::ChooseFolder);
+    wait_until(8000, || s.describe().contains("stage=review"));
     s.add_click(r, El::AddAdd);
-    s.has(r, "an import from Settings returns to Settings with the result", &["screen=settings", "4 files added"]);
+    wait_until(15000, || s.describe().starts_with("screen=settings"));
+    s.has(r, "an import from Settings returns to Settings with the result", &["screen=settings", "6 files added"]);
     s.click(r, SHit::Nav(0));
-    s.has(r, "the imported files are in the library", &["screen=manager", "total=12"]);
+    s.has(r, "the imported files are in the library", &["screen=manager", "total=14"]);
 
     // × hides the window from the Settings page too.
     s.manager_click(r, MHit::Nav(4));

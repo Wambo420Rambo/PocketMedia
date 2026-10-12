@@ -75,6 +75,7 @@ impl Nav {
 /// Keyboard focus targets, in Tab order.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MFocus {
+    QuickPopup,
     Close,
     Nav(usize),
     AddMedia,
@@ -336,8 +337,8 @@ impl ManagerState {
         self.focus = MFocus::Recycle;
     }
 
-    /// Removes the selected item after confirmation and selects the one that
-    /// took its place. Phase 2: fake data, so no file is moved.
+    /// Removes the selected item after confirmation (its file is already in the
+    /// Recycle Bin) and selects the one that took its place.
     pub fn confirm_recycle(&mut self, lib: &mut Library) {
         let Some(id) = self.selected.filter(|_| self.confirming) else { return };
         let index = self.selected_index(lib).unwrap_or(0);
@@ -345,7 +346,7 @@ impl ManagerState {
         self.confirming = false;
         let visible = self.visible(lib);
         self.selected = visible.get(index.min(visible.len().saturating_sub(1))).map(|i| i.id);
-        self.status = Some(format!("{name} removed from the library (fake data: no file was moved)."));
+        self.status = Some(format!("{name} was moved to the Recycle Bin."));
         self.focus = if self.selected.is_some() { MFocus::Gallery } else { MFocus::Search };
         self.sync(lib);
     }
@@ -364,7 +365,7 @@ impl ManagerState {
     }
 
     pub fn focus_order(&self, lib: &Library) -> Vec<MFocus> {
-        let mut order = vec![MFocus::Close];
+        let mut order = vec![MFocus::QuickPopup, MFocus::Close];
         order.extend((0..Nav::ORDER.len()).map(MFocus::Nav));
         order.extend([MFocus::AddMedia, MFocus::Search]);
         if self.has_filters() {
@@ -553,7 +554,7 @@ mod tests {
         let (mut m, mut lib) = setup();
         m.set_filter(TypeFilter::Video, &lib);
         m.set_sort(Sort::Name, &lib);
-        lib.items.insert(0, Item { id: 99, name: "New.png".into(), kind: crate::sample::MediaKind::Picture, width: 0, height: 0 });
+        lib.items.insert(0, Item::new(99, "New.png", crate::sample::MediaKind::Picture, 0, 0));
         m.show_imported("1 file added".into(), &lib);
         assert_eq!(m.filter, TypeFilter::All);
         assert_eq!(m.sort, Sort::RecentlyAdded);
@@ -581,7 +582,7 @@ mod tests {
     fn tab_order_follows_the_screen() {
         let (mut m, lib) = setup();
         let order = m.focus_order(&lib);
-        assert_eq!(order[0], MFocus::Close);
+        assert_eq!(order[..2], [MFocus::QuickPopup, MFocus::Close]);
         assert!(!order.contains(&MFocus::ClearFilters));
         assert!(order.contains(&MFocus::Recycle));
         m.set_filter(TypeFilter::Gif, &lib);
@@ -591,6 +592,6 @@ mod tests {
         assert!(order.ends_with(&[MFocus::ConfirmMove, MFocus::ConfirmCancel]));
         m.focus = MFocus::ConfirmCancel;
         m.tab(&lib, false);
-        assert_eq!(m.focus, MFocus::Close);
+        assert_eq!(m.focus, MFocus::QuickPopup);
     }
 }

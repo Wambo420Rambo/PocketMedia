@@ -8,7 +8,7 @@ use windows::Win32::Graphics::Gdi::{
     DeleteObject, HBITMAP,
 };
 use windows::Win32::UI::Shell::{
-    NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIIF_WARNING, NIM_ADD, NIM_DELETE,
+    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
     NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -94,18 +94,6 @@ pub fn set_tip(hwnd: HWND, tip: &str) {
     }
 }
 
-/// Non-modal Windows notification. Used for results after the popup has closed,
-/// so we never steal focus back from the target app.
-pub fn notify(hwnd: HWND, title: &str, text: &str, warning: bool) {
-    let mut data = base_data(hwnd);
-    data.uFlags = NIF_INFO;
-    data.dwInfoFlags = if warning { NIIF_WARNING } else { NIIF_INFO };
-    copy_into(&mut data.szInfoTitle, title);
-    copy_into(&mut data.szInfo, text);
-    unsafe {
-        let _ = Shell_NotifyIconW(NIM_MODIFY, &data);
-    }
-}
 
 pub fn show_menu(hwnd: HWND) -> MenuChoice {
     unsafe {
