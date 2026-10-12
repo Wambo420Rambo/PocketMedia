@@ -67,10 +67,12 @@ pub enum TextStyle {
     Title,
     /// 13px: names in the import review.
     Row,
+    /// 22px medium: window headings ("Your library").
+    H1,
 }
 
 impl TextStyle {
-    pub const ALL: [TextStyle; 7] = [
+    pub const ALL: [TextStyle; 8] = [
         TextStyle::Medium,
         TextStyle::Body,
         TextStyle::Small,
@@ -78,6 +80,7 @@ impl TextStyle {
         TextStyle::Heading,
         TextStyle::Title,
         TextStyle::Row,
+        TextStyle::H1,
     ];
 
     pub fn size(self) -> f32 {
@@ -88,10 +91,11 @@ impl TextStyle {
             TextStyle::Heading => 16.0,
             TextStyle::Title => 21.0,
             TextStyle::Row => 13.0,
+            TextStyle::H1 => 22.0,
         }
     }
     pub fn medium(self) -> bool {
-        matches!(self, TextStyle::Medium | TextStyle::Heading | TextStyle::Title)
+        matches!(self, TextStyle::Medium | TextStyle::Heading | TextStyle::Title | TextStyle::H1)
     }
     /// CSS line box height (line-height 1.45).
     pub fn line(self) -> f32 {
@@ -136,8 +140,6 @@ pub struct Layout {
     pub dropdown: Rect,
     pub dropdown_rows: [Rect; 2],
     pub gallery: Rect,
-    pub tile_w: f32,
-    pub tile_h: f32,
     pub footer: Rect,
     pub footer_text: Rect,
     pub clear_history: Rect,
@@ -215,8 +217,6 @@ impl Layout {
         let footer_text = Rect::new(footer_x, footer.y + 1.0 + 11.0, clear_history.x - 8.0 - footer_x, NAME_LINE);
 
         let gallery = Rect::new(left, y, inner_w, (footer.y - PAD - y).max(0.0));
-        let tile_w = (inner_w - GALLERY_PAD_RIGHT - GAP * (COLUMNS as f32 - 1.0)) / COLUMNS as f32;
-        let tile_h = 2.0 + 8.0 + THUMB_H + 7.0 + NAME_LINE;
 
         let empty_action_w = empty_actions.iter().map(|l| (*l, button_w(measure(l, TextStyle::Body), None))).collect();
 
@@ -239,8 +239,6 @@ impl Layout {
             dropdown,
             dropdown_rows,
             gallery,
-            tile_w,
-            tile_h,
             footer,
             footer_text,
             clear_history,
@@ -248,19 +246,8 @@ impl Layout {
         }
     }
 
-    pub fn row_pitch(&self) -> f32 {
-        self.tile_h + GAP
-    }
-
-    pub fn tile(&self, index: usize, scroll: f32) -> Rect {
-        let col = (index % COLUMNS) as f32;
-        let row = (index / COLUMNS) as f32;
-        Rect::new(
-            self.gallery.x + col * (self.tile_w + GAP),
-            self.gallery.y + row * self.row_pitch() - scroll,
-            self.tile_w,
-            self.tile_h,
-        )
+    pub fn grid(&self) -> Grid {
+        Grid::new(self.gallery)
     }
 
     /// The bordered thumbnail box inside a tile (tile border 1 + padding 4).
@@ -273,49 +260,9 @@ impl Layout {
         Rect::new(t.x, t.bottom() + 7.0, t.w, NAME_LINE)
     }
 
-    pub fn content_height(&self, count: usize) -> f32 {
-        let rows = count.div_ceil(COLUMNS) as f32;
-        if rows == 0.0 { 0.0 } else { rows * self.tile_h + (rows - 1.0) * GAP }
-    }
-
-    pub fn max_scroll(&self, count: usize) -> f32 {
-        (self.content_height(count) - self.gallery.h).max(0.0)
-    }
-
-    /// Scroll offset that keeps tile `index` fully visible.
-    pub fn scroll_to_show(&self, index: usize, scroll: f32) -> f32 {
-        let top = (index / COLUMNS) as f32 * self.row_pitch();
-        let bottom = top + self.tile_h;
-        if top < scroll {
-            top
-        } else if bottom > scroll + self.gallery.h {
-            bottom - self.gallery.h
-        } else {
-            scroll
-        }
-    }
-
-    /// Thin scrollbar thumb inside the gallery's 6px right padding.
-    pub fn scrollbar(&self, count: usize, scroll: f32) -> Option<Rect> {
-        let content = self.content_height(count);
-        if content <= self.gallery.h {
-            return None;
-        }
-        let track = self.gallery.h;
-        let h = (track * track / content).max(24.0);
-        let y = self.gallery.y + (track - h) * (scroll / self.max_scroll(count));
-        Some(Rect::new(self.gallery.right() - 5.0, y, 4.0, h))
-    }
-
-    /// Empty state: heading, hint and action button inside the gallery
-    /// (CSS .pm-empty: padding 46px 16px; heading 16px + 12px gap; actions +18px).
     pub fn empty_parts(&self, action: &str) -> (Rect, Rect, Rect) {
-        let g = self.gallery;
-        let heading = Rect::new(g.x + 16.0, g.y + 46.0, g.w - 32.0, 16.0 * 1.45);
-        let hint = Rect::new(heading.x, heading.bottom() + 12.0, heading.w, 14.0 * 1.45);
         let w = self.empty_action_w.iter().find(|(l, _)| *l == action).map(|(_, w)| *w).unwrap_or(120.0);
-        let button = Rect::new(g.x + (g.w - w) / 2.0, hint.bottom() + 18.0, w, ACTIONS_H);
-        (heading, hint, button)
+        empty_parts(self.gallery, w)
     }
 
     pub fn hit(&self, x: f32, y: f32, view: &HitView) -> Hit {
@@ -354,16 +301,112 @@ impl Layout {
         if let Some(action) = view.empty_action {
             return if self.empty_parts(action).2.contains(x, y) { Hit::EmptyAction } else { Hit::None };
         }
-        if let Some(bar) = self.scrollbar(view.tiles, view.scroll)
-            && x >= bar.x - 2.0
-        {
+        let grid = self.grid();
+        if grid.on_scrollbar(view.tiles, view.scroll, x, y) {
             return Hit::Scrollbar;
         }
-        (0..view.tiles)
-            .find(|i| self.tile(*i, view.scroll).contains(x, y))
-            .map(Hit::Tile)
-            .unwrap_or(Hit::None)
+        grid.hit(view.tiles, view.scroll, x, y).map_or(Hit::None, Hit::Tile)
     }
+}
+
+/// A scrolling gallery of tiles in three columns (CSS .pm-media-grid: gap 12,
+/// 6px right padding for the scrollbar). Shared by the popup and the Manager.
+#[derive(Clone, Copy, Debug)]
+pub struct Grid {
+    pub area: Rect,
+    pub tile_w: f32,
+    pub tile_h: f32,
+}
+
+impl Grid {
+    pub fn new(area: Rect) -> Self {
+        let tile_w = (area.w - GALLERY_PAD_RIGHT - GAP * (COLUMNS as f32 - 1.0)) / COLUMNS as f32;
+        // Tile border 1 + padding 4 (x2), thumbnail, 7px gap, name line.
+        let tile_h = 2.0 + 8.0 + THUMB_H + 7.0 + NAME_LINE;
+        Self { area, tile_w, tile_h }
+    }
+
+    pub fn row_pitch(&self) -> f32 {
+        self.tile_h + GAP
+    }
+
+    pub fn tile(&self, index: usize, scroll: f32) -> Rect {
+        let col = (index % COLUMNS) as f32;
+        let row = (index / COLUMNS) as f32;
+        Rect::new(
+            self.area.x + col * (self.tile_w + GAP),
+            self.area.y + row * self.row_pitch() - scroll,
+            self.tile_w,
+            self.tile_h,
+        )
+    }
+
+    pub fn content_height(&self, count: usize) -> f32 {
+        let rows = count.div_ceil(COLUMNS) as f32;
+        if rows == 0.0 { 0.0 } else { rows * self.tile_h + (rows - 1.0) * GAP }
+    }
+
+    pub fn max_scroll(&self, count: usize) -> f32 {
+        (self.content_height(count) - self.area.h).max(0.0)
+    }
+
+    /// Scroll offset that keeps tile `index` fully visible.
+    pub fn scroll_to_show(&self, index: usize, scroll: f32) -> f32 {
+        let top = (index / COLUMNS) as f32 * self.row_pitch();
+        let bottom = top + self.tile_h;
+        if top < scroll {
+            top
+        } else if bottom > scroll + self.area.h {
+            bottom - self.area.h
+        } else {
+            scroll
+        }
+    }
+
+    /// Thin scrollbar thumb inside the 6px right padding.
+    pub fn scrollbar(&self, count: usize, scroll: f32) -> Option<Rect> {
+        let content = self.content_height(count);
+        if content <= self.area.h {
+            return None;
+        }
+        let track = self.area.h;
+        let h = (track * track / content).max(24.0);
+        let y = self.area.y + (track - h) * (scroll / self.max_scroll(count));
+        Some(Rect::new(self.area.right() - 5.0, y, 4.0, h))
+    }
+
+    /// Tiles per visible page (whole rows), for Page Up / Page Down.
+    pub fn page(&self) -> isize {
+        (self.area.h / self.row_pitch()).floor().max(1.0) as isize * COLUMNS as isize
+    }
+
+    /// Index of the tile under (x, y), if any.
+    pub fn hit(&self, count: usize, scroll: f32, x: f32, y: f32) -> Option<usize> {
+        if !self.area.contains(x, y) {
+            return None;
+        }
+        (0..count).find(|i| self.tile(*i, scroll).contains(x, y))
+    }
+
+    /// True over the scrollbar thumb's column when there is one.
+    pub fn on_scrollbar(&self, count: usize, scroll: f32, x: f32, y: f32) -> bool {
+        self.area.contains(x, y) && self.scrollbar(count, scroll).is_some_and(|bar| x >= bar.x - 2.0)
+    }
+}
+
+/// Empty state inside a gallery: heading, hint and a button `button_w` wide
+/// (CSS .pm-empty: padding 46px 16px; heading 16px + 12px gap; actions +18px).
+pub fn empty_parts(gallery: Rect, button_w: f32) -> (Rect, Rect, Rect) {
+    let g = gallery;
+    let heading = Rect::new(g.x + 16.0, g.y + 46.0, g.w - 32.0, TextStyle::Heading.line());
+    let hint = Rect::new(heading.x, heading.bottom() + 12.0, heading.w, TextStyle::Body.line());
+    let button = Rect::new(g.x + (g.w - button_w) / 2.0, hint.bottom() + 18.0, button_w, ACTIONS_H);
+    (heading, hint, button)
+}
+
+/// Width of a 36px-high text button: 1px border + 11px padding on each side.
+pub fn text_button_w(text_w: f32) -> f32 {
+    2.0 + 22.0 + text_w
 }
 
 /// The bits of popup state hit-testing needs.
@@ -403,15 +446,16 @@ mod tests {
     #[test]
     fn grid_matches_wireframe() {
         let l = layout();
-        assert_eq!(l.tile_w, 152.0);
-        assert!((l.tile_h - 120.4).abs() < 0.01);
+        let g = l.grid();
+        assert_eq!(g.tile_w, 152.0);
+        assert!((g.tile_h - 120.4).abs() < 0.01);
         assert_eq!(l.gallery.y, 251.0);
         assert_eq!(l.footer.y, 564.0);
         assert_eq!(l.gallery.bottom(), 548.0);
         assert_eq!((l.search_input.x, l.search_input.right()), (39.0, 490.0));
-        assert_eq!(l.tile(1, 0.0).x, 181.0);
-        assert_eq!(l.tile(2, 0.0).x, 345.0);
-        assert!((l.tile(3, 0.0).y - (251.0 + 132.4)).abs() < 0.01);
+        assert_eq!(g.tile(1, 0.0).x, 181.0);
+        assert_eq!(g.tile(2, 0.0).x, 345.0);
+        assert!((g.tile(3, 0.0).y - (251.0 + 132.4)).abs() < 0.01);
     }
 
     #[test]
@@ -439,10 +483,10 @@ mod tests {
 
     #[test]
     fn scrolling_shows_the_selected_row() {
-        let l = layout();
-        assert_eq!(l.max_scroll(8), (l.content_height(8) - l.gallery.h).max(0.0));
+        let l = layout().grid();
+        assert_eq!(l.max_scroll(8), (l.content_height(8) - l.area.h).max(0.0));
         let s = l.scroll_to_show(7, 0.0);
-        assert!(l.tile(7, s).bottom() <= l.gallery.bottom() + 0.01);
+        assert!(l.tile(7, s).bottom() <= l.area.bottom() + 0.01);
         assert_eq!(l.scroll_to_show(0, s), 0.0);
         assert!(l.scrollbar(3, 0.0).is_none());
         assert!(l.scrollbar(8, 0.0).is_some());
@@ -454,7 +498,7 @@ mod tests {
         let view = HitView { tiles: 8, scroll: 0.0, dropdown_open: false, search_has_text: false, empty_action: None };
         let (cx, cy) = l.close.center();
         assert_eq!(l.hit(cx, cy, &view), Hit::Close);
-        let (tx, ty) = l.tile(4, 0.0).center();
+        let (tx, ty) = l.grid().tile(4, 0.0).center();
         assert_eq!(l.hit(tx, ty, &view), Hit::Tile(4));
         // The 12px gap between columns is not a tile.
         assert_eq!(l.hit(175.0, 300.0, &view), Hit::None);

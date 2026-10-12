@@ -35,7 +35,10 @@ use windows::core::{HSTRING, PCWSTR};
 use crate::popup::TestTarget as Target;
 use crate::ui::add_view::AddHit;
 use crate::ui::layout::Hit;
-use crate::{StatusKind, WM_SELFTEST, app, assets, exit, popup, test_target};
+use crate::library::{self, Library};
+use crate::{StatusKind, WM_SELFTEST, app, assets, exit, manager, popup, test_target};
+
+mod manager_test;
 
 const CMD_TARGET: usize = 1;
 const CMD_STATUS: usize = 2;
@@ -45,6 +48,11 @@ const CMD_EXIT: usize = 5;
 const CMD_HOTKEY_OK: usize = 6;
 const CMD_POINT: usize = 7;
 const CMD_DESCRIBE: usize = 8;
+const CMD_RESET: usize = 9;
+const CMD_MANAGER: usize = 10;
+const CMD_MANAGER_POINT: usize = 11;
+const CMD_MANAGER_DESCRIBE: usize = 12;
+const CMD_MANAGER_ADD_POINT: usize = 13;
 const CONFLICT_TITLE: &str = "PocketMedia - shortcut not available";
 
 static EXIT_CODE: AtomicI32 = AtomicI32::new(0);
@@ -58,6 +66,7 @@ static DESCRIBE: Mutex<String> = Mutex::new(String::new());
 enum El {
     Neutral,
     Search,
+    OpenManager,
     AddMediaButton,
     AddChooseFiles,
     AddImportExisting,
@@ -81,6 +90,7 @@ impl El {
         match self {
             El::Neutral => 0,
             El::Search => 2,
+            El::OpenManager => 4,
             El::AddMediaButton => 3,
             El::AddChooseFiles => 200,
             El::AddImportExisting => 201,
@@ -119,6 +129,7 @@ impl El {
             1 => Hit::Close,
             2 => Hit::Search,
             3 => Hit::AddMedia,
+            4 => Hit::OpenManager,
             10..=13 => Hit::Chip((code - 10) as usize),
             20 => Hit::List,
             30..=31 => Hit::DropdownRow((code - 30) as usize),
@@ -183,10 +194,26 @@ pub fn on_ui_command(wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         CMD_FOCUS => unsafe { SetForegroundWindow(hwnd(lparam.0)) }.0 as isize,
         CMD_POPUP => popup::hwnd().0 as isize,
         CMD_HOTKEY_OK => app(|a| a.hotkey_ok.get()) as isize,
-        CMD_POINT => match popup::element_center(El::target(lparam.0)) {
-            Some(pt) => ((pt.x as u32 as u64) << 32 | pt.y as u32 as u64) as isize,
-            None => isize::MIN,
+        CMD_POINT => pack(popup::element_center(El::target(lparam.0))),
+        CMD_MANAGER => manager::hwnd().0 as isize,
+        CMD_MANAGER_POINT => pack(manager::element_center(manager_test::decode(lparam.0))),
+        CMD_MANAGER_ADD_POINT => match El::target(lparam.0) {
+            Target::Add(hit) => pack(manager::add_element_center(hit)),
+            Target::Gallery(_) => isize::MIN,
         },
+        CMD_MANAGER_DESCRIBE => {
+            if let Ok(mut d) = DESCRIBE.lock() {
+                *d = manager::describe();
+            }
+            0
+        }
+        CMD_RESET => {
+            // Fresh fake library and windows, so each test section starts the same.
+            library::with_mut(|lib| *lib = Library::sample());
+            popup::reset();
+            manager::reset();
+            0
+        }
         CMD_DESCRIBE => {
             if let Ok(mut d) = DESCRIBE.lock() {
                 *d = popup::describe_state();
@@ -200,6 +227,18 @@ pub fn on_ui_command(wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         _ => 0,
     };
     LRESULT(value)
+}
+
+/// Packs a screen point into an LRESULT (isize::MIN = not on screen).
+fn pack(pt: Option<windows::Win32::Foundation::POINT>) -> isize {
+    match pt {
+        Some(pt) => ((pt.x as u32 as u64) << 32 | pt.y as u32 as u64) as isize,
+        None => isize::MIN,
+    }
+}
+
+fn unpack(v: isize) -> Option<(i32, i32)> {
+    (v != isize::MIN).then_some((((v as u64) >> 32) as u32 as i32, (v as u64 & 0xFFFF_FFFF) as u32 as i32))
 }
 
 // ---------------------------------------------------------------- report
@@ -330,8 +369,7 @@ struct Session {
 
 impl Session {
     fn point(&self, el: El) -> Option<(i32, i32)> {
-        let v = send(self.main, CMD_POINT, el.code());
-        (v != isize::MIN).then_some((((v as u64) >> 32) as u32 as i32, (v as u64 & 0xFFFF_FFFF) as u32 as i32))
+        unpack(send(self.main, CMD_POINT, el.code()))
     }
 
     fn describe(&self) -> String {
@@ -622,7 +660,9 @@ fn run_input_tests(r: &mut Report, t: &Session) -> bool {
         mouse_button(false);
         r.check("clicking outside closes popup", wait_until(1500, || !is_visible(popup)), "");
     }
-    true
+
+    // 12. The Manager, from a fresh fake library.
+    manager_test::run(r, t)
 }
 
 fn add_media_test(r: &mut Report, t: &Session) -> bool {

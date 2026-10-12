@@ -1,53 +1,43 @@
 //! The quick popup window: input handling, show/hide and focus hand-back.
-//! State lives in `PopupState`, geometry in `ui::layout`, drawing in `ui::paint`.
+//! State lives in `PopupState` and the shared `library`, geometry in
+//! `ui::layout`, drawing in `ui::paint`. Add media is an `AddPanel`.
 //!
-//! The items are fake. Clicking or pressing Enter on a tile runs the
+//! The items are fake (Phase 1-2). Clicking or pressing Enter on a tile runs the
 //! Phase 0 paste of the test PNG, and dragging a tile drags the test PNG, so
 //! the transfer risk test keeps working until Phase 4 replaces it.
 
 use std::cell::{Cell, RefCell};
 
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Dwm::{
-    DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute,
-};
-use windows::Win32::Graphics::Gdi::{
-    ClientToScreen, GetMonitorInfoW, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, ScreenToClient,
-    ValidateRect,
-};
-use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
-use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
-use windows::Win32::System::Ole::{CF_UNICODETEXT, DROPEFFECT_COPY};
-use windows::Win32::UI::HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI};
+use windows::Win32::Graphics::Gdi::ValidateRect;
+use windows::Win32::System::Ole::DROPEFFECT_COPY;
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    DragDetect, GetKeyState, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VIRTUAL_KEY,
-    VK_A, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F4, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR,
-    VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP, VK_V,
+    DragDetect, VIRTUAL_KEY, VK_A, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F4, VK_HOME,
+    VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP, VK_V,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::w;
 
+use crate::add_panel::{AddOutcome, AddPanel, Area};
+use crate::library::{self, Library};
 use crate::popup_state::{Focus, ListKind, PopupState, TypeFilter};
 use crate::target::{self, NoTarget, Target};
 use crate::ui::add_view::AddHit;
 use crate::ui::d2d::Gfx;
-use crate::ui::layout::{self, COLUMNS, Hit, HitView, Layout, TextStyle};
+use crate::ui::layout::{self, COLUMNS, Grid, Hit, HitView, Layout, TextStyle};
 use crate::ui::paint::{self, Ui};
-use crate::{SHORTCUT_LABEL, StatusKind, app, assets, paste, sample, set_status, transfer};
+use crate::ui::widgets::TextMetrics;
+use crate::winutil::{self, WM_MOUSELEAVE};
+use crate::{SHORTCUT_LABEL, StatusKind, app, assets, manager, paste, set_status, transfer};
 
-/// Defined in Win32_UI_Controls; declared here rather than enabling that whole feature.
-const WM_MOUSELEAVE: u32 = 0x02A3;
 const EMPTY_ACTIONS: [&str; 3] = ["Clear filters", "Show all media", "Add media"];
 const WHEEL_STEP: f32 = 48.0;
-
-mod add;
 
 struct View {
     state: PopupState,
     /// Add media panel, shown in place of the gallery while open.
-    add: Option<crate::add_media::AddMedia>,
-    add_hover: AddHit,
-    add_pressed: AddHit,
+    add: Option<AddPanel>,
     gfx: Gfx,
     layout: Option<Layout>,
     dpi: u32,
@@ -66,6 +56,9 @@ enum Effect {
     TileDown(POINT),
     PasteText,
     Capture(bool),
+    OpenManager,
+    /// Activate a control once no state is borrowed (keyboard Enter/Space).
+    Deferred(Hit),
 }
 
 thread_local! {
@@ -116,15 +109,11 @@ pub fn create(instance: HINSTANCE) -> Result<(), String> {
         .map_err(|e| format!("Could not create the popup: {e}"))?
     };
     POPUP.with(|c| c.set(hwnd));
-    set_dwm_attribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND.0 as u32);
-    // We draw our own 1px border, so turn off the system one.
-    set_dwm_attribute(hwnd, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE);
+    winutil::style_frame(hwnd);
     VIEW.with(|v| {
         *v.borrow_mut() = Some(View {
-            state: PopupState::new(sample::items(), sample::recent()),
+            state: PopupState::new(),
             add: None,
-            add_hover: AddHit::None,
-            add_pressed: AddHit::None,
             gfx,
             layout: None,
             dpi: 96,
@@ -136,12 +125,6 @@ pub fn create(instance: HINSTANCE) -> Result<(), String> {
         })
     });
     Ok(())
-}
-
-fn set_dwm_attribute(hwnd: HWND, attr: windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE, value: u32) {
-    // SAFETY: value is a 4-byte local, as both attributes expect. Failure (older
-    // Windows) only loses the cosmetic effect.
-    let _ = unsafe { DwmSetWindowAttribute(hwnd, attr, &value as *const u32 as *const _, 4) };
 }
 
 pub fn destroy() {
@@ -159,11 +142,7 @@ pub fn is_visible() -> bool {
 }
 
 fn invalidate() {
-    let h = hwnd();
-    if !h.is_invalid() {
-        // SAFETY: our own window; async repaint request.
-        let _ = unsafe { InvalidateRect(Some(h), None, false) };
-    }
+    winutil::invalidate(hwnd());
 }
 
 pub fn toggle_from_hotkey() {
@@ -202,8 +181,9 @@ pub fn close(restore_focus: bool) {
     }
     with_view(|v| {
         v.state.dropdown = None;
-        v.add_hover = AddHit::None;
-        v.add_pressed = AddHit::None;
+        if let Some(add) = v.add.as_mut() {
+            add.clear_hover();
+        }
         v.hover = Hit::None;
         v.pressed = Hit::None;
         v.scroll_drag = None;
@@ -219,24 +199,22 @@ pub fn close(restore_focus: bool) {
     let _ = unsafe { ShowWindow(hwnd(), SW_HIDE) };
 }
 
+/// Self-test only: back to the state after start-up (the library is reset separately).
+pub fn reset() {
+    with_view(|v| {
+        v.state = PopupState::new();
+        v.add = None;
+    });
+}
+
 fn position_near_cursor() {
-    let mut pt = POINT::default();
-    let mut info = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
-    let (mut dpi, mut dpi_y) = (96u32, 96u32);
-    // SAFETY: out-pointers to locals.
-    unsafe {
-        let _ = GetCursorPos(&mut pt);
-        let monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
-        let _ = GetMonitorInfoW(monitor, &mut info);
-        let _ = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi, &mut dpi_y);
-    }
-    let work = info.rcWork;
+    let at = winutil::monitor_at_cursor();
     POSITIONING.with(|p| p.set(true));
-    place(pt, work, dpi);
+    place(at.cursor, at.work, at.dpi);
     // SAFETY: our own window.
     let actual = unsafe { GetDpiForWindow(hwnd()) };
-    if actual != 0 && actual != dpi {
-        place(pt, work, actual);
+    if actual != 0 && actual != at.dpi {
+        place(at.cursor, at.work, actual);
     }
     POSITIONING.with(|p| p.set(false));
 }
@@ -270,78 +248,59 @@ fn place(pt: POINT, work: RECT, dpi: u32) {
 impl View {
     fn ensure_layout(&mut self) -> &Layout {
         if self.layout.is_none() {
-            let mut rc = RECT::default();
-            // SAFETY: our window; rc is a local.
-            let _ = unsafe { GetClientRect(hwnd(), &mut rc) };
-            let scale = 96.0 / self.dpi as f32;
-            let (w, h) = ((rc.right - rc.left) as f32 * scale, (rc.bottom - rc.top) as f32 * scale);
+            let (w, h) = winutil::client_size_dip(hwnd(), self.dpi);
             let gfx = &self.gfx;
             self.layout = Some(Layout::compute(w, h, &|t, s| gfx.measure(t, s), SHORTCUT_LABEL, &EMPTY_ACTIONS));
         }
         self.layout.as_ref().expect("layout was just computed")
     }
 
-    fn to_dip(&self, lparam: LPARAM) -> (f32, f32) {
-        let x = (lparam.0 & 0xFFFF) as i16 as f32;
-        let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
-        let s = 96.0 / self.dpi as f32;
-        (x * s, y * s)
+    fn area(&mut self) -> Area {
+        let l = self.ensure_layout();
+        Area { w: l.width, h: l.height }
     }
 
     fn hit(&mut self, x: f32, y: f32) -> Hit {
-        let view = HitView {
-            tiles: self.state.visible().len(),
+        let view = library::with(|lib| HitView {
+            tiles: self.state.visible(lib).len(),
             scroll: self.state.scroll,
             dropdown_open: self.state.dropdown.is_some(),
             search_has_text: !self.state.search.is_empty(),
-            empty_action: self.state.empty().map(|e| e.action()),
-        };
+            empty_action: self.state.empty(lib).map(|e| e.action()),
+        });
         self.ensure_layout().hit(x, y, &view)
     }
 
     fn clamp_scroll(&mut self) {
-        let n = self.state.visible().len();
-        let max = self.ensure_layout().max_scroll(n);
+        let n = library::with(|lib| self.state.visible(lib).len());
+        let max = self.ensure_layout().grid().max_scroll(n);
         self.state.scroll = self.state.scroll.clamp(0.0, max);
     }
 
-    fn show_selection(&mut self) {
-        if let Some(i) = self.state.selected_index() {
-            let scroll = self.state.scroll;
-            self.state.scroll = self.ensure_layout().scroll_to_show(i, scroll);
-        }
-    }
-
-    /// Horizontal scroll of the search text and the caret position within it.
-    fn search_metrics(&mut self) -> (f32, f32, f32) {
-        let text = self.state.search.text().to_string();
-        let caret_x = self.gfx.caret_x(&text, TextStyle::Body, self.state.search.caret_utf16());
-        let full_w = self.gfx.measure(&text, TextStyle::Body);
-        let visible_w = self.ensure_layout().search_input.w - 4.0 - 26.0;
-        let offset = (caret_x - visible_w + 2.0).max(0.0);
-        (offset, caret_x, full_w)
+    fn search_metrics(&mut self) -> TextMetrics {
+        let b = paint::search_box(self.ensure_layout());
+        TextMetrics::for_search(&self.gfx, &self.state.search, &b)
     }
 
     fn paint(&mut self) {
-        if self.add.is_some() {
-            return self.add_paint();
+        let area = self.area();
+        if let Some(add) = self.add.as_ref() {
+            add.paint(&mut self.gfx, hwnd(), self.dpi as f32, area);
+            return;
         }
-        let (search_offset, caret_x, selection_w) = self.search_metrics();
-        let plus_w = self.gfx.measure("+", TextStyle::Body);
-        self.ensure_layout();
         let ui = Ui {
             hover: self.hover,
             dpi: self.dpi as f32,
             shortcut_ok: app(|a| a.hotkey_ok.get()),
             shortcut_label: SHORTCUT_LABEL,
-            search_offset,
-            caret_x,
-            selection_w,
-            plus_w,
+            search: self.search_metrics(),
+            plus_w: self.gfx.measure("+", TextStyle::Body),
         };
         let View { state, gfx, layout, dpi, .. } = self;
         if let Some(layout) = layout.as_ref() {
-            let _ = gfx.draw(hwnd(), *dpi as f32, |p| paint::paint(p, state, layout, &ui));
+            library::with(|lib| {
+                let _ = gfx.draw(hwnd(), *dpi as f32, |p| paint::paint(p, state, lib, layout, &ui));
+            });
         }
     }
 
@@ -350,17 +309,20 @@ impl View {
         let s = &mut self.state;
         match hit {
             Hit::Close => return Effect::Close(true),
-            // Open manager is Phase 2b.
-            Hit::OpenManager => {}
-            Hit::AddMedia => self.open_add(),
+            Hit::OpenManager => return Effect::OpenManager,
+            Hit::AddMedia => self.add = Some(AddPanel::new()),
             Hit::Chip(i) => s.set_filter(TypeFilter::ORDER[i]),
             Hit::List => s.dropdown = if s.dropdown.is_some() { None } else { Some(list_index(s.list)) },
             Hit::DropdownRow(i) => {
                 s.set_list(ListKind::BOTH[i]);
                 s.focus = Focus::List;
             }
-            Hit::ClearHistory if s.history_enabled() => s.clear_history(),
-            Hit::EmptyAction => s.run_empty_action(),
+            Hit::ClearHistory => library::with_mut(|lib| {
+                if s.history_enabled(lib) {
+                    s.clear_history(lib);
+                }
+            }),
+            Hit::EmptyAction => library::with(|lib| s.run_empty_action(lib)),
             Hit::Tile(_) => return Effect::Activate,
             Hit::SearchClear => {
                 s.search.clear();
@@ -387,9 +349,31 @@ impl View {
         })
     }
 
+    /// Turns what the Add media panel asks for into popup effects.
+    fn add_outcome(&mut self, outcome: AddOutcome) -> Effect {
+        match outcome {
+            AddOutcome::None => Effect::None,
+            AddOutcome::CloseWindow => Effect::Close(true),
+            AddOutcome::Leave => {
+                self.add = None;
+                self.state.focus = Focus::AddMedia;
+                Effect::Capture(false)
+            }
+            AddOutcome::Imported(status) => {
+                self.add = None;
+                self.state.show_imported(status);
+                Effect::Capture(false)
+            }
+            AddOutcome::Capture(on) => Effect::Capture(on),
+            AddOutcome::PasteText => Effect::PasteText,
+        }
+    }
+
     fn mouse_down(&mut self, x: f32, y: f32, screen: POINT) -> Effect {
-        if self.add.is_some() {
-            return self.add_mouse_down(x, y);
+        let area = self.area();
+        if let Some(add) = self.add.as_mut() {
+            let outcome = add.mouse_down(&self.gfx, area, x, y);
+            return self.add_outcome(outcome);
         }
         let hit = self.hit(x, y);
         if self.state.dropdown.is_some() && !matches!(hit, Hit::DropdownRow(_) | Hit::List) {
@@ -403,9 +387,8 @@ impl View {
         match hit {
             Hit::Search => {
                 let input_x = self.ensure_layout().search_input.x + 2.0;
-                let (offset, _, _) = self.search_metrics();
-                let text = self.state.search.text().to_string();
-                let pos = self.gfx.position_at(&text, TextStyle::Body, x - input_x + offset);
+                let m = self.search_metrics();
+                let pos = self.gfx.position_at(self.state.search.text(), TextStyle::Body, x - input_x + m.offset);
                 self.state.search.set_caret_utf16(pos);
                 Effect::None
             }
@@ -426,8 +409,10 @@ impl View {
     }
 
     fn mouse_up(&mut self, x: f32, y: f32) -> Effect {
-        if self.add.is_some() {
-            return self.add_mouse_up(x, y);
+        let area = self.area();
+        if let Some(add) = self.add.as_mut() {
+            let outcome = add.mouse_up(&self.gfx, area, x, y);
+            return self.add_outcome(outcome);
         }
         if self.scroll_drag.take().is_some() {
             return Effect::Capture(false);
@@ -436,24 +421,19 @@ impl View {
         if pressed == Hit::None {
             return Effect::None;
         }
-        let effect = if self.hit(x, y) == pressed { self.activate(pressed) } else { Effect::None };
-        match effect {
-            Effect::None => Effect::Capture(false),
-            other => {
-                release_capture();
-                other
-            }
-        }
+        winutil::release_capture();
+        if self.hit(x, y) == pressed { self.activate(pressed) } else { Effect::None }
     }
 
     fn mouse_move(&mut self, x: f32, y: f32) {
-        if self.add.is_some() {
-            return self.add_mouse_move(x, y);
+        let area = self.area();
+        if let Some(add) = self.add.as_mut() {
+            return add.mouse_move(&self.gfx, area, x, y);
         }
         if let Some((start_y, start_scroll)) = self.scroll_drag {
-            let n = self.state.visible().len();
+            let n = library::with(|lib| self.state.visible(lib).len());
             let l = self.ensure_layout();
-            let content = l.content_height(n);
+            let content = l.grid().content_height(n);
             let ratio = if l.gallery.h > 0.0 { content / l.gallery.h } else { 1.0 };
             self.state.scroll = start_scroll + (y - start_y) * ratio;
             self.clamp_scroll();
@@ -462,8 +442,9 @@ impl View {
     }
 
     fn wheel(&mut self, delta: i16) {
-        if self.add.is_some() {
-            return self.add_wheel(delta);
+        let area = self.area();
+        if let Some(add) = self.add.as_mut() {
+            return add.wheel(&self.gfx, area, delta);
         }
         self.state.dropdown = None;
         self.state.scroll -= delta as f32 / 120.0 * WHEEL_STEP;
@@ -471,18 +452,26 @@ impl View {
     }
 
     fn key(&mut self, vk: VIRTUAL_KEY, ctrl: bool, shift: bool, alt: bool) -> Effect {
-        if self.add.is_some() {
-            return self.add_key(vk, ctrl, shift);
+        let area = self.area();
+        if let Some(add) = self.add.as_mut() {
+            let outcome = add.key(&self.gfx, area, vk, ctrl, shift);
+            return self.add_outcome(outcome);
         }
+        let grid = self.ensure_layout().grid();
+        library::with(|lib| self.key_gallery(lib, grid, vk, ctrl, shift, alt))
+    }
+
+    /// Keys for the gallery screen. Runs inside a library read, so it must not
+    /// change the library: actions that do are returned as `Effect::Deferred`.
+    fn key_gallery(&mut self, lib: &Library, grid: Grid, vk: VIRTUAL_KEY, ctrl: bool, shift: bool, alt: bool) -> Effect {
+        let page = grid.page();
         let s = &mut self.state;
         if let Some(row) = s.dropdown {
             match vk {
                 VK_UP | VK_DOWN => s.dropdown = Some(if vk == VK_UP { 0 } else { 1 }),
-                VK_RETURN | VK_SPACE => {
-                    s.set_list(ListKind::BOTH[row]);
-                }
+                VK_RETURN | VK_SPACE => s.set_list(ListKind::BOTH[row]),
                 VK_ESCAPE => s.dropdown = None,
-                VK_TAB => s.tab(shift),
+                VK_TAB => s.tab(lib, shift),
                 _ => {}
             }
             return Effect::None;
@@ -490,7 +479,7 @@ impl View {
         match vk {
             VK_ESCAPE => return Effect::Close(true),
             VK_TAB => {
-                s.tab(shift);
+                s.tab(lib, shift);
                 return Effect::None;
             }
             _ => {}
@@ -515,32 +504,32 @@ impl View {
                 }
                 VK_A if ctrl => s.search.select_all(),
                 VK_V if ctrl => return Effect::PasteText,
-                VK_DOWN if s.empty().is_none() => {
+                VK_DOWN if s.empty(lib).is_none() => {
                     s.focus = Focus::Gallery;
                     s.focus_visible = true;
                 }
-                VK_RETURN => return s.selected_index().map_or(Effect::None, |_| Effect::Activate),
+                VK_RETURN => return s.selected_index(lib).map_or(Effect::None, |_| Effect::Activate),
                 _ => {}
             },
             Focus::Gallery => {
-                let page = ((self.ensure_layout().gallery.h / self.ensure_layout().row_pitch()).floor().max(1.0)) as isize * COLUMNS as isize;
-                let s = &mut self.state;
                 let cols = COLUMNS as isize;
                 match vk {
-                    VK_LEFT => s.move_selection(-1),
-                    VK_RIGHT => s.move_selection(1),
-                    VK_DOWN => s.move_selection(cols),
-                    VK_UP if s.selected_index().unwrap_or(0) < COLUMNS => s.focus = Focus::Search,
-                    VK_UP => s.move_selection(-cols),
-                    VK_HOME => s.move_selection(-10_000),
-                    VK_END => s.move_selection(10_000),
-                    VK_NEXT => s.move_selection(page),
-                    VK_PRIOR => s.move_selection(-page),
-                    VK_RETURN | VK_SPACE => return s.selected_index().map_or(Effect::None, |_| Effect::Activate),
+                    VK_LEFT => s.move_selection(lib, -1),
+                    VK_RIGHT => s.move_selection(lib, 1),
+                    VK_DOWN => s.move_selection(lib, cols),
+                    VK_UP if s.selected_index(lib).unwrap_or(0) < COLUMNS => s.focus = Focus::Search,
+                    VK_UP => s.move_selection(lib, -cols),
+                    VK_HOME => s.move_selection(lib, -10_000),
+                    VK_END => s.move_selection(lib, 10_000),
+                    VK_NEXT => s.move_selection(lib, page),
+                    VK_PRIOR => s.move_selection(lib, -page),
+                    VK_RETURN | VK_SPACE => return s.selected_index(lib).map_or(Effect::None, |_| Effect::Activate),
                     _ => return Effect::None,
                 }
                 s.focus_visible = true;
-                self.show_selection();
+                if let Some(i) = s.selected_index(lib) {
+                    s.scroll = grid.scroll_to_show(i, s.scroll);
+                }
             }
             Focus::Type(i) => match vk {
                 VK_LEFT if i > 0 => s.focus = Focus::Type(i - 1),
@@ -568,7 +557,7 @@ impl View {
                         Focus::OpenManager => Hit::OpenManager,
                         _ => Hit::AddMedia,
                     };
-                    return self.activate(hit);
+                    return Effect::Deferred(hit);
                 }
             }
         }
@@ -578,6 +567,17 @@ impl View {
     fn search_edit(&mut self, f: impl FnOnce(&mut crate::text_field::TextField)) {
         f(&mut self.state.search);
         self.state.reset_view();
+    }
+
+    fn insert_text(&mut self, text: &str) {
+        if let Some(add) = self.add.as_mut() {
+            return add.insert(text);
+        }
+        // Typing while the gallery has focus goes to the search box.
+        if matches!(self.state.focus, Focus::Search | Focus::Gallery) && self.state.dropdown.is_none() {
+            self.state.focus = Focus::Search;
+            self.search_edit(|f| f.insert(text));
+        }
     }
 
     fn char_input(&mut self, unit: u16) {
@@ -593,29 +593,12 @@ impl View {
             u if u < 0x20 || u == 0x7F => return, // control keys are handled in WM_KEYDOWN
             u => String::from_utf16_lossy(&[u]),
         };
-        if self.add.is_some() {
-            return self.add_insert(&text);
-        }
-        // Typing while the gallery has focus goes to the search box.
-        if matches!(self.state.focus, Focus::Search | Focus::Gallery) && self.state.dropdown.is_none() {
-            self.state.focus = Focus::Search;
-            self.search_edit(|f| f.insert(&text));
-        }
+        self.insert_text(&text);
     }
 }
 
 fn list_index(list: ListKind) -> usize {
     ListKind::BOTH.iter().position(|l| *l == list).unwrap_or(0)
-}
-
-fn release_capture() {
-    // SAFETY: no preconditions; harmless if we do not hold capture.
-    let _ = unsafe { ReleaseCapture() };
-}
-
-fn key_down(vk: VIRTUAL_KEY) -> bool {
-    // SAFETY: no preconditions.
-    (unsafe { GetKeyState(vk.0 as i32) }) < 0
 }
 
 fn run(effect: Effect) {
@@ -635,21 +618,21 @@ fn run(effect: Effect) {
             }
         }
         Effect::PasteText => {
-            if let Some(text) = clipboard_text() {
-                with_view(|v| {
-                    if v.add.is_some() {
-                        v.add_insert(&text);
-                    } else {
-                        v.search_edit(|f| f.insert(&text));
-                    }
-                });
+            if let Some(text) = winutil::clipboard_text(hwnd()) {
+                with_view(|v| v.insert_text(&text));
             }
         }
-        Effect::Capture(true) => {
-            // SAFETY: our own window.
-            unsafe { SetCapture(hwnd()) };
+        Effect::Capture(true) => winutil::set_capture(hwnd()),
+        Effect::Capture(false) => winutil::release_capture(),
+        Effect::OpenManager => {
+            close(false);
+            manager::show();
         }
-        Effect::Capture(false) => release_capture(),
+        Effect::Deferred(hit) => {
+            if let Some(effect) = with_view(|v| v.activate(hit)) {
+                run(effect);
+            }
+        }
     }
     invalidate();
 }
@@ -665,42 +648,6 @@ fn drag_out() {
         Ok(_) => set_status("Drag ended without a drop.", StatusKind::Neutral),
         Err(e) => set_status(e, StatusKind::Bad),
     }
-}
-
-/// Plain text from the clipboard for Ctrl+V in the search box.
-fn clipboard_text() -> Option<String> {
-    // SAFETY: the clipboard is opened and closed in this block; the memory is
-    // read only while locked and copied out before unlocking.
-    unsafe {
-        OpenClipboard(Some(hwnd())).ok()?;
-        let text = GetClipboardData(CF_UNICODETEXT.0 as u32).ok().and_then(|h| {
-            let mem = windows::Win32::Foundation::HGLOBAL(h.0);
-            let ptr = GlobalLock(mem) as *const u16;
-            if ptr.is_null() {
-                return None;
-            }
-            let mut len = 0;
-            while *ptr.add(len) != 0 && len < 4096 {
-                len += 1;
-            }
-            let s = String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len));
-            let _ = GlobalUnlock(mem);
-            Some(s)
-        });
-        let _ = CloseClipboard();
-        text
-    }
-}
-
-fn cursor_dip(v: &View) -> Option<(f32, f32)> {
-    let mut pt = POINT::default();
-    // SAFETY: out-pointer to a local; our own window.
-    unsafe {
-        GetCursorPos(&mut pt).ok()?;
-        let _ = ScreenToClient(hwnd(), &mut pt);
-    }
-    let s = 96.0 / v.dpi as f32;
-    Some((pt.x as f32 * s, pt.y as f32 * s))
 }
 
 extern "system" fn popup_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -719,11 +666,9 @@ extern "system" fn popup_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
         WM_MOUSEMOVE => {
             with_view(|v| {
                 if !v.tracking_leave {
-                    let mut tme = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
-                    // SAFETY: tme is a fully initialised local.
-                    v.tracking_leave = unsafe { TrackMouseEvent(&mut tme) }.is_ok();
+                    v.tracking_leave = winutil::track_mouse_leave(hwnd);
                 }
-                let (x, y) = v.to_dip(lparam);
+                let (x, y) = winutil::to_dip(winutil::lparam_point(lparam), v.dpi);
                 v.mouse_move(x, y);
             });
             Effect::None
@@ -732,29 +677,30 @@ extern "system" fn popup_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
             with_view(|v| {
                 v.tracking_leave = false;
                 v.hover = Hit::None;
-                v.add_hover = AddHit::None;
+                if let Some(add) = v.add.as_mut() {
+                    add.hover = AddHit::None;
+                }
             });
             Effect::None
         }
         WM_LBUTTONDOWN => {
-            let mut screen = POINT { x: (lparam.0 & 0xFFFF) as i16 as i32, y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32 };
-            // SAFETY: our own window; screen is a local.
-            let _ = unsafe { ClientToScreen(hwnd, &mut screen) };
+            let pt = winutil::lparam_point(lparam);
+            let screen = winutil::client_to_screen(hwnd, pt);
             with_view(|v| {
-                let (x, y) = v.to_dip(lparam);
+                let (x, y) = winutil::to_dip(pt, v.dpi);
                 v.mouse_down(x, y, screen)
             })
             .unwrap_or(Effect::None)
         }
         WM_LBUTTONUP => with_view(|v| {
-            let (x, y) = v.to_dip(lparam);
+            let (x, y) = winutil::to_dip(winutil::lparam_point(lparam), v.dpi);
             v.mouse_up(x, y)
         })
         .unwrap_or(Effect::None),
         WM_MOUSEWHEEL => {
             with_view(|v| {
                 v.wheel(((wparam.0 >> 16) & 0xFFFF) as i16);
-                if let Some((x, y)) = cursor_dip(v) {
+                if let Some((x, y)) = winutil::cursor_dip(hwnd, v.dpi) {
                     v.mouse_move(x, y);
                 }
             });
@@ -767,24 +713,20 @@ extern "system" fn popup_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
                 // SAFETY: forwarding unchanged (keeps Alt+F4 etc.).
                 return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
             }
-            with_view(|v| v.key(vk, key_down(VK_CONTROL), key_down(VK_SHIFT), alt)).unwrap_or(Effect::None)
+            let (ctrl, shift) = (winutil::key_down(VK_CONTROL), winutil::key_down(VK_SHIFT));
+            with_view(|v| v.key(vk, ctrl, shift, alt)).unwrap_or(Effect::None)
         }
         WM_CHAR => {
             with_view(|v| v.char_input(wparam.0 as u16));
             Effect::None
         }
         WM_SETCURSOR if (lparam.0 & 0xFFFF) as u32 == HTCLIENT => {
-            let beam = with_view(|v| match v.add {
-                Some(_) => matches!(v.add_hover, AddHit::RowInput(_)),
+            let beam = with_view(|v| match v.add.as_ref() {
+                Some(add) => add.text_hover(),
                 None => v.hover == Hit::Search,
             })
             .unwrap_or(false);
-            // SAFETY: system cursors are shared resources; no ownership.
-            unsafe {
-                if let Ok(c) = LoadCursorW(None, if beam { IDC_IBEAM } else { IDC_ARROW }) {
-                    SetCursor(Some(c));
-                }
-            }
+            winutil::set_cursor(beam);
             return LRESULT(1);
         }
         WM_ACTIVATE => {
@@ -831,17 +773,17 @@ pub enum TestTarget {
 pub fn element_center(target: TestTarget) -> Option<POINT> {
     let h = hwnd();
     with_view(|v| {
+        let area = v.area();
         let element = match target {
             TestTarget::Gallery(hit) if v.add.is_none() => hit,
             TestTarget::Add(hit) => {
-                let r = v.add_element(hit)?;
-                return Some(to_screen(h, v.dpi, r));
+                let r = v.add.as_ref()?.element(&v.gfx, area, hit)?;
+                return Some(winutil::rect_center_on_screen(h, v.dpi, r));
             }
             _ => return None,
         };
-        let n = v.state.visible().len();
+        let (n, action) = library::with(|lib| (v.state.visible(lib).len(), v.state.empty(lib).map(|e| e.action())));
         let scroll = v.state.scroll;
-        let action = v.state.empty().map(|e| e.action());
         let l = v.ensure_layout();
         let r = match element {
             Hit::Close => l.close,
@@ -852,47 +794,40 @@ pub fn element_center(target: TestTarget) -> Option<POINT> {
             Hit::Chip(i) => *l.chips.get(i)?,
             Hit::List => l.list,
             Hit::DropdownRow(i) => *l.dropdown_rows.get(i)?,
-            Hit::Tile(i) if i < n => l.tile(i, scroll),
+            Hit::Tile(i) if i < n => l.grid().tile(i, scroll),
             Hit::ClearHistory => l.clear_history,
             Hit::EmptyAction => l.empty_parts(action?).2,
             // A point in the gap between the first two columns: over the gallery, not a tile.
-            Hit::Scrollbar => layout::Rect::new(l.tile(0, 0.0).right() + 1.0, l.gallery.y + l.gallery.h / 2.0, 10.0, 1.0),
+            Hit::Scrollbar => layout::Rect::new(l.grid().tile(0, 0.0).right() + 1.0, l.gallery.y + l.gallery.h / 2.0, 10.0, 1.0),
             // A neutral point: the empty middle of the title bar.
             Hit::None => layout::Rect::new(l.title.right() + 20.0, l.titlebar.y + 10.0, 1.0, 1.0),
             _ => return None,
         };
-        Some(to_screen(h, v.dpi, r))
+        Some(winutil::rect_center_on_screen(h, v.dpi, r))
     })
     .flatten()
 }
 
-fn to_screen(h: HWND, dpi: u32, r: layout::Rect) -> POINT {
-    let (cx, cy) = r.center();
-    let s = dpi as f32 / 96.0;
-    let mut pt = POINT { x: (cx * s).round() as i32, y: (cy * s).round() as i32 };
-    // SAFETY: our own window; pt is a local.
-    let _ = unsafe { ClientToScreen(h, &mut pt) };
-    pt
-}
-
-/// "list=… filter=… count=… names=a|b|c" for self-test checks.
+/// "screen=gallery list=… filter=… count=… names=a|b|c" for self-test checks.
 pub fn describe_state() -> String {
     with_view(|v| {
-        if let Some(d) = v.describe_add() {
-            return d;
+        if let Some(add) = v.add.as_ref() {
+            return add.describe();
         }
         let s = &v.state;
-        let names: Vec<&str> = s.visible().iter().map(|i| i.name.as_str()).collect();
-        format!(
-            "screen=gallery status={:?} list={:?} filter={:?} query={:?} focus={:?} count={} names={}",
-            s.status.as_deref().unwrap_or(""),
-            s.list,
-            s.filter,
-            s.search.text(),
-            s.focus,
-            names.len(),
-            names.join("|")
-        )
+        library::with(|lib| {
+            let names: Vec<&str> = s.visible(lib).iter().map(|i| i.name.as_str()).collect();
+            format!(
+                "screen=gallery status={:?} list={:?} filter={:?} query={:?} focus={:?} count={} names={}",
+                s.status.as_deref().unwrap_or(""),
+                s.list,
+                s.filter,
+                s.search.text(),
+                s.focus,
+                names.len(),
+                names.join("|")
+            )
+        })
     })
     .unwrap_or_default()
 }

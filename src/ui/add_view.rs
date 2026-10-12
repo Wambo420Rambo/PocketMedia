@@ -4,7 +4,7 @@
 
 use super::d2d::{Align, Color, Gfx, Painter};
 use super::layout::{Rect, TextStyle};
-use super::paint::{self, ACCENT, BG, BORDER, MUTED, ON_ACCENT, RAISED, RING, SOFT_TEXT, SURFACE, TEXT};
+use super::widgets::{self, ACCENT, BG, BORDER, DISABLED, ERROR, MUTED, ON_ACCENT, RAISED, RING, SOFT_TEXT, SURFACE, TEXT};
 use crate::add_media::{AddFocus, AddMedia, RowStatus};
 
 const PAD: f32 = 20.0;
@@ -19,7 +19,9 @@ const ICON_COL: f32 = 20.0;
 const COL_GAP: f32 = 10.0;
 const ROUTE_W: f32 = 76.0;
 const DROP_FILL: Color = Color::rgb(0x232434); // --pm-soft 35% over --pm-bg
-const ERROR: Color = Color::rgb(0xFF8A80);
+/// The panel is at most this wide and centred, so it reads well in the wide
+/// Manager window too (CSS .pm-import-host max-width).
+const HOST_MAX_W: f32 = 680.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AddHit {
@@ -48,6 +50,8 @@ pub struct RowGeom {
 pub struct AddLayout {
     pub width: f32,
     pub height: f32,
+    /// Right edge of the panel, where its scrollbar goes.
+    pub host_right: f32,
     pub close: Rect,
     pub title_bar: Rect,
     pub title: Rect,
@@ -85,9 +89,12 @@ impl AddLayout {
         let close = Rect::new(width - 1.0 - 14.0 - 32.0, 1.0 + (45.0 - 28.0) / 2.0, 32.0, 28.0);
         let title = Rect::new(1.0 + 14.0 + 9.0, 1.0, gfx.measure("PocketMedia", TextStyle::Medium), 45.0);
 
+        // The panel: full width in the popup, centred at 680 in the Manager.
+        let host_w = (width - 2.0).min(HOST_MAX_W);
+        let host_x = (width - host_w) / 2.0;
         // Head: [back 32][12][title / subtitle], padding 20 20 16.
-        let x0 = 1.0 + PAD;
-        let inner_w = width - 2.0 - 2.0 * PAD;
+        let x0 = host_x + PAD;
+        let inner_w = host_w - 2.0 * PAD;
         let head_y = 47.0 + HEAD_PAD_TOP;
         let head_h = TextStyle::Title.line() + 4.0 + TextStyle::Small.line();
         let back = Rect::new(x0, head_y + (head_h - BUTTON_H) / 2.0, BACK_W, BUTTON_H);
@@ -99,7 +106,7 @@ impl AddLayout {
         // Footer: padding 14 20, safety line, then actions (review only) after 12px.
         let review = a.reviewing();
         let footer_h = 1.0 + 14.0 + TextStyle::Small.line() + 14.0 + if review { 12.0 + BUTTON_H } else { 0.0 };
-        let footer = Rect::new(1.0, height - 1.0 - footer_h, width - 2.0, footer_h);
+        let footer = Rect::new(host_x, height - 1.0 - footer_h, host_w, footer_h);
         let safety = Rect::new(x0 + 7.0, footer.y + 1.0 + 14.0, inner_w - 7.0, TextStyle::Small.line());
         let actions_y = safety.bottom() + 12.0;
         let add_w = 24.0 + gfx.measure(&a.add_label(), TextStyle::Body);
@@ -154,6 +161,7 @@ impl AddLayout {
         AddLayout {
             width,
             height,
+            host_right: host_x + host_w,
             close,
             title_bar,
             title,
@@ -249,7 +257,7 @@ pub struct AddUi {
 
 pub fn paint(p: &Painter, a: &AddMedia, l: &AddLayout, ui: &AddUi) {
     p.clear(BG);
-    paint::title_bar(p, l.title_bar, l.title, l.close, ui.hover == AddHit::Close, a.focus_visible && a.focus == AddFocus::Close);
+    widgets::title_bar(p, l.title_bar, l.title, l.close, ui.hover == AddHit::Close, a.focus_visible && a.focus == AddFocus::Close);
 
     let ring = |focus: AddFocus, r: Rect, radius: f32| {
         if a.focus_visible && a.focus == focus {
@@ -286,7 +294,7 @@ pub fn paint(p: &Painter, a: &AddMedia, l: &AddLayout, ui: &AddUi) {
         let h = (track * track / l.content_h).max(24.0);
         let y = l.main.y + (track - h) * (a.scroll / l.max_scroll());
         p.pop_clip();
-        p.fill(Rect::new(l.width - 1.0 - 6.0, y, 4.0, h), 2.0, BORDER);
+        p.fill(Rect::new(l.host_right - 6.0, y, 4.0, h), 2.0, BORDER);
     } else {
         p.pop_clip();
     }
@@ -298,8 +306,7 @@ pub fn paint(p: &Painter, a: &AddMedia, l: &AddLayout, ui: &AddUi) {
         quiet(l.cancel, AddHit::Cancel);
         p.text("Cancel", l.cancel, TextStyle::Body, TEXT, Align::Center, true);
         ring(AddFocus::Cancel, l.cancel, 6.0);
-        // Disabled buttons are drawn at 55% opacity, as in the wireframe.
-        let alpha = if a.can_add() { 1.0 } else { 0.55 };
+        let alpha = if a.can_add() { 1.0 } else { DISABLED };
         p.fill(l.add, 6.0, ACCENT.alpha(alpha));
         p.text(&a.add_label(), l.add, TextStyle::Body, ON_ACCENT.alpha(alpha), Align::Center, true);
         ring(AddFocus::Add, l.add, 6.0);

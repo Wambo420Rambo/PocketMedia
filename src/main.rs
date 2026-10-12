@@ -3,11 +3,16 @@
 //! Phase 0 (risk test): tray icon + menu, the global shortcut Win+Alt+., focus
 //! hand-back, paste of a test PNG and dragging it out.
 //! The quick popup drawn with Direct2D/DirectWrite over fake items.
-//! No real library, import, settings or persistence yet.
+//! Add media and the Manager over the same fake, in-memory library.
+//! No real files, settings or persistence yet.
 
 #![windows_subsystem = "windows"]
 
 mod add_media;
+mod add_panel;
+mod library;
+mod manager;
+mod manager_state;
 mod names;
 mod paste;
 mod popup;
@@ -22,6 +27,7 @@ mod text_field;
 mod transfer;
 mod tray;
 mod ui;
+mod winutil;
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -297,6 +303,7 @@ extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
                 }
                 let _ = KillTimer(Some(hwnd), TIMER_PASTE);
                 tray::remove(hwnd);
+                manager::destroy();
                 popup::destroy();
                 PostQuitMessage(0);
                 LRESULT(0)
