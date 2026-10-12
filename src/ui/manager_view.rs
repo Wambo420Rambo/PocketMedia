@@ -75,7 +75,8 @@ pub struct Inspector {
     pub confirm: Option<Confirm>,
 }
 
-pub struct ManagerLayout {
+/// Title bar and sidebar, shared by the Library and Settings pages.
+pub struct Frame {
     pub width: f32,
     pub height: f32,
     pub titlebar: Rect,
@@ -85,6 +86,100 @@ pub struct ManagerLayout {
     pub sidebar: Rect,
     pub labels: [Rect; 2],
     pub nav: [Rect; 5],
+}
+
+/// What the frame has under the pointer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameHit {
+    Close,
+    Caption,
+    Nav(usize),
+}
+
+impl Frame {
+    /// `bottom` is where the sidebar ends (the footer's top, or the window's inner bottom).
+    pub fn compute(width: f32, height: f32, caption: &str, bottom: f32, gfx: &Gfx) -> Self {
+        let titlebar = Rect::new(1.0, 1.0, width - 2.0, TITLE_H);
+        let title_w = gfx.measure("PocketMedia", TextStyle::Medium);
+        let title = Rect::new(1.0 + 14.0 + 9.0, 1.0, title_w, TITLE_H - 1.0);
+        let caption = Rect::new(title.right() + 9.0, 1.0, gfx.measure(caption, TextStyle::Small) + 2.0, TITLE_H - 1.0);
+        let close = Rect::new(width - 1.0 - 14.0 - 32.0, 1.0 + (TITLE_H - 1.0 - 28.0) / 2.0, 32.0, 28.0);
+
+        // Sidebar: padding 18 10; labels 11px with margins 12 8 8; buttons 36 + 5.
+        let body_y = Self::body_y();
+        let sidebar = Rect::new(1.0, body_y, SIDEBAR_W, bottom - body_y);
+        let nav_x = sidebar.x + 10.0;
+        let nav_w = SIDEBAR_W - 1.0 - 20.0;
+        let label = |y: f32| Rect::new(nav_x + 8.0, y + 12.0, nav_w - 16.0, TextStyle::Tiny.line());
+        let lib_label = label(body_y + 18.0);
+        let mut y = lib_label.bottom() + 8.0;
+        let all = Rect::new(nav_x, y, nav_w, BUTTON_H);
+        let types_label = label(all.bottom() + NAV_GAP);
+        y = types_label.bottom() + 8.0;
+        let mut nav = [all; 5];
+        for slot in nav.iter_mut().skip(1) {
+            *slot = Rect::new(nav_x, y, nav_w, BUTTON_H);
+            y += BUTTON_H + NAV_GAP;
+        }
+        Frame { width, height, titlebar, title, caption, close, sidebar, labels: [lib_label, types_label], nav }
+    }
+
+    /// Top of everything under the title bar.
+    pub fn body_y() -> f32 {
+        1.0 + TITLE_H
+    }
+
+    pub fn hit(&self, x: f32, y: f32) -> Option<FrameHit> {
+        if self.close.contains(x, y) {
+            Some(FrameHit::Close)
+        } else if self.titlebar.contains(x, y) {
+            Some(FrameHit::Caption)
+        } else {
+            self.nav.iter().position(|r| r.contains(x, y)).map(FrameHit::Nav)
+        }
+    }
+}
+
+/// Pointer and focus state of the frame's controls.
+pub struct FrameLook {
+    pub hover: Option<FrameHit>,
+    pub ring: Option<FrameHit>,
+}
+
+/// Background, border, title bar and sidebar. Call first; `paint_border` last.
+pub fn paint_frame(p: &Painter, f: &Frame, caption: &str, selected: &dyn Fn(Nav) -> bool, look: FrameLook) {
+    p.clear(BG);
+    let close = Some(FrameHit::Close);
+    widgets::title_bar(p, f.titlebar, f.title, f.close, look.hover == close, look.ring == close);
+    p.text(caption, f.caption, TextStyle::Small, MUTED, Align::Start, true);
+
+    p.fill(f.sidebar, 0.0, SIDEBAR);
+    p.line(f.sidebar.right() - 0.5, f.sidebar.y, f.sidebar.right() - 0.5, f.sidebar.bottom(), 1.0, BORDER);
+    // CSS letter-spacing: .06em of 11px.
+    let spacing = TextStyle::Tiny.size() * 0.06;
+    p.text_spaced("LIBRARY", f.labels[0], TextStyle::Tiny, MUTED, spacing);
+    p.text_spaced("MEDIA TYPES", f.labels[1], TextStyle::Tiny, MUTED, spacing);
+    for (i, (r, nav)) in f.nav.iter().zip(Nav::ORDER).enumerate() {
+        let on = selected(nav);
+        if on {
+            p.fill(*r, 6.0, SOFT);
+        }
+        if look.hover == Some(FrameHit::Nav(i)) {
+            p.stroke(*r, 6.0, 1.0, ACCENT);
+        }
+        let text = Rect::new(r.x + 19.0, r.y, r.w - 26.0, r.h);
+        p.text(nav.label(), text, TextStyle::Body, if on { SOFT_TEXT } else { TEXT }, Align::Start, true);
+        widgets::ring(p, look.ring == Some(FrameHit::Nav(i)), *r, 6.0);
+    }
+}
+
+/// The window's 1px rounded border, over everything else.
+pub fn paint_border(p: &Painter, f: &Frame) {
+    p.stroke(Rect::new(0.0, 0.0, f.width, f.height), 8.0, 1.0, BORDER);
+}
+
+pub struct ManagerLayout {
+    pub frame: Frame,
     pub heading: Rect,
     pub add_media: Rect,
     pub lead: Rect,
@@ -106,36 +201,15 @@ pub struct ManagerLayout {
 
 impl ManagerLayout {
     pub fn compute(s: &ManagerState, lib: &Library, width: f32, height: f32, gfx: &Gfx) -> Self {
-        let titlebar = Rect::new(1.0, 1.0, width - 2.0, TITLE_H);
-        let title_w = gfx.measure("PocketMedia", TextStyle::Medium);
-        let title = Rect::new(1.0 + 14.0 + 9.0, 1.0, title_w, TITLE_H - 1.0);
-        let caption = Rect::new(title.right() + 9.0, 1.0, gfx.measure("Library", TextStyle::Small) + 2.0, TITLE_H - 1.0);
-        let close = Rect::new(width - 1.0 - 14.0 - 32.0, 1.0 + (TITLE_H - 1.0 - 28.0) / 2.0, 32.0, 28.0);
-
-        let body_y = 1.0 + TITLE_H;
+        let body_y = Frame::body_y();
         let footer = Rect::new(1.0, height - 1.0 - FOOTER_H, width - 2.0, FOOTER_H);
         // 2px above the CSS box: matches where Chrome puts the glyphs (as in the popup).
         let footer_text = Rect::new(footer.x + 20.0, footer.y + 1.0 + 11.0, footer.w - 40.0, TextStyle::Small.line());
         let body_h = footer.y - body_y;
-
-        // Sidebar: padding 18 10; labels 11px with margins 12 8 8; buttons 36 + 5.
-        let sidebar = Rect::new(1.0, body_y, SIDEBAR_W, body_h);
-        let nav_x = sidebar.x + 10.0;
-        let nav_w = SIDEBAR_W - 1.0 - 20.0;
-        let label = |y: f32| Rect::new(nav_x + 8.0, y + 12.0, nav_w - 16.0, TextStyle::Tiny.line());
-        let lib_label = label(body_y + 18.0);
-        let mut y = lib_label.bottom() + 8.0;
-        let all = Rect::new(nav_x, y, nav_w, BUTTON_H);
-        let types_label = label(all.bottom() + NAV_GAP);
-        y = types_label.bottom() + 8.0;
-        let mut nav = [all; 5];
-        for slot in nav.iter_mut().skip(1) {
-            *slot = Rect::new(nav_x, y, nav_w, BUTTON_H);
-            y += BUTTON_H + NAV_GAP;
-        }
+        let frame = Frame::compute(width, height, "Library", footer.y, gfx);
 
         // Main column: padding 20.
-        let main = Rect::new(sidebar.right(), body_y, width - 2.0 - SIDEBAR_W - INSPECTOR_W, body_h);
+        let main = Rect::new(frame.sidebar.right(), body_y, width - 2.0 - SIDEBAR_W - INSPECTOR_W, body_h);
         let x0 = main.x + 20.0;
         let inner_w = main.w - 40.0;
         let top = body_y + 20.0;
@@ -205,15 +279,7 @@ impl ManagerLayout {
             .map(|t| Rect::new(ix, bottom + 14.0, iw, gfx.wrapped_height(t, TextStyle::Small, iw)));
 
         ManagerLayout {
-            width,
-            height,
-            titlebar,
-            title,
-            caption,
-            close,
-            sidebar,
-            labels: [lib_label, types_label],
-            nav,
+            frame,
             heading,
             add_media,
             lead,
@@ -243,14 +309,11 @@ impl ManagerLayout {
                 return MHit::None;
             }
         }
-        if self.close.contains(x, y) {
-            return MHit::Close;
-        }
-        if self.titlebar.contains(x, y) {
-            return MHit::Caption;
-        }
-        if let Some(i) = self.nav.iter().position(|r| r.contains(x, y)) {
-            return MHit::Nav(i);
+        match self.frame.hit(x, y) {
+            Some(FrameHit::Close) => return MHit::Close,
+            Some(FrameHit::Caption) => return MHit::Caption,
+            Some(FrameHit::Nav(i)) => return MHit::Nav(i),
+            None => {}
         }
         let simple = [(self.add_media, MHit::AddMedia), (self.sort, MHit::Sort)];
         if let Some((_, hit)) = simple.iter().find(|(r, _)| r.contains(x, y)) {
@@ -303,29 +366,21 @@ pub struct ManagerUi {
 }
 
 pub fn paint(p: &Painter, s: &ManagerState, lib: &Library, l: &ManagerLayout, ui: &ManagerUi) {
-    p.clear(BG);
     let ring = |f: MFocus| s.focus_visible && s.focus == f;
-
-    widgets::title_bar(p, l.titlebar, l.title, l.close, ui.hover == MHit::Close, ring(MFocus::Close));
-    p.text("Library", l.caption, TextStyle::Small, MUTED, Align::Start, true);
-
-    // Sidebar
-    p.fill(l.sidebar, 0.0, SIDEBAR);
-    p.line(l.sidebar.right() - 0.5, l.sidebar.y, l.sidebar.right() - 0.5, l.sidebar.bottom(), 1.0, BORDER);
-    p.text("LIBRARY", l.labels[0], TextStyle::Tiny, MUTED, Align::Start, true);
-    p.text("MEDIA TYPES", l.labels[1], TextStyle::Tiny, MUTED, Align::Start, true);
-    for (i, (r, nav)) in l.nav.iter().zip(Nav::ORDER).enumerate() {
-        let on = s.nav_selected(nav);
-        if on {
-            p.fill(*r, 6.0, SOFT);
-        }
-        if ui.hover == MHit::Nav(i) {
-            p.stroke(*r, 6.0, 1.0, ACCENT);
-        }
-        let text = Rect::new(r.x + 19.0, r.y, r.w - 26.0, r.h);
-        p.text(nav.label(), text, TextStyle::Body, if on { SOFT_TEXT } else { TEXT }, Align::Start, true);
-        widgets::ring(p, ring(MFocus::Nav(i)), *r, 6.0);
-    }
+    let frame_hit = |h: MHit| match h {
+        MHit::Close => Some(FrameHit::Close),
+        MHit::Nav(i) => Some(FrameHit::Nav(i)),
+        _ => None,
+    };
+    let look = FrameLook {
+        hover: frame_hit(ui.hover),
+        ring: match s.focus {
+            MFocus::Close if s.focus_visible => Some(FrameHit::Close),
+            MFocus::Nav(i) if s.focus_visible => Some(FrameHit::Nav(i)),
+            _ => None,
+        },
+    };
+    paint_frame(p, &l.frame, "Library", &|n| s.nav_selected(n), look);
 
     // Main column
     p.text("Your library", l.heading, TextStyle::H1, TEXT, Align::Start, true);
@@ -355,7 +410,7 @@ pub fn paint(p: &Painter, s: &ManagerState, lib: &Library, l: &ManagerLayout, ui
         let labels = Sort::BOTH.map(Sort::label);
         widgets::menu(p, &l.sort_menu, &labels, row, s.sort.index());
     }
-    p.stroke(Rect::new(0.0, 0.0, l.width, l.height), 8.0, 1.0, BORDER);
+    paint_border(p, &l.frame);
 }
 
 fn gallery(p: &Painter, s: &ManagerState, lib: &Library, l: &ManagerLayout, ui: &ManagerUi) {

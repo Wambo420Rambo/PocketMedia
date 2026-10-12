@@ -262,3 +262,73 @@ pub fn empty_state(p: &Painter, parts: (Rect, Rect, Rect), empty: Empty, hovered
 pub fn scrollbar(p: &Painter, bar: Rect, hovered: bool) {
     p.fill(bar, 2.0, if hovered { MUTED } else { BORDER });
 }
+
+/// Fill and border of an unchecked native checkbox or radio in the dark wireframe.
+const CONTROL_FILL: Color = Color::rgb(0x3B3B3B);
+const CONTROL_BORDER: Color = Color::rgb(0x858585);
+/// Checked controls under the pointer are drawn lighter, as Chrome does.
+const ACCENT_HOT: Color = Color::rgb(0xD7CBFF);
+
+/// 16px checkbox (CSS input[type=checkbox] with accent-color).
+pub fn checkbox(p: &Painter, r: Rect, checked: bool, hovered: bool, focus_ring: bool) {
+    if checked {
+        p.fill(r, 2.5, if hovered { ACCENT_HOT } else { ACCENT });
+        let (x, y) = (r.x, r.y);
+        p.line(x + 3.5, y + 8.0, x + 6.5, y + 11.0, 2.0, CONTROL_FILL);
+        p.line(x + 6.0, y + 11.3, x + 12.5, y + 4.5, 2.0, CONTROL_FILL);
+    } else {
+        p.fill(r, 2.5, CONTROL_FILL);
+        p.stroke(r, 2.5, 1.0, if hovered { MUTED } else { CONTROL_BORDER });
+    }
+    ring(p, focus_ring, r, 3.0);
+}
+
+/// 13px radio button.
+pub fn radio(p: &Painter, r: Rect, checked: bool, hovered: bool, focus_ring: bool) {
+    let (cx, cy) = r.center();
+    let outer = r.w / 2.0;
+    if checked {
+        let accent = if hovered { ACCENT_HOT } else { ACCENT };
+        p.fill_circle(cx, cy, outer, accent);
+        p.fill_circle(cx, cy, outer - 1.5, CONTROL_FILL);
+        p.fill_circle(cx, cy, outer - 2.75, accent);
+    } else {
+        p.fill_circle(cx, cy, outer, if hovered { MUTED } else { CONTROL_BORDER });
+        p.fill_circle(cx, cy, outer - 1.0, CONTROL_FILL);
+    }
+    if focus_ring {
+        p.stroke(r.inset(-2.0), outer + 2.0, 2.0, RING);
+    }
+}
+
+/// A select inside a settings row (BG fill, 14px text), unlike the 12px sort select.
+pub fn field_select(p: &Painter, r: Rect, label: &str, highlighted: bool, focus_ring: bool) {
+    p.fill(r, 6.0, BG);
+    p.stroke(r, 6.0, 1.0, if highlighted { ACCENT } else { BORDER });
+    let text_r = Rect::new(r.x + 13.0, r.y, r.w - 40.0, r.h);
+    p.text(label, text_r, TextStyle::Body, TEXT, Align::Start, true);
+    chevron(p, r.right() - 8.0 - 3.0, r.y + r.h / 2.0, TEXT);
+    ring(p, focus_ring, r, 6.0);
+}
+
+/// Raised button with centred text, one line or more (CSS button).
+pub fn button(p: &Painter, r: Rect, lines: &[&str], hovered: bool, focus_ring: bool) {
+    p.fill(r, 6.0, RAISED);
+    p.stroke(r, 6.0, 1.0, if hovered { ACCENT } else { BORDER });
+    let lh = TextStyle::Body.line();
+    let top = r.y + (r.h - lh * lines.len() as f32) / 2.0;
+    for (i, line) in lines.iter().enumerate() {
+        let lr = Rect::new(r.x, top + i as f32 * lh, r.w, lh);
+        p.text(line, lr, TextStyle::Body, TEXT, Align::Center, true);
+    }
+    ring(p, focus_ring, r, 6.0);
+}
+
+/// Lavender button with dark text (CSS .pm-primary); dimmed when disabled.
+pub fn primary_button(p: &Painter, r: Rect, label: &str, enabled: bool, hovered: bool, focus_ring: bool) {
+    let a = if !enabled { DISABLED } else if hovered { 0.85 } else { 1.0 };
+    p.fill(r, 6.0, ACCENT.alpha(a));
+    // CSS opacity dims the whole button over BG; the dark text stays about the same.
+    p.text(label, r, TextStyle::Body, ON_ACCENT, Align::Center, true);
+    ring(p, focus_ring, r, 6.0);
+}

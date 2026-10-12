@@ -18,7 +18,7 @@ const BY_NAME: [&str; 8] = [
 ];
 
 /// MHit <-> number, for `CMD_MANAGER_POINT`.
-fn code(h: MHit) -> isize {
+pub(super) fn code(h: MHit) -> isize {
     match h {
         MHit::None => 0,
         MHit::Close => 1,
@@ -172,6 +172,7 @@ pub(super) fn run(r: &mut Report, t: &Session) -> bool {
     }
     m.park();
     m.has(r, "Manager starts with the first item selected", &["selected=\"Happy dance.gif\"", "rename=\"Happy dance\"", "total=8"]);
+    m.has(r, "no scrollbar when the gallery fits", &["scrollbar=false"]);
     m.expect(r, "Manager lists the library, recently added first", &ALL);
 
     // focused-20: an item selected in the inspector.
@@ -246,6 +247,7 @@ pub(super) fn run(r: &mut Report, t: &Session) -> bool {
     m.park();
     m.shot(r, "focused-29-manager-recycle-confirm");
     m.has(r, "Move to Recycle Bin asks for confirmation (focused-29)", &["confirming=true", "total=8"]);
+    m.has(r, "the confirmation replaces the Open folder note", &["status=\"\""]);
     m.click(r, MHit::ConfirmCancel);
     m.has(r, "Cancel keeps the item", &["confirming=false", "total=8", "selected=\"Renamed clip.mp4\""]);
     m.click(r, MHit::Recycle);
@@ -262,9 +264,6 @@ pub(super) fn run(r: &mut Report, t: &Session) -> bool {
     m.has(r, "no match empties the gallery and inspector (focused-31)", &["count=0", "selected=\"\"", "query=\"zzzz\""]);
     m.click(r, MHit::EmptyAction);
     m.has(r, "Clear filters in the empty state brings everything back", &["count=7", "query=\"\""]);
-
-    m.click(r, MHit::Nav(4));
-    m.has(r, "Settings says it arrives in Phase 2c", &["Phase 2c"]);
 
     // Keyboard: Tab moves a visible focus ring through the inspector.
     m.click(r, MHit::Tile(0));

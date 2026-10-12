@@ -69,10 +69,12 @@ pub enum TextStyle {
     Row,
     /// 22px medium: window headings ("Your library").
     H1,
+    /// 12px medium: section labels in Settings ("RESOURCE USAGE").
+    Label,
 }
 
 impl TextStyle {
-    pub const ALL: [TextStyle; 8] = [
+    pub const ALL: [TextStyle; 9] = [
         TextStyle::Medium,
         TextStyle::Body,
         TextStyle::Small,
@@ -81,12 +83,13 @@ impl TextStyle {
         TextStyle::Title,
         TextStyle::Row,
         TextStyle::H1,
+        TextStyle::Label,
     ];
 
     pub fn size(self) -> f32 {
         match self {
             TextStyle::Medium | TextStyle::Body => 14.0,
-            TextStyle::Small => 12.0,
+            TextStyle::Small | TextStyle::Label => 12.0,
             TextStyle::Tiny => 11.0,
             TextStyle::Heading => 16.0,
             TextStyle::Title => 21.0,
@@ -95,7 +98,7 @@ impl TextStyle {
         }
     }
     pub fn medium(self) -> bool {
-        matches!(self, TextStyle::Medium | TextStyle::Heading | TextStyle::Title | TextStyle::H1)
+        matches!(self, TextStyle::Medium | TextStyle::Heading | TextStyle::Title | TextStyle::H1 | TextStyle::Label)
     }
     /// CSS line box height (line-height 1.45).
     pub fn line(self) -> f32 {
@@ -346,8 +349,13 @@ impl Grid {
         if rows == 0.0 { 0.0 } else { rows * self.tile_h + (rows - 1.0) * GAP }
     }
 
+    /// Content that fits to within half a DIP does not scroll (rounding, not overflow).
+    fn overflows(&self, count: usize) -> bool {
+        self.content_height(count) > self.area.h + 0.5
+    }
+
     pub fn max_scroll(&self, count: usize) -> f32 {
-        (self.content_height(count) - self.area.h).max(0.0)
+        if self.overflows(count) { self.content_height(count) - self.area.h } else { 0.0 }
     }
 
     /// Scroll offset that keeps tile `index` fully visible.
@@ -365,10 +373,10 @@ impl Grid {
 
     /// Thin scrollbar thumb inside the 6px right padding.
     pub fn scrollbar(&self, count: usize, scroll: f32) -> Option<Rect> {
-        let content = self.content_height(count);
-        if content <= self.area.h {
+        if !self.overflows(count) {
             return None;
         }
+        let content = self.content_height(count);
         let track = self.area.h;
         let h = (track * track / content).max(24.0);
         let y = self.area.y + (track - h) * (scroll / self.max_scroll(count));
@@ -490,6 +498,17 @@ mod tests {
         assert_eq!(l.scroll_to_show(0, s), 0.0);
         assert!(l.scrollbar(3, 0.0).is_none());
         assert!(l.scrollbar(8, 0.0).is_some());
+    }
+
+    #[test]
+    fn content_that_exactly_fits_does_not_scroll() {
+        // Three rows in the Manager's gallery: 3 x 120.4 + 2 x 12 = 385.2 DIP.
+        let g = Grid::new(Rect::new(0.0, 0.0, 578.0, 385.2 - 0.001));
+        assert_eq!(g.max_scroll(8), 0.0);
+        assert!(g.scrollbar(8, 0.0).is_none());
+        let g = Grid::new(Rect::new(0.0, 0.0, 578.0, 300.0));
+        assert!(g.max_scroll(8) > 0.0);
+        assert!(g.scrollbar(8, 0.0).is_some());
     }
 
     #[test]

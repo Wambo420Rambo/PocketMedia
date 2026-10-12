@@ -39,6 +39,7 @@ use crate::library::{self, Library};
 use crate::{StatusKind, WM_SELFTEST, app, assets, exit, manager, popup, test_target};
 
 mod manager_test;
+mod settings_test;
 
 const CMD_TARGET: usize = 1;
 const CMD_STATUS: usize = 2;
@@ -53,6 +54,9 @@ const CMD_MANAGER: usize = 10;
 const CMD_MANAGER_POINT: usize = 11;
 const CMD_MANAGER_DESCRIBE: usize = 12;
 const CMD_MANAGER_ADD_POINT: usize = 13;
+const CMD_SETTINGS_POINT: usize = 14;
+/// lparam = scroll offset in DIPs (clamped; a large value means the end).
+const CMD_SETTINGS_SCROLL: usize = 15;
 const CONFLICT_TITLE: &str = "PocketMedia - shortcut not available";
 
 static EXIT_CODE: AtomicI32 = AtomicI32::new(0);
@@ -197,6 +201,11 @@ pub fn on_ui_command(wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         CMD_POINT => pack(popup::element_center(El::target(lparam.0))),
         CMD_MANAGER => manager::hwnd().0 as isize,
         CMD_MANAGER_POINT => pack(manager::element_center(manager_test::decode(lparam.0))),
+        CMD_SETTINGS_POINT => pack(manager::settings_element_center(settings_test::decode(lparam.0))),
+        CMD_SETTINGS_SCROLL => {
+            manager::set_settings_scroll(lparam.0 as f32);
+            0
+        }
         CMD_MANAGER_ADD_POINT => match El::target(lparam.0) {
             Target::Add(hit) => pack(manager::add_element_center(hit)),
             Target::Gallery(_) => isize::MIN,
@@ -662,7 +671,7 @@ fn run_input_tests(r: &mut Report, t: &Session) -> bool {
     }
 
     // 12. The Manager, from a fresh fake library.
-    manager_test::run(r, t)
+    manager_test::run(r, t) && settings_test::run(r, t)
 }
 
 fn add_media_test(r: &mut Report, t: &Session) -> bool {

@@ -1,6 +1,7 @@
-//! The Manager window: library browsing, rename and removal (fake data).
-//! State lives in `ManagerState` and the shared `library`, geometry and drawing
-//! in `ui::manager_view`. Add media is an `AddPanel`, as in the popup.
+//! The Manager window: library browsing, rename and removal, and the Settings
+//! page (fake data, settings in memory). State lives in `ManagerState`
+//! and the shared `library`; geometry and drawing in `ui::manager_view` and
+//! `ui::settings_view`. Add media is an `AddPanel`, as in the popup.
 //!
 //! Created the first time it is shown. × hides it; the tray and shortcut stay.
 
@@ -19,18 +20,22 @@ use windows::core::w;
 
 use crate::add_panel::{AddOutcome, AddPanel, Area};
 use crate::library::{self, Library, extension};
-use crate::manager_state::{MFocus, ManagerState, Nav, Sort};
+use crate::manager_state::{MFocus, ManagerState, Nav, Page, Sort};
+use crate::settings_state::{Profile, SFocus, VideoPreview};
 use crate::text_field::TextField;
 use crate::ui::add_view::AddHit;
 use crate::ui::d2d::Gfx;
 use crate::ui::layout::{COLUMNS, Rect, TextStyle};
 use crate::ui::manager_view::{self, MHit, ManagerLayout, ManagerUi};
+use crate::ui::settings_view::{self, SHit, SettingsLayout, SettingsUi};
 use crate::ui::widgets::TextMetrics;
 use crate::winutil::{self, WM_MOUSELEAVE};
 
 const WHEEL_STEP: f32 = 48.0;
 const OPEN_FOLDER_NOTE: &str = "Open folder needs real files, which arrive in Phase 3. These items are fake.";
-const SETTINGS_NOTE: &str = "Settings arrives in Phase 2c.";
+const MEDIA_FOLDER_NOTE: &str = "Open folder needs the real Media folder, which arrives in Phase 3.";
+const SHORTCUT_NOTE: &str = "Changing the shortcut is not built yet.";
+const BACKUP_NOTE: &str = "Back up library arrives in Phase 6.";
 
 struct View {
     state: ManagerState,
@@ -40,6 +45,9 @@ struct View {
     dpi: u32,
     hover: MHit,
     pressed: MHit,
+    /// Pointer state on the Settings page.
+    s_hover: SHit,
+    s_pressed: SHit,
     scroll_drag: Option<(f32, f32)>,
     high_surrogate: Option<u16>,
     tracking_leave: bool,
@@ -59,6 +67,7 @@ thread_local! {
     static WINDOW: Cell<HWND> = Cell::new(HWND::default());
     static VIEW: RefCell<Option<View>> = const { RefCell::new(None) };
     static POSITIONING: Cell<bool> = const { Cell::new(false) };
+    static TITLE_PAGE: Cell<Option<Page>> = const { Cell::new(None) };
 }
 
 /// Runs `f` with the view. Returns None if the window does not exist yet or the
@@ -120,6 +129,8 @@ fn create() -> Result<(), String> {
             dpi: 96,
             hover: MHit::None,
             pressed: MHit::None,
+            s_hover: SHit::None,
+            s_pressed: SHit::None,
             scroll_drag: None,
             high_surrogate: None,
             tracking_leave: false,
@@ -154,8 +165,11 @@ pub fn show() {
 pub fn hide() {
     with_view(|v| {
         v.state.sort_open = None;
+        v.state.settings.video_open = None;
         v.hover = MHit::None;
         v.pressed = MHit::None;
+        v.s_hover = SHit::None;
+        v.s_pressed = SHit::None;
         v.scroll_drag = None;
     });
     // SAFETY: our own window; a stale HWND only makes it fail.
@@ -223,8 +237,29 @@ impl View {
         ManagerLayout::compute(&self.state, lib, a.w, a.h, &self.gfx)
     }
 
+    fn on_settings(&self) -> bool {
+        self.add.is_none() && self.state.page == Page::Settings
+    }
+
+    fn settings_layout(&self) -> SettingsLayout {
+        let a = self.area();
+        SettingsLayout::compute(&self.state.settings, a.w, a.h, &self.gfx)
+    }
+
+    fn settings_hit(&self, x: f32, y: f32) -> SHit {
+        if !self.on_settings() {
+            return SHit::None;
+        }
+        self.settings_layout().hit(&self.state.settings, x, y)
+    }
+
+    /// Over the × button (which must not drag the window).
+    fn over_close(&self, x: f32, y: f32) -> bool {
+        if self.on_settings() { self.settings_hit(x, y) == SHit::Close } else { self.hit(x, y) == MHit::Close }
+    }
+
     fn hit(&self, x: f32, y: f32) -> MHit {
-        if self.add.is_some() {
+        if self.add.is_some() || self.state.page != Page::Library {
             return MHit::None;
         }
         library::with(|lib| self.layout(lib).hit(&self.state, lib, x, y))
@@ -244,6 +279,13 @@ impl View {
         let area = self.area();
         if let Some(add) = self.add.as_ref() {
             add.paint(&mut self.gfx, hwnd(), self.dpi as f32, area);
+            return;
+        }
+        if self.state.page == Page::Settings {
+            let l = self.settings_layout();
+            let ui = SettingsUi { hover: self.s_hover };
+            let s = &self.state.settings;
+            let _ = self.gfx.draw(hwnd(), self.dpi as f32, |p| settings_view::paint(p, s, &l, &ui));
             return;
         }
         library::with(|lib| {
@@ -276,14 +318,10 @@ impl View {
         let s = &mut self.state;
         match hit {
             MHit::Close => return Effect::Hide,
-            MHit::Nav(i) => match Nav::ORDER[i] {
-                Nav::Settings => s.status = Some(SETTINGS_NOTE.into()),
-                nav => {
-                    if let Some(filter) = nav.filter() {
-                        library::with(|lib| s.set_filter(filter, lib));
-                    }
-                }
-            },
+            MHit::Nav(i) => {
+                library::with(|lib| s.navigate(Nav::ORDER[i], lib));
+                self.hover = MHit::None;
+            }
             MHit::AddMedia => self.add = Some(AddPanel::new()),
             MHit::ClearFilters | MHit::EmptyAction => library::with(|lib| s.clear_filters(lib)),
             MHit::Sort => s.sort_open = if s.sort_open.is_some() { None } else { Some(s.sort.index()) },
@@ -337,11 +375,19 @@ impl View {
             AddOutcome::Leave => {
                 self.add = None;
                 self.state.focus = MFocus::AddMedia;
+                self.state.settings.focus = SFocus::ChooseFolder;
                 Effect::Capture(false)
             }
             AddOutcome::Imported(status) => {
                 self.add = None;
-                library::with(|lib| self.state.show_imported(status, lib));
+                if self.state.page == Page::Settings {
+                    // Back where the import started; the result shows in the action bar.
+                    self.state.settings.focus = SFocus::ChooseFolder;
+                    self.state.settings.show_note(&status);
+                    library::with(|lib| self.state.sync(lib));
+                } else {
+                    library::with(|lib| self.state.show_imported(status, lib));
+                }
                 Effect::Capture(false)
             }
             AddOutcome::Capture(on) => Effect::Capture(on),
@@ -360,6 +406,9 @@ impl View {
         if let Some(add) = self.add.as_mut() {
             let outcome = add.mouse_down(&self.gfx, area, x, y);
             return self.add_outcome(outcome);
+        }
+        if self.on_settings() {
+            return self.settings_mouse_down(x, y);
         }
         let hit = self.hit(x, y);
         if self.state.sort_open.is_some() && !matches!(hit, MHit::SortRow(_) | MHit::Sort) {
@@ -411,6 +460,14 @@ impl View {
             let outcome = add.mouse_up(&self.gfx, area, x, y);
             return self.add_outcome(outcome);
         }
+        if self.on_settings() {
+            let pressed = std::mem::replace(&mut self.s_pressed, SHit::None);
+            if pressed == SHit::None {
+                return Effect::None;
+            }
+            winutil::release_capture();
+            return if self.settings_hit(x, y) == pressed { self.activate_settings(pressed) } else { Effect::None };
+        }
         if self.scroll_drag.take().is_some() {
             return Effect::Capture(false);
         }
@@ -426,6 +483,10 @@ impl View {
         let area = self.area();
         if let Some(add) = self.add.as_mut() {
             return add.mouse_move(&self.gfx, area, x, y);
+        }
+        if self.on_settings() {
+            self.s_hover = self.settings_hit(x, y);
+            return;
         }
         if let Some((start_y, start_scroll)) = self.scroll_drag {
             library::with(|lib| {
@@ -444,6 +505,12 @@ impl View {
         if let Some(add) = self.add.as_mut() {
             return add.wheel(&self.gfx, area, delta);
         }
+        if self.on_settings() {
+            let st = &mut self.state.settings;
+            st.video_open = None;
+            st.scroll -= delta as f32 / 120.0 * WHEEL_STEP;
+            return self.clamp_settings_scroll(false);
+        }
         self.state.sort_open = None;
         self.state.scroll -= delta as f32 / 120.0 * WHEEL_STEP;
         self.clamp_scroll(false);
@@ -454,6 +521,11 @@ impl View {
         if let Some(add) = self.add.as_mut() {
             let outcome = add.key(&self.gfx, area, vk, ctrl, shift);
             return self.add_outcome(outcome);
+        }
+        if self.on_settings() {
+            let effect = self.key_settings(vk, shift, alt);
+            self.clamp_settings_scroll(true);
+            return effect;
         }
         let grid = library::with(|lib| self.layout(lib).grid);
         let effect = library::with(|lib| self.key_library(lib, vk, ctrl, shift, alt, grid.page()));
@@ -571,9 +643,163 @@ impl View {
         Effect::None
     }
 
+    // ------------------------------------------------------------ Settings page
+
+    /// Keeps the settings scroll in range and, for keyboard moves, the focused control in view.
+    fn clamp_settings_scroll(&mut self, show_focus: bool) {
+        let l = self.settings_layout();
+        let st = &mut self.state.settings;
+        st.scroll = st.scroll.clamp(0.0, l.max_scroll());
+        if show_focus {
+            st.scroll = l.scroll_to_show(st, st.focus);
+        }
+    }
+
+    fn settings_focus_for(hit: SHit) -> Option<SFocus> {
+        Some(match hit {
+            SHit::Close => SFocus::Close,
+            SHit::Nav(i) => SFocus::Nav(i),
+            SHit::Profile(_) => SFocus::Profile,
+            SHit::Video | SHit::VideoRow(_) => SFocus::Video,
+            SHit::Change => SFocus::Change,
+            SHit::CloseAfter => SFocus::CloseAfter,
+            SHit::OpenFolder => SFocus::OpenFolder,
+            SHit::ChooseFolder => SFocus::ChooseFolder,
+            SHit::Backup => SFocus::Backup,
+            SHit::Autostart => SFocus::Autostart,
+            SHit::Cancel => SFocus::Cancel,
+            SHit::Save => SFocus::Save,
+            SHit::None | SHit::Caption => return None,
+        })
+    }
+
+    fn settings_mouse_down(&mut self, x: f32, y: f32) -> Effect {
+        let hit = self.settings_hit(x, y);
+        let st = &mut self.state.settings;
+        if st.video_open.is_some() && !matches!(hit, SHit::VideoRow(_) | SHit::Video) {
+            st.video_open = None; // a click outside only closes the list
+            return Effect::None;
+        }
+        if hit == SHit::Save && !st.dirty() {
+            return Effect::None; // disabled
+        }
+        st.focus_visible = false;
+        if let Some(f) = Self::settings_focus_for(hit) {
+            st.focus = f;
+        }
+        match hit {
+            SHit::None | SHit::Caption => Effect::None,
+            other => {
+                self.s_pressed = other;
+                Effect::Capture(true)
+            }
+        }
+    }
+
+    /// Click or Enter/Space on a Settings control.
+    fn activate_settings(&mut self, hit: SHit) -> Effect {
+        let st = &mut self.state.settings;
+        match hit {
+            SHit::Close => return Effect::Hide,
+            SHit::Nav(i) if Nav::ORDER[i] == Nav::Settings => {} // already here; keep the draft
+            SHit::Nav(i) => {
+                let s = &mut self.state;
+                library::with(|lib| s.navigate(Nav::ORDER[i], lib));
+                self.s_hover = SHit::None;
+                self.clamp_scroll(true);
+                return Effect::None;
+            }
+            SHit::Profile(i) => st.set_profile(Profile::BOTH[i]),
+            SHit::Video => st.video_open = if st.video_open.is_some() { None } else { Some(st.draft.video_preview.index()) },
+            SHit::VideoRow(i) => {
+                st.set_video(VideoPreview::BOTH[i]);
+                st.focus = SFocus::Video;
+            }
+            SHit::Change => st.show_note(SHORTCUT_NOTE),
+            SHit::CloseAfter => st.toggle_close_after(),
+            SHit::OpenFolder => st.show_note(MEDIA_FOLDER_NOTE),
+            SHit::ChooseFolder => {
+                self.add = Some(AddPanel::for_import());
+                self.s_hover = SHit::None;
+            }
+            SHit::Backup => st.show_note(BACKUP_NOTE),
+            SHit::Autostart => st.toggle_autostart(),
+            SHit::Cancel => st.cancel(),
+            SHit::Save => st.save(),
+            SHit::None | SHit::Caption => {}
+        }
+        Effect::None
+    }
+
+    fn key_settings(&mut self, vk: VIRTUAL_KEY, shift: bool, alt: bool) -> Effect {
+        let st = &mut self.state.settings;
+        if let Some(row) = st.video_open {
+            match vk {
+                VK_UP | VK_DOWN => st.video_open = Some(if vk == VK_UP { 0 } else { 1 }),
+                VK_RETURN | VK_SPACE => st.set_video(VideoPreview::BOTH[row]),
+                VK_ESCAPE => st.video_open = None,
+                VK_TAB => st.tab(shift),
+                _ => {}
+            }
+            return Effect::None;
+        }
+        if vk == VK_TAB {
+            st.tab(shift);
+            return Effect::None;
+        }
+        let press = matches!(vk, VK_RETURN | VK_SPACE);
+        let hit = match st.focus {
+            SFocus::Nav(i) => match vk {
+                VK_UP if i > 0 => {
+                    st.focus = SFocus::Nav(i - 1);
+                    SHit::None
+                }
+                VK_DOWN if i + 1 < Nav::ORDER.len() => {
+                    st.focus = SFocus::Nav(i + 1);
+                    SHit::None
+                }
+                _ if press => SHit::Nav(i),
+                _ => SHit::None,
+            },
+            // A radio group: arrows choose, as in a browser.
+            SFocus::Profile => match vk {
+                VK_LEFT | VK_UP => SHit::Profile(0),
+                VK_RIGHT | VK_DOWN => SHit::Profile(1),
+                _ => SHit::None,
+            },
+            SFocus::Video => match vk {
+                VK_DOWN if alt => SHit::Video,
+                VK_F4 | VK_RETURN | VK_SPACE => SHit::Video,
+                VK_UP => SHit::VideoRow(0),
+                VK_DOWN => SHit::VideoRow(1),
+                _ => SHit::None,
+            },
+            // Checkboxes toggle with Space only.
+            SFocus::CloseAfter if vk == VK_SPACE => SHit::CloseAfter,
+            SFocus::Autostart if vk == VK_SPACE => SHit::Autostart,
+            SFocus::CloseAfter | SFocus::Autostart => SHit::None,
+            focus if press => match focus {
+                SFocus::Close => SHit::Close,
+                SFocus::Change => SHit::Change,
+                SFocus::OpenFolder => SHit::OpenFolder,
+                SFocus::ChooseFolder => SHit::ChooseFolder,
+                SFocus::Backup => SHit::Backup,
+                SFocus::Cancel => SHit::Cancel,
+                SFocus::Save => SHit::Save,
+                _ => SHit::None,
+            },
+            _ => SHit::None,
+        };
+        st.focus_visible = true;
+        self.activate_settings(hit)
+    }
+
     fn insert_text(&mut self, text: &str) {
         if let Some(add) = self.add.as_mut() {
             return add.insert(text);
+        }
+        if self.state.page == Page::Settings {
+            return; // no text boxes on the Settings page
         }
         let s = &mut self.state;
         library::with(|lib| match s.focus {
@@ -651,7 +877,18 @@ fn run(effect: Effect) {
             }
         }
     }
+    sync_title(h);
     winutil::invalidate(h);
+}
+
+/// Window title (taskbar, Alt+Tab) follows the page.
+fn sync_title(h: HWND) {
+    let Some(page) = with_view(|v| v.state.page) else { return };
+    if TITLE_PAGE.with(|t| t.replace(Some(page))) != Some(page) {
+        let title = if page == Page::Settings { w!("PocketMedia - Settings") } else { w!("PocketMedia - Library") };
+        // SAFETY: our own window; a static string.
+        let _ = unsafe { SetWindowTextW(h, title) };
+    }
 }
 
 fn screen_to_client(hwnd: HWND, lparam: LPARAM) -> POINT {
@@ -676,7 +913,7 @@ extern "system" fn manager_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             let caption = with_view(|v| {
                 let (x, y) = winutil::to_dip(pt, v.dpi);
                 let in_bar = (1.0..47.0).contains(&y);
-                in_bar && v.hit(x, y) != MHit::Close && !(v.add.is_some() && x > v.area().w - 48.0)
+                in_bar && !v.over_close(x, y) && !(v.add.is_some() && x > v.area().w - 48.0)
             });
             return LRESULT(if caption == Some(true) { HTCAPTION as isize } else { HTCLIENT as isize });
         }
@@ -694,6 +931,7 @@ extern "system" fn manager_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             with_view(|v| {
                 v.tracking_leave = false;
                 v.hover = MHit::None;
+                v.s_hover = SHit::None;
                 if let Some(add) = v.add.as_mut() {
                     add.hover = AddHit::None;
                 }
@@ -770,7 +1008,7 @@ extern "system" fn manager_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
 pub fn element_center(hit: MHit) -> Option<POINT> {
     let h = hwnd();
     with_view(|v| {
-        if v.add.is_some() {
+        if v.add.is_some() || v.state.page != Page::Library {
             return None;
         }
         let r = library::with(|lib| {
@@ -779,8 +1017,8 @@ pub fn element_center(hit: MHit) -> Option<POINT> {
             let insp = l.insp.as_ref();
             let confirm = insp.and_then(|i| i.confirm.as_ref());
             Some(match hit {
-                MHit::Close => l.close,
-                MHit::Nav(i) => *l.nav.get(i)?,
+                MHit::Close => l.frame.close,
+                MHit::Nav(i) => *l.frame.nav.get(i)?,
                 MHit::AddMedia => l.add_media,
                 MHit::Search => l.search.outer,
                 MHit::SearchClear => l.search.clear,
@@ -798,7 +1036,7 @@ pub fn element_center(hit: MHit) -> Option<POINT> {
                 MHit::ConfirmMove => confirm?.move_button,
                 MHit::ConfirmCancel => confirm?.cancel,
                 // A neutral point: the empty middle of the title bar.
-                MHit::None => Rect::new(l.caption.right() + 40.0, l.titlebar.y + 10.0, 1.0, 1.0),
+                MHit::None => Rect::new(l.frame.caption.right() + 40.0, l.frame.titlebar.y + 10.0, 1.0, 1.0),
                 _ => return None,
             })
         })?;
@@ -818,18 +1056,89 @@ pub fn add_element_center(hit: AddHit) -> Option<POINT> {
     .flatten()
 }
 
-/// "screen=manager filter=… selected=… names=a|b" for self-test checks.
+/// Screen-space centre of a Settings element (None if the page is not showing).
+pub fn settings_element_center(hit: SHit) -> Option<POINT> {
+    let h = hwnd();
+    with_view(|v| {
+        if !v.on_settings() {
+            return None;
+        }
+        let l = v.settings_layout();
+        let r = match hit {
+            SHit::Close => l.frame.close,
+            SHit::Nav(i) => *l.frame.nav.get(i)?,
+            SHit::Profile(i) => l.choices.get(i)?.card,
+            SHit::Video => l.video.control,
+            SHit::VideoRow(i) => *l.video_menu.rows.get(i)?,
+            SHit::Change => l.shortcut.control,
+            SHit::CloseAfter => l.close_after.control,
+            SHit::OpenFolder => l.folder.control,
+            SHit::ChooseFolder => l.import.control,
+            SHit::Backup => l.backup.control,
+            SHit::Autostart => l.autostart.control,
+            SHit::Cancel => l.cancel,
+            SHit::Save => l.save,
+            // The empty title bar.
+            SHit::None => Rect::new(l.frame.caption.right() + 40.0, l.frame.titlebar.y + 10.0, 1.0, 1.0),
+            // Test-only: a spot inside the scroll area but beside every control (for the wheel).
+            SHit::Caption => Rect::new(l.view.x + 4.0, l.view.y + l.view.h / 2.0, 1.0, 1.0),
+        };
+        Some(winutil::rect_center_on_screen(h, v.dpi, r))
+    })
+    .flatten()
+}
+
+/// Self-test only: puts the Settings page at a scroll offset (clamped), to
+/// frame the same part of the page as a reference screenshot.
+pub fn set_settings_scroll(y: f32) {
+    with_view(|v| {
+        v.state.settings.scroll = y;
+        v.clamp_settings_scroll(false);
+    });
+    winutil::invalidate(hwnd());
+}
+
+/// "screen=manager filter=… selected=… names=a|b" (or "screen=settings …") for self-test checks.
 pub fn describe() -> String {
     with_view(|v| {
         if let Some(add) = v.add.as_ref() {
             return format!("host=manager {}", add.describe());
         }
+        if v.state.page == Page::Settings {
+            let st = &v.state.settings;
+            let (d, saved) = (st.draft, st.saved);
+            let l = v.settings_layout();
+            let visible = |r: Rect| r.y >= l.view.y - 0.5 && r.bottom() <= l.view.bottom() + 0.5;
+            return format!(
+                "screen=settings profile={:?} video={:?} close_after={} autostart={} saved={:?}/{:?}/{}/{} dirty={} \
+                 focus={:?} focus_visible={} video_open={} scroll={:.0} max_scroll={:.0} autostart_visible={} \
+                 line={:?} nav_selected={}",
+                d.profile,
+                d.video_preview,
+                d.close_after_insert,
+                d.autostart,
+                saved.profile,
+                saved.video_preview,
+                saved.close_after_insert,
+                saved.autostart,
+                st.dirty(),
+                st.focus,
+                st.focus_visible,
+                st.video_open.is_some(),
+                st.scroll,
+                l.max_scroll(),
+                visible(l.autostart.control),
+                st.status_line(),
+                Nav::ORDER.iter().filter(|n| v.state.nav_selected(**n)).map(|n| n.label()).collect::<Vec<_>>().join("+"),
+            );
+        }
         let s = &v.state;
         library::with(|lib| {
             let names: Vec<&str> = s.visible(lib).iter().map(|i| i.name.as_str()).collect();
+            let scrollbar = v.layout(lib).grid.scrollbar(names.len(), s.scroll).is_some();
             format!(
                 "screen=manager filter={:?} sort={:?} query={:?} focus={:?} selected={:?} rename={:?} error={:?} \
-                 can_rename={} confirming={} status={:?} total={} count={} names={}",
+                 can_rename={} confirming={} status={:?} scrollbar={scrollbar} total={} count={} names={}",
                 s.filter,
                 s.sort,
                 s.search.text(),

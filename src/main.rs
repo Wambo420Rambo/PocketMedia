@@ -20,6 +20,7 @@ mod popup_state;
 mod sample;
 mod search;
 mod selftest;
+mod settings_state;
 mod target;
 mod test_png;
 mod test_target;

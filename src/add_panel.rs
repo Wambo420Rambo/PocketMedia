@@ -56,6 +56,14 @@ impl AddPanel {
         Self { add: AddMedia::new(), hover: AddHit::None, pressed: AddHit::None }
     }
 
+    /// Settings' "Choose folder…": straight to the review of the chosen folder
+    /// (fake files in Phase 2, as for "Import your existing media").
+    pub fn for_import() -> Self {
+        let mut panel = Self::new();
+        library::with(|lib| panel.add.choose(&lib.items));
+        panel
+    }
+
     pub fn layout(&self, gfx: &Gfx, area: Area) -> AddLayout {
         AddLayout::compute(&self.add, area.w, area.h, gfx)
     }

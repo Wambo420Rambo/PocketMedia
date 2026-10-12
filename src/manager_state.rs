@@ -6,7 +6,15 @@ use crate::names::NameError;
 use crate::popup_state::TypeFilter;
 use crate::sample::Item;
 use crate::search::{self, name_without_extension};
+use crate::settings_state::SettingsPage;
 use crate::text_field::TextField;
+
+/// What the main column shows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Page {
+    Library,
+    Settings,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Sort {
@@ -84,6 +92,9 @@ pub enum MFocus {
 }
 
 pub struct ManagerState {
+    pub page: Page,
+    /// The Settings page (kept while the Library page shows, so saved values stay).
+    pub settings: SettingsPage,
     pub filter: TypeFilter,
     pub search: TextField,
     pub sort: Sort,
@@ -114,6 +125,8 @@ impl Default for ManagerState {
 impl ManagerState {
     pub fn new() -> Self {
         Self {
+            page: Page::Library,
+            settings: SettingsPage::new(),
             filter: TypeFilter::All,
             search: TextField::default(),
             sort: Sort::RecentlyAdded,
@@ -155,7 +168,34 @@ impl ManagerState {
     }
 
     pub fn nav_selected(&self, nav: Nav) -> bool {
-        nav.filter() == Some(self.filter)
+        match self.page {
+            Page::Settings => nav == Nav::Settings,
+            Page::Library => nav.filter() == Some(self.filter),
+        }
+    }
+
+    /// A sidebar entry: Settings opens the Settings page (always from the saved
+    /// values); a type opens the Library page with that filter.
+    pub fn navigate(&mut self, nav: Nav, lib: &Library) {
+        self.sort_open = None;
+        match nav.filter() {
+            None => {
+                if self.page == Page::Library {
+                    self.settings.focus_visible = self.focus_visible;
+                }
+                self.page = Page::Settings;
+                self.settings.enter();
+                self.settings.focus = crate::settings_state::SFocus::Nav(Nav::ORDER.len() - 1);
+            }
+            Some(filter) => {
+                if self.page == Page::Settings {
+                    self.focus_visible = self.settings.focus_visible;
+                }
+                self.page = Page::Library;
+                self.focus = MFocus::Nav(Nav::ORDER.iter().position(|n| *n == nav).unwrap_or(0));
+                self.set_filter(filter, lib);
+            }
+        }
     }
 
     pub fn selected_index(&self, lib: &Library) -> Option<usize> {
@@ -219,12 +259,14 @@ impl ManagerState {
     }
 
     pub fn set_filter(&mut self, filter: TypeFilter, lib: &Library) {
+        self.status = None;
         self.filter = filter;
         self.scroll = 0.0;
         self.sync(lib);
     }
 
     pub fn set_sort(&mut self, sort: Sort, lib: &Library) {
+        self.status = None;
         self.sort = sort;
         self.sort_open = None;
         self.scroll = 0.0;
@@ -232,11 +274,13 @@ impl ManagerState {
     }
 
     pub fn search_changed(&mut self, lib: &Library) {
+        self.status = None;
         self.scroll = 0.0;
         self.sync(lib);
     }
 
     pub fn clear_filters(&mut self, lib: &Library) {
+        self.status = None;
         self.search.clear();
         self.filter = TypeFilter::All;
         self.scroll = 0.0;
@@ -245,6 +289,7 @@ impl ManagerState {
 
     /// Validates the rename field as the user types (same rules as import).
     pub fn rename_edited(&mut self, lib: &Library) {
+        self.status = None;
         self.rename_error = self.selected.and_then(|id| lib.check_rename(id, self.rename.text()).err());
     }
 
@@ -280,6 +325,7 @@ impl ManagerState {
 
     pub fn ask_recycle(&mut self) {
         if self.selected.is_some() {
+            self.status = None;
             self.confirming = true;
             self.focus = MFocus::ConfirmMove;
         }
@@ -441,6 +487,21 @@ mod tests {
     }
 
     #[test]
+    fn a_result_line_clears_when_the_user_moves_on() {
+        let (mut m, mut lib) = setup();
+        set_rename(&mut m, &lib, "Dance");
+        m.apply_rename(&mut lib);
+        assert!(m.status.is_some());
+        m.search.insert("z");
+        m.search_changed(&lib);
+        assert_eq!(m.status, None);
+        m.clear_filters(&lib);
+        m.status = Some("Open folder needs real files".into());
+        m.ask_recycle();
+        assert_eq!(m.status, None, "the confirmation replaces an old note");
+    }
+
+    #[test]
     fn escape_reverts_the_name_field() {
         let (mut m, lib) = setup();
         set_rename(&mut m, &lib, "Cat/photo");
@@ -498,6 +559,22 @@ mod tests {
         assert_eq!(m.sort, Sort::RecentlyAdded);
         assert_eq!(m.selected, Some(99));
         assert_eq!(names(&m, &lib)[0], "New.png");
+    }
+
+    #[test]
+    fn settings_is_a_page_of_the_manager() {
+        let (mut m, lib) = setup();
+        m.set_filter(TypeFilter::Gif, &lib);
+        m.navigate(Nav::Settings, &lib);
+        assert_eq!(m.page, Page::Settings);
+        assert!(m.nav_selected(Nav::Settings));
+        assert!(!m.nav_selected(Nav::Gif), "only one entry is highlighted");
+        m.settings.toggle_autostart();
+        m.navigate(Nav::Picture, &lib);
+        assert_eq!(m.page, Page::Library);
+        assert_eq!(m.filter, TypeFilter::Picture);
+        m.navigate(Nav::Settings, &lib);
+        assert!(!m.settings.dirty(), "unsaved edits are dropped on leaving the page");
     }
 
     #[test]
