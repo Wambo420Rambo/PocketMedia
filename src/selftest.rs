@@ -39,6 +39,7 @@ use crate::{StatusKind, WM_SELFTEST, app, exit, manager, popup, test_target};
 
 mod manager_test;
 mod media_gen;
+mod watch_test;
 mod preview_test;
 mod seed;
 mod settings_test;
@@ -70,7 +71,6 @@ const CMD_STORE_REOPEN: usize = 18;
 const CMD_SET_CLOSE_AFTER: usize = 19;
 /// The next paste fails as if focus never came back.
 const CMD_FAIL_NEXT_PASTE: usize = 20;
-const CONFLICT_TITLE: &str = "PocketMedia - shortcut not available";
 
 static EXIT_CODE: AtomicI32 = AtomicI32::new(0);
 static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -236,6 +236,7 @@ pub fn on_ui_command(wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             if let Some(p) = crate::paths::get() {
                 crate::store::init(&p.data);
             }
+            crate::autostart::sync_store();
             manager::reload_settings();
             0
         }
@@ -259,9 +260,18 @@ pub fn on_ui_command(wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         }
         CMD_RESET => {
             // Fresh library files and windows, so each test section starts the same.
+            // The folders are replaced, so watching pauses meanwhile.
+            crate::watch::stop();
+            crate::autostart::remove_test_key();
             crate::store::reset_for_test();
+            crate::autostart::sync_store();
             if let Err(e) = seed::reset_library() {
                 note(&format!("could not create the test library: {e}"));
+            }
+            if let Some(p) = crate::paths::get()
+                && let Err(e) = crate::watch::start(&p.media, crate::watch::BUFFER)
+            {
+                note(&e);
             }
             popup::reset();
             manager::reset();
@@ -278,6 +288,7 @@ pub fn on_ui_command(wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             0
         }
         cmd @ preview_test::CMD_PREVIEW_DESCRIBE..=preview_test::CMD_MANAGER_SHOW => preview_test::on_ui_command(cmd, lparam.0),
+        cmd @ watch_test::CMD_LIB_FIND..=watch_test::CMD_WATCH_RESTART => watch_test::on_ui_command(cmd, lparam.0),
         _ => 0,
     };
     LRESULT(value)
@@ -422,7 +433,7 @@ fn script(r: &mut Report, out: &Path, main: isize) {
     if let Some(m) = &marker {
         let _ = std::fs::write(m, b"kept");
     }
-    conflict_test(r, out, &exe);
+    instance_test(r, &t, &exe);
     if let Some(m) = &marker {
         let kept = std::fs::read(m).is_ok_and(|b| b == b"kept");
         r.check("starting again keeps the folders' contents", kept, &m.display().to_string());
@@ -730,7 +741,11 @@ fn run_input_tests(r: &mut Report, t: &Session) -> bool {
     }
 
     // 12. The Manager, from a fresh fake library.
-    manager_test::run(r, t) && settings_test::run(r, t) && window_test::run(r, t) && preview_test::run(r, t)
+    manager_test::run(r, t)
+        && settings_test::run(r, t)
+        && window_test::run(r, t)
+        && preview_test::run(r, t)
+        && watch_test::run(r, t)
 }
 
 /// Files in the test library's Media folders (not counting temporary files).
@@ -1145,33 +1160,44 @@ fn blocked_folder_test(r: &mut Report, out: &Path, exe: &Path) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-fn conflict_test(r: &mut Report, out: &Path, exe: &Path) {
-    let second = Command::new(exe).arg("--exit-after-start").spawn();
-    let Ok(mut second) = second else {
-        r.check("second copy launched", false, "spawn failed");
-        return;
+/// One PocketMedia per user: a second launch shows this one's popup
+/// and exits; a second launch from autostart exits without showing anything.
+fn instance_test(r: &mut Report, t: &Session, exe: &Path) {
+    let launch = |args: &[&str]| -> Option<i32> {
+        let mut child = Command::new(exe).args(args).spawn().ok()?;
+        let mut code = None;
+        wait_until(8000, || {
+            code = child.try_wait().ok().flatten().and_then(|s| s.code());
+            code.is_some()
+        });
+        if code.is_none() {
+            let _ = child.kill();
+        }
+        code
     };
-    let mut boxed = 0isize;
-    let shown = wait_until(5000, || {
-        boxed = find_window("#32770", Some(CONFLICT_TITLE), second.id());
-        boxed != 0
-    });
-    if r.check("second copy shows shortcut-unavailable message", shown, "") {
-        std::thread::sleep(Duration::from_millis(300));
-        let text = longest_child_text(boxed);
-        r.check(
-            "message explains the conflict",
-            text.contains("already using it") && text.contains("tray"),
-            &text.replace('\n', " / "),
-        );
-        save_capture(r, &out.join("screens").join("hotkey-conflict.png"), capture_window(boxed));
-        post(boxed, WM_CLOSE, 0, 0);
+    let popup_hidden = !is_visible(t.popup);
+    let code = launch(&[]);
+    r.check("a second launch exits at once (exit code 0)", code == Some(0), &format!("exit code {code:?}"));
+    let shown = wait_until(3000, || is_visible(t.popup));
+    // In front only when Windows lets it be (a launch from Explorer does).
+    wait_until(1000, || foreground() == t.popup);
+    r.check(
+        "…and the running PocketMedia shows its popup instead",
+        popup_hidden && shown,
+        &format!("hidden before: {popup_hidden}; {}", describe_foreground()),
+    );
+    if is_visible(t.popup) {
+        post(t.popup, WM_CLOSE, 0, 0);
+        wait_until(1500, || !is_visible(t.popup));
     }
-    let exited = wait_until(5000, || matches!(second.try_wait(), Ok(Some(_))));
-    r.check("second copy exits cleanly", exited, "");
-    if !exited {
-        let _ = second.kill();
-    }
+    let code = launch(&[crate::autostart::ARG]);
+    std::thread::sleep(Duration::from_millis(800));
+    r.check(
+        "a second launch from autostart exits quietly (no popup)",
+        code == Some(0) && !is_visible(t.popup),
+        &format!("exit code {code:?}, popup visible {}", is_visible(t.popup)),
+    );
+    r.check("the tray icon and shortcut stay with the running copy", tray_icon_rect(t.main).is_some() && send(t.main, CMD_HOTKEY_OK, 0) == 1, "");
 }
 
 // ---------------------------------------------------------------- helpers

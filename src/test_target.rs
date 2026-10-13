@@ -186,7 +186,6 @@ fn on_paste(hwnd: HWND) {
         }
         names.push(format_name(format));
     }
-    write_result("paste-formats.txt", names.join("\n").as_bytes());
     // The file offered with the paste (CF_HDROP), and the bitmap's size (CF_DIB).
     if let Some(path) = clipboard_hdrop() {
         write_result("paste-hdrop.txt", path.as_bytes());
@@ -205,6 +204,8 @@ fn on_paste(hwnd: HWND) {
         }
         None => set_last(format!("Ctrl+V: no PNG on the clipboard.\nFormats: {}", names.join(", ")), hwnd),
     }
+    // Written last: the self-test waits for this file, then reads the others.
+    write_result("paste-formats.txt", names.join("\n").as_bytes());
 }
 
 fn on_drop(hwnd: HWND, drop: HDROP) {

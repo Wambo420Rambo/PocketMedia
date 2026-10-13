@@ -21,7 +21,7 @@ const LIBRARY_PANEL_SCROLL: isize = 261;
 const END: isize = 100_000;
 
 /// SHit <-> number, for `CMD_SETTINGS_POINT`.
-fn code(h: SHit) -> isize {
+pub(super) fn code(h: SHit) -> isize {
     match h {
         SHit::None => 0,
         SHit::Close => 1,
@@ -65,23 +65,23 @@ pub(super) fn decode(c: isize) -> SHit {
 }
 
 /// Test helpers bound to the Manager window showing Settings.
-struct Set<'a> {
-    t: &'a Session,
-    hwnd: isize,
+pub(super) struct Set<'a> {
+    pub(super) t: &'a Session,
+    pub(super) hwnd: isize,
 }
 
 impl Set<'_> {
-    fn describe(&self) -> String {
+    pub(super) fn describe(&self) -> String {
         send(self.t.main, CMD_MANAGER_DESCRIBE, 0);
         DESCRIBE.lock().map(|d| d.clone()).unwrap_or_default()
     }
 
-    fn has(&self, r: &mut Report, name: &str, needles: &[&str]) -> bool {
+    pub(super) fn has(&self, r: &mut Report, name: &str, needles: &[&str]) -> bool {
         let d = self.describe();
         r.check(name, needles.iter().all(|n| d.contains(n)), &d)
     }
 
-    fn click_at(&self, r: &mut Report, what: &str, point: Option<(i32, i32)>) -> bool {
+    pub(super) fn click_at(&self, r: &mut Report, what: &str, point: Option<(i32, i32)>) -> bool {
         let Some((x, y)) = point else {
             return r.check(&format!("find {what}"), false, "not on screen");
         };
@@ -97,39 +97,39 @@ impl Set<'_> {
         true
     }
 
-    fn point(&self, hit: SHit) -> Option<(i32, i32)> {
+    pub(super) fn point(&self, hit: SHit) -> Option<(i32, i32)> {
         unpack(send(self.t.main, CMD_SETTINGS_POINT, code(hit)))
     }
 
-    fn click(&self, r: &mut Report, hit: SHit) -> bool {
+    pub(super) fn click(&self, r: &mut Report, hit: SHit) -> bool {
         self.click_at(r, &format!("Settings {hit:?}"), self.point(hit))
     }
 
     /// A Library-page control (the sidebar while the Library page shows).
-    fn manager_click(&self, r: &mut Report, hit: MHit) -> bool {
+    pub(super) fn manager_click(&self, r: &mut Report, hit: MHit) -> bool {
         let point = unpack(send(self.t.main, CMD_MANAGER_POINT, manager_test::code(hit)));
         self.click_at(r, &format!("Manager {hit:?}"), point)
     }
 
-    fn add_click(&self, r: &mut Report, el: El) -> bool {
+    pub(super) fn add_click(&self, r: &mut Report, el: El) -> bool {
         let point = unpack(send(self.t.main, super::CMD_MANAGER_ADD_POINT, el.code()));
         self.click_at(r, &format!("Settings Add media {el:?}"), point)
     }
 
-    fn scroll_to(&self, y: isize) {
+    pub(super) fn scroll_to(&self, y: isize) {
         send(self.t.main, CMD_SETTINGS_SCROLL, y);
         std::thread::sleep(Duration::from_millis(100));
     }
 
     /// Mouse to an empty spot of the title bar, so nothing shows a hover border.
-    fn park(&self) {
+    pub(super) fn park(&self) {
         if let Some((x, y)) = self.point(SHit::None) {
             mouse_to(x, y);
         }
         std::thread::sleep(Duration::from_millis(150));
     }
 
-    fn shot(&self, r: &mut Report, name: &str) {
+    pub(super) fn shot(&self, r: &mut Report, name: &str) {
         std::thread::sleep(Duration::from_millis(150));
         if let Some(rect) = window_rect(self.hwnd) {
             save_capture(r, &self.t.out.join("screens").join(format!("{name}.png")), capture_screen(rect));
@@ -137,7 +137,7 @@ impl Set<'_> {
     }
 
     /// The number after `key=` in the description.
-    fn number(&self, key: &str) -> f32 {
+    pub(super) fn number(&self, key: &str) -> f32 {
         let d = self.describe();
         d.split(&format!("{key}=")).nth(1).and_then(|v| v.split(' ').next()).and_then(|v| v.parse().ok()).unwrap_or(-1.0)
     }
@@ -192,7 +192,8 @@ fn store_checks(r: &mut Report, s: &Set) {
     send(s.t.main, CMD_STORE_REOPEN, 0);
     let d = store_describe(s.t);
     r.check("a damaged file falls back to the backup", d.contains("outcome=restored-from-backup"), &d);
-    s.has(r, "the backup's settings are used", &["saved=OpenFaster/HoverOnly/true/false"]);
+    // Autostart is not taken from the file: it shows what Windows has (turned on by the save above).
+    s.has(r, "the backup's settings are used (Autostart as Windows has it)", &["saved=OpenFaster/HoverOnly/true/true"]);
     let kept = std::fs::read_dir(store_file("")).ok().map(|dir| {
         dir.filter_map(|e| e.ok()).any(|e| e.file_name().to_string_lossy().starts_with("pocketmedia.json.corrupt-"))
     });
@@ -230,7 +231,7 @@ pub(super) fn run(r: &mut Report, t: &Session) -> bool {
     r.check("Settings shows the Media folder PocketMedia uses", shown_ok, &used);
     let before_edits = std::fs::read(store_file("pocketmedia.json")).ok();
     let d = s.describe();
-    r.check("only the Settings entry is highlighted", d.ends_with("nav_selected=Settings"), &d);
+    r.check("only the Settings entry is highlighted", d.contains(" nav_selected=Settings "), &d);
     let title = window_text(hwnd);
     r.check("the window title follows the page", title == "PocketMedia - Settings", &title);
 
@@ -302,7 +303,9 @@ pub(super) fn run(r: &mut Report, t: &Session) -> bool {
     );
     s.click(r, SHit::Backup);
     s.shot(r, "focused-44-settings-backup");
-    s.has(r, "Back up library says when it arrives (focused-44)", &["dirty=true", "Phase 6"]);
+    // Back up library acts. Under the self-test no picker is shown, and with
+    // no test folder set it reports a closed picker.
+    s.has(r, "Back up library asks for a folder (focused-44)", &["dirty=true", "Backup cancelled: no folder was chosen."]);
     s.scroll_to(END);
     s.park();
     s.shot(r, "focused-44-settings-backup-scrolled1");

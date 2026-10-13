@@ -16,7 +16,7 @@ use crate::media_info::fixtures;
 use crate::sample::Item;
 
 /// A solid-colour PNG (real and decodable), different for each `seed`.
-fn png(w: u32, h: u32, seed: u32) -> Vec<u8> {
+pub(super) fn png(w: u32, h: u32, seed: u32) -> Vec<u8> {
     let c = [(seed * 53 % 256) as u8, (seed * 97 % 256) as u8, (seed * 151 % 256) as u8, 255];
     let rgba: Vec<u8> = c.iter().copied().cycle().take((w * h * 4) as usize).collect();
     crate::test_png::encode_rgba(w, h, &rgba)

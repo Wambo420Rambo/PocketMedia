@@ -105,8 +105,10 @@ pub struct SettingsPage {
     pub focus_visible: bool,
     /// Highlighted row while the Video preview list is open.
     pub video_open: Option<usize>,
-    /// Result of the last action ("Settings saved.", a not-built-yet note).
+    /// Result of the last action ("Settings saved.", a not-built-yet note, backup progress).
     pub note: Option<String>,
+    /// Back up library is running: its button reads "Cancel backup".
+    pub backup_running: bool,
 }
 
 impl Default for SettingsPage {
@@ -122,15 +124,27 @@ impl SettingsPage {
 
     /// The page for settings loaded from the store.
     pub fn with_saved(saved: Settings) -> Self {
-        Self { saved, draft: saved, scroll: 0.0, focus: SFocus::Profile, focus_visible: false, video_open: None, note: None }
+        Self {
+            saved,
+            draft: saved,
+            scroll: 0.0,
+            focus: SFocus::Profile,
+            focus_visible: false,
+            video_open: None,
+            note: None,
+            backup_running: false,
+        }
     }
 
-    /// Opening the page always starts from the saved values.
+    /// Opening the page always starts from the saved values. A running backup's
+    /// progress stays.
     pub fn enter(&mut self) {
         self.draft = self.saved;
         self.scroll = 0.0;
         self.video_open = None;
-        self.note = None;
+        if !self.backup_running {
+            self.note = None;
+        }
     }
 
     pub fn dirty(&self) -> bool {

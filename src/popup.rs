@@ -221,6 +221,14 @@ pub fn refresh() {
     invalidate();
 }
 
+/// The library changed outside the popup (the Media folders were changed in
+/// File Explorer). The selection is clamped to the list when it is read; the
+/// scroll position is kept inside the shorter list.
+pub fn library_changed() {
+    with_view(|v| v.clamp_scroll());
+    invalidate();
+}
+
 /// A worker result. Returns true if the popup's Add media panel owned it.
 pub fn on_job(ev: &crate::jobs::Event) -> bool {
     let effect = with_view(|v| {

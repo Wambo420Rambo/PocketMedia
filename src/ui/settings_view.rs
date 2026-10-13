@@ -408,7 +408,8 @@ pub fn paint(p: &Painter, s: &SettingsPage, l: &SettingsLayout, ui: &SettingsUi)
     widgets::button(p, l.import.control, &["Choose", "folder…"], hover(SHit::ChooseFolder), ring(SFocus::ChooseFolder));
     separator(p, &l.backup);
     title_and_desc(p, &l.backup, BACKUP_TITLE, Some(BACKUP_DESC));
-    widgets::button(p, l.backup.control, &["Back up library"], hover(SHit::Backup), ring(SFocus::Backup));
+    let backup_label = if s.backup_running { "Cancel backup" } else { "Back up library" };
+    widgets::button(p, l.backup.control, &[backup_label], hover(SHit::Backup), ring(SFocus::Backup));
 
     title_and_desc(p, &l.autostart, AUTOSTART_TITLE, Some(AUTOSTART_DESC));
     let hot = hover(SHit::Autostart);

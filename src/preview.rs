@@ -314,26 +314,48 @@ pub fn frame(key: &Key) -> Option<(Rc<Pixels>, u64)> {
 pub fn set_gifs(win: Win, list: Vec<(Key, PathBuf)>) {
     let dropped = ui(|u| {
         u.gifs[win as usize] = list;
-        let mut all: Vec<(Key, PathBuf)> = u.gifs.iter().flatten().cloned().collect();
-        all.sort_by_key(|(k, _)| *k);
-        all.dedup_by_key(|(k, _)| *k);
-        let keys: Vec<Key> = all.iter().map(|(k, _)| *k).collect();
-        if keys == u.sent {
-            return Vec::new();
+        send_gifs(u)
+    });
+    for k in &dropped {
+        thumbs::invalidate(k);
+    }
+}
+
+/// Sends the GIF thread the GIFs to animate when the set changed. Returns the
+/// keys whose moving frame is no longer shown.
+fn send_gifs(u: &mut Ui) -> Vec<Key> {
+    let mut all: Vec<(Key, PathBuf)> = u.gifs.iter().flatten().cloned().collect();
+    all.sort_by_key(|(k, _)| *k);
+    all.dedup_by_key(|(k, _)| *k);
+    let keys: Vec<Key> = all.iter().map(|(k, _)| *k).collect();
+    if keys == u.sent {
+        return Vec::new();
+    }
+    u.sent = keys;
+    if u.gif_tx.is_none() && !all.is_empty() {
+        u.gif_tx = spawn("gif-preview", gif_thread);
+    }
+    if let Some(tx) = &u.gif_tx {
+        let _ = tx.send(GifCmd::Set(all));
+    }
+    let hover = u.hover.map(|(_, k)| k);
+    let gone: Vec<Key> = u.frames.keys().filter(|k| !u.sent.contains(k) && Some(**k) != hover).copied().collect();
+    for k in &gone {
+        u.frames.remove(k);
+    }
+    gone
+}
+
+/// Item `id`'s file was replaced or removed outside PocketMedia: its hover
+/// video stops and its GIF decoder is dropped, so a replaced GIF is opened
+/// again from the new file once its thumbnail is made.
+pub fn forget(id: u32) {
+    release_item(id);
+    let dropped = ui(|u| {
+        for list in &mut u.gifs {
+            list.retain(|(k, _)| k.id != id);
         }
-        u.sent = keys;
-        if u.gif_tx.is_none() && !all.is_empty() {
-            u.gif_tx = spawn("gif-preview", gif_thread);
-        }
-        if let Some(tx) = &u.gif_tx {
-            let _ = tx.send(GifCmd::Set(all));
-        }
-        let hover = u.hover.map(|(_, k)| k);
-        let gone: Vec<Key> = u.frames.keys().filter(|k| !u.sent.contains(k) && Some(**k) != hover).copied().collect();
-        for k in &gone {
-            u.frames.remove(k);
-        }
-        gone
+        send_gifs(u)
     });
     for k in &dropped {
         thumbs::invalidate(k);

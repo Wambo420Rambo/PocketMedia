@@ -56,7 +56,7 @@ fn cancelled(cancel: &AtomicBool) -> Result<(), String> {
     if cancel.load(Ordering::Relaxed) { Err("Cancelled.".into()) } else { Ok(()) }
 }
 
-fn is_partial(name: &str) -> bool {
+pub fn is_partial(name: &str) -> bool {
     name.starts_with(PARTIAL_PREFIX) && name.ends_with(PARTIAL_SUFFIX)
 }
 

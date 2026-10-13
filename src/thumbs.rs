@@ -121,6 +121,18 @@ impl Ram {
         self.bytes = 0;
     }
 
+    /// Drops every size of item `id`'s thumbnail.
+    pub fn remove_id(&mut self, id: u32) {
+        let bytes = &mut self.bytes;
+        self.map.retain(|k, e| {
+            let keep = k.id != id;
+            if !keep {
+                *bytes -= e.px.bytes();
+            }
+            keep
+        });
+    }
+
     pub fn bytes(&self) -> usize {
         self.bytes
     }
@@ -514,6 +526,20 @@ pub fn describe(win: Win) -> String {
     })
 }
 
+/// Item `id`'s file changed (replaced or gone outside PocketMedia): its
+/// thumbnails in RAM are dropped, so the next paint makes them again. The disk
+/// cache notices the change itself (entries are stamped with size and time).
+pub fn forget(id: u32) {
+    let keys: Vec<Key> = ui(|u| {
+        u.ram.remove_id(id);
+        u.none.retain(|k| k.id != id);
+        u.frames.iter().flat_map(|f| f.seen.iter().map(|s| s.key)).filter(|k| k.id == id).collect()
+    });
+    for k in &keys {
+        invalidate(k);
+    }
+}
+
 /// Self-test only: forget everything in RAM (as after a restart).
 pub fn reset() {
     ui(|u| {
@@ -532,6 +558,18 @@ mod tests {
 
     fn key(id: u32) -> Key {
         Key { id, w: 128, h: 72 }
+    }
+
+    #[test]
+    fn forgetting_an_item_drops_all_its_sizes() {
+        let mut ram = Ram::default();
+        let keep = HashSet::new();
+        ram.insert(Key { id: 1, w: 10, h: 10 }, px(100), 1 << 20, &keep);
+        ram.insert(Key { id: 1, w: 20, h: 20 }, px(400), 1 << 20, &keep);
+        ram.insert(Key { id: 2, w: 10, h: 10 }, px(100), 1 << 20, &keep);
+        ram.remove_id(1);
+        assert_eq!((ram.len(), ram.bytes()), (1, 400));
+        assert!(ram.contains(&Key { id: 2, w: 10, h: 10 }));
     }
 
     #[test]

@@ -169,6 +169,15 @@ fn parse(text: &str) -> Result<(StoreData, Vec<String>), ParseError> {
     Ok(validate(data))
 }
 
+/// Reads library file text as a start would (the backup checks what it wrote).
+pub fn check_text(text: &str) -> Result<StoreData, String> {
+    match parse(text) {
+        Ok((data, _)) => Ok(data),
+        Err(ParseError::Bad(e)) => Err(e),
+        Err(ParseError::Newer(v)) => Err(format!("format version {v} is newer than this PocketMedia")),
+    }
+}
+
 enum ParseError {
     Bad(String),
     Newer(u32),

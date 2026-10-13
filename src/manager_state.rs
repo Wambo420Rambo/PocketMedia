@@ -239,6 +239,11 @@ impl ManagerState {
         }
     }
 
+    /// The selected item's name changed elsewhere: `sync` loads the new name.
+    pub fn reload_rename(&mut self) {
+        self.rename_for = None;
+    }
+
     pub fn select(&mut self, id: u32, lib: &Library) {
         if self.selected != Some(id) {
             self.selected = Some(id);

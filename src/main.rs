@@ -10,16 +10,21 @@
 //! Real transfer: paste and drag of the library's original files.
 //! Previews: thumbnails with a disk and a RAM cache, GIFs that loop
 //! while visible and a muted hover video.
+//! The Media folders are watched for changes made in File Explorer,
+//! Back up library, one PocketMedia per user, and Autostart.
 
 #![windows_subsystem = "windows"]
 
 mod add_media;
 mod add_panel;
+mod autostart;
+mod backup;
 mod dialogs;
 mod digest;
 mod fileops;
 mod gif;
 mod import;
+mod instance;
 mod jobs;
 mod library;
 mod manager;
@@ -48,6 +53,7 @@ mod transfer;
 mod tray;
 mod ui;
 mod video;
+mod watch;
 mod wic;
 mod winutil;
 
@@ -89,6 +95,8 @@ pub struct App {
     /// Self-test mode: report problems in the log instead of message boxes.
     pub quiet: Cell<bool>,
     pub taskbar_created: Cell<u32>,
+    /// Sent by a second launch (`instance.rs`).
+    pub activate: Cell<u32>,
     pub target: RefCell<Result<Target, NoTarget>>,
     pub status: RefCell<(String, StatusKind)>,
 }
@@ -99,6 +107,7 @@ thread_local! {
         hotkey_ok: Cell::new(false),
         quiet: Cell::new(false),
         taskbar_created: Cell::new(0),
+        activate: Cell::new(0),
         target: RefCell::new(Err(NoTarget::NothingFocused)),
         status: RefCell::new((String::new(), StatusKind::Neutral)),
     };
@@ -115,20 +124,29 @@ pub fn set_status(text: impl Into<String>, kind: StatusKind) {
     app(|a| *a.status.borrow_mut() = (text, kind));
 }
 
-/// Command-line modes. Normal launch has no arguments.
+/// Command-line modes. A normal launch has no arguments and opens the popup;
+/// `--autostart` (from the Run key) starts quietly in the tray.
 enum Mode {
-    Normal { exit_after_start: bool },
+    Normal { exit_after_start: bool, autostart: bool },
     SelfTest(PathBuf),
     TestTarget(PathBuf),
+    /// Self-test only: load the library beside this copy of the program (as a
+    /// start does), write what was found to the file, and exit.
+    CheckLibrary(PathBuf),
 }
+
+const MAIN_CLASS: PCWSTR = w!("PocketMediaPhase0Main");
 
 fn parse_mode() -> Mode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let path = |default: &str| PathBuf::from(args.get(1).cloned().unwrap_or_else(|| default.into()));
     match args.first().map(String::as_str) {
-        Some("--self-test") => Mode::SelfTest(PathBuf::from(args.get(1).cloned().unwrap_or_else(|| "test-results".into()))),
-        Some("--test-target") => Mode::TestTarget(PathBuf::from(args.get(1).cloned().unwrap_or_else(|| "test-results".into()))),
-        Some("--exit-after-start") => Mode::Normal { exit_after_start: true },
-        _ => Mode::Normal { exit_after_start: false },
+        Some("--self-test") => Mode::SelfTest(path("test-results")),
+        Some("--test-target") => Mode::TestTarget(path("test-results")),
+        Some("--check-library") => Mode::CheckLibrary(path("check-library.txt")),
+        Some("--exit-after-start") => Mode::Normal { exit_after_start: true, autostart: false },
+        Some(autostart::ARG) => Mode::Normal { exit_after_start: false, autostart: true },
+        _ => Mode::Normal { exit_after_start: false, autostart: false },
     }
 }
 
@@ -159,7 +177,34 @@ fn main() {
             std::process::exit(2);
         }
     };
+    if let Mode::CheckLibrary(report) = &mode {
+        std::process::exit(check_library(paths, report));
+    }
+    // One PocketMedia per user: a later launch shows the running one's popup.
+    let Some(_instance) = instance::claim() else {
+        match mode {
+            Mode::Normal { autostart: true, .. } => {}
+            Mode::SelfTest(_) => {
+                message_box(
+                    "Another PocketMedia is running. Exit it from the tray, then run the self-test again.",
+                    "PocketMedia - self-test",
+                    MB_ICONWARNING,
+                );
+                std::process::exit(1);
+            }
+            _ => {
+                instance::activate_running(MAIN_CLASS);
+            }
+        }
+        std::process::exit(0);
+    };
     let outcome = store::init(&paths.data);
+    if matches!(mode, Mode::SelfTest(_)) {
+        // The self-test never changes what starts with Windows; it starts from "off".
+        autostart::use_test_key();
+        autostart::remove_test_key();
+    }
+    autostart::sync_store();
     let media = paths.media.clone();
     paths::init(paths);
     let quiet = matches!(mode, Mode::SelfTest(_));
@@ -223,6 +268,21 @@ fn load_library(media: &std::path::Path) -> Option<String> {
     })
 }
 
+/// `--check-library`: what a start finds in the library beside this program.
+fn check_library(paths: paths::Paths, report: &std::path::Path) -> i32 {
+    let outcome = store::init(&paths.data);
+    let media = paths.media.clone();
+    let message = load_library(&media);
+    let names = library::with(|lib| lib.items.iter().map(|i| i.name.clone()).collect::<Vec<_>>());
+    let text = format!(
+        "store={}\nitems={}\nmissing={}\nnames={}\n",
+        outcome.label(),
+        names.len(),
+        message.unwrap_or_default().replace('\n', " / "),
+        names.join("|")
+    );
+    if std::fs::write(report, text).is_ok() { 0 } else { 1 }
+}
 
 fn run(mode: &Mode) -> Result<(), String> {
     app(|a| a.quiet.set(matches!(mode, Mode::SelfTest(_))));
@@ -231,7 +291,7 @@ fn run(mode: &Mode) -> Result<(), String> {
         let class = WNDCLASSW {
             lpfnWndProc: Some(main_proc),
             hInstance: instance.into(),
-            lpszClassName: w!("PocketMediaPhase0Main"),
+            lpszClassName: MAIN_CLASS,
             ..Default::default()
         };
         if RegisterClassW(&class) == 0 {
@@ -240,7 +300,7 @@ fn run(mode: &Mode) -> Result<(), String> {
         // Hidden owner window: receives tray, hotkey and timer messages. Never shown.
         let main = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
-            w!("PocketMediaPhase0Main"),
+            MAIN_CLASS,
             w!("PocketMedia"),
             WS_OVERLAPPED,
             0,
@@ -256,8 +316,14 @@ fn run(mode: &Mode) -> Result<(), String> {
         app(|a| {
             a.main.set(main);
             a.taskbar_created.set(RegisterWindowMessageW(w!("TaskbarCreated")));
+            a.activate.set(instance::activate_message());
         });
         jobs::init(main);
+        if let Some(p) = paths::get()
+            && let Err(e) = watch::start(&p.media, watch::BUFFER)
+        {
+            selftest::note(&e);
+        }
 
         popup::create(instance.into())?;
         tray::add(main);
@@ -278,7 +344,8 @@ fn run(mode: &Mode) -> Result<(), String> {
 
         match mode {
             Mode::SelfTest(out) => selftest::start(out.clone(), main),
-            Mode::Normal { exit_after_start: true } => exit(),
+            Mode::Normal { exit_after_start: true, .. } => exit(),
+            Mode::Normal { autostart: false, .. } => popup::open(target::capture_foreground()),
             _ => {}
         }
         message_loop();
@@ -347,6 +414,9 @@ extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             WM_SELFTEST => selftest::on_ui_command(wparam, lparam),
             jobs::WM_JOB => {
                 for ev in jobs::take() {
+                    if watch::on_event(&ev) || backup::on_event(&ev) {
+                        continue;
+                    }
                     if !paste::on_prepared(&ev) && !popup::on_job(&ev) {
                         manager::on_job(&ev);
                     }
@@ -367,12 +437,19 @@ extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
                     let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
                 }
                 let _ = KillTimer(Some(hwnd), TIMER_PASTE);
+                watch::stop();
+                backup::shutdown();
                 preview::shutdown();
                 thumbs::shutdown();
                 tray::remove(hwnd);
                 manager::destroy();
                 popup::destroy();
                 PostQuitMessage(0);
+                LRESULT(0)
+            }
+            m if m != 0 && m == app(|a| a.activate.get()) => {
+                // Another launch of PocketMedia: show the popup of this one.
+                popup::open(target::capture_foreground());
                 LRESULT(0)
             }
             m if m != 0 && m == app(|a| a.taskbar_created.get()) => {

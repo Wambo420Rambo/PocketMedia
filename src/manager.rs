@@ -34,7 +34,6 @@ use crate::winutil::{self, WM_MOUSELEAVE};
 
 const WHEEL_STEP: f32 = 48.0;
 const SHORTCUT_NOTE: &str = "Changing the shortcut is not built yet.";
-const BACKUP_NOTE: &str = "Back up library arrives in Phase 6.";
 
 struct View {
     state: ManagerState,
@@ -64,6 +63,8 @@ enum Effect {
     Deferred(MHit),
     /// Show the Add media file or folder picker (modal).
     Pick(crate::dialogs::Pick),
+    /// Show the folder picker for Back up library (modal).
+    PickBackup,
 }
 
 thread_local! {
@@ -199,6 +200,28 @@ pub fn test_show_state(restore: bool) {
     let _ = unsafe { ShowWindow(hwnd(), if restore { SW_RESTORE } else { SW_MINIMIZE }) };
 }
 
+/// Back up library progress or its result, shown beside Save and Cancel.
+pub fn backup_changed(text: &str, running: bool) {
+    with_view(|v| {
+        v.state.settings.backup_running = running;
+        v.state.settings.show_note(text);
+    });
+    winutil::invalidate(hwnd());
+}
+
+/// The library changed outside the Manager (the Media folders were changed in
+/// File Explorer). The rename field reloads if the selected item was renamed.
+pub fn library_changed(renamed: &[u32]) {
+    with_view(|v| {
+        if v.state.selected.is_some_and(|id| renamed.contains(&id)) {
+            v.state.reload_rename();
+        }
+        library::with(|lib| v.state.sync(lib));
+        v.clamp_scroll(false);
+    });
+    winutil::invalidate(hwnd());
+}
+
 /// Repaints the Manager if it is on screen (a thumbnail arrived).
 pub fn refresh() {
     if is_visible() {
@@ -320,6 +343,8 @@ impl View {
         } else if let Some(add) = self.add.as_ref() {
             add.paint(&mut self.gfx, hwnd(), self.dpi as f32, area);
         } else if self.state.page == Page::Settings {
+            // The button label follows the backup itself, even if an event was missed.
+            self.state.settings.backup_running = crate::backup::running();
             let l = self.settings_layout();
             let ui = SettingsUi { hover: self.s_hover };
             let s = &self.state.settings;
@@ -792,13 +817,30 @@ impl View {
                 self.s_hover = SHit::None;
                 return Effect::Pick(crate::dialogs::Pick::Folder);
             }
-            SHit::Backup => st.show_note(BACKUP_NOTE),
+            SHit::Backup if crate::backup::running() => {
+                crate::backup::cancel();
+                st.show_note("Cancelling the backup…");
+            }
+            SHit::Backup => return Effect::PickBackup,
             SHit::Autostart => st.toggle_autostart(),
             SHit::Cancel => st.cancel(),
             SHit::Save => {
+                let autostart = (st.draft.autostart != st.saved.autostart).then_some(st.draft.autostart);
                 st.save();
+                let mut problems = Vec::new();
+                if let Some(on) = autostart
+                    && let Err(e) = crate::autostart::set(on)
+                {
+                    // The registry is the truth: the toggle shows what it says.
+                    st.saved.autostart = crate::autostart::is_on();
+                    st.draft.autostart = st.saved.autostart;
+                    problems.push(format!("Autostart could not be turned {}: {e}.", if on { "on" } else { "off" }));
+                }
                 if let Err(e) = crate::store::save_settings(st.saved) {
-                    st.show_note(&format!("Settings could not be saved: {e}"));
+                    problems.push(format!("Settings could not be saved: {e}"));
+                }
+                if !problems.is_empty() {
+                    st.show_note(&problems.join(" "));
                 }
             }
             SHit::None | SHit::Caption => {}
@@ -960,6 +1002,23 @@ fn run(effect: Effect) {
                 run(effect);
             }
         }
+        Effect::PickBackup => {
+            let folder = crate::dialogs::pick_backup_folder(h);
+            // SAFETY: our own window; back in front after the picker.
+            let _ = unsafe { SetForegroundWindow(h) };
+            let note = match folder {
+                None => "Backup cancelled: no folder was chosen.".to_string(),
+                Some(dest) => match crate::backup::start(dest) {
+                    Ok(()) => {
+                        with_view(|v| v.state.settings.backup_running = true);
+                        "Backing up…".to_string()
+                    }
+                    Err(e) => format!("Backup failed: {e}"),
+                },
+            };
+            with_view(|v| v.state.settings.show_note(&note));
+            winutil::invalidate(h);
+        }
         Effect::PasteText => {
             if let Some(text) = winutil::clipboard_text(h) {
                 with_view(|v| v.insert_text(&text));
@@ -998,6 +1057,10 @@ fn media_path(rel: &str) -> Option<std::path::PathBuf> {
 
 /// Rename: the file first, then the record. A failure changes nothing.
 fn rename_selected(s: &mut ManagerState) {
+    if crate::backup::running() {
+        s.status = Some(crate::backup::BUSY.into());
+        return;
+    }
     let plan = library::with(|lib| {
         let id = s.selected.filter(|_| s.can_rename())?;
         let item = lib.get(id)?;
@@ -1026,6 +1089,11 @@ fn rename_selected(s: &mut ManagerState) {
 
 /// Move to Recycle Bin (after the confirmation): the managed copy only.
 fn recycle_selected(s: &mut ManagerState) {
+    if crate::backup::running() {
+        s.cancel_recycle();
+        s.status = Some(crate::backup::BUSY.into());
+        return;
+    }
     let Some((name, rel)) = library::with(|lib| s.selected_item(lib).map(|i| (i.name.clone(), i.path.clone()))) else { return };
     let Some(path) = media_path(&rel) else { return };
     if let Some(id) = s.selected {
@@ -1334,7 +1402,7 @@ pub fn describe() -> String {
             return format!(
                 "screen=settings profile={:?} video={:?} close_after={} autostart={} saved={:?}/{:?}/{}/{} dirty={} \
                  focus={:?} focus_visible={} video_open={} scroll={:.0} max_scroll={:.0} autostart_visible={} \
-                 line={:?} opened={:?} media={:?} nav_selected={}",
+                 line={:?} opened={:?} media={:?} nav_selected={} backup_running={}",
                 d.profile,
                 d.video_preview,
                 d.close_after_insert,
@@ -1354,6 +1422,7 @@ pub fn describe() -> String {
                 OPENED.with(|o| o.borrow().clone().unwrap_or_default()),
                 crate::paths::media_text(),
                 Nav::ORDER.iter().filter(|n| v.state.nav_selected(**n)).map(|n| n.label()).collect::<Vec<_>>().join("+"),
+                st.backup_running,
             );
         }
         let s = &v.state;

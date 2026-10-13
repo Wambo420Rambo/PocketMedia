@@ -204,3 +204,20 @@ pub fn open_folder(dir: &std::path::Path) -> Result<(), String> {
     // ShellExecute returns a value above 32 on success.
     if result.0 as usize > 32 { Ok(()) } else { Err(format!("Windows returned error {}", result.0 as usize)) }
 }
+
+/// A kernel handle (event, mutex, directory) with one owner, closed on drop.
+pub struct OwnedHandle(pub windows::Win32::Foundation::HANDLE);
+
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            // SAFETY: this struct is the handle's only owner, so it is closed exactly once.
+            let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.0) };
+        }
+    }
+}
+
+// SAFETY: a kernel handle is a process-wide value; any thread may wait on or close it.
+unsafe impl Send for OwnedHandle {}
+// SAFETY: as above; the methods used through `&OwnedHandle` (wait, SetEvent) are thread-safe.
+unsafe impl Sync for OwnedHandle {}

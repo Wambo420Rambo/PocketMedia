@@ -25,12 +25,25 @@ pub enum Event {
     Finished { job: u64, stopped: bool },
     /// A library item is ready for the clipboard.
     Prepared { job: u64, result: Result<crate::transfer::Payload, String> },
+    /// Changes in the Media folders made outside PocketMedia (`watch.rs`).
+    Watched(crate::watch::Batch),
+    /// A full comparison of the Media folders with a snapshot of `(id, path)`:
+    /// files without a record, and records whose file is gone.
+    Rescanned { job: u64, orphans: Vec<crate::import::Orphan>, missing: Vec<(u32, String)> },
+    /// Back up library progress or its result (`backup.rs`).
+    Backup { job: u64, progress: crate::backup::Progress },
 }
 
 impl Event {
     pub fn job(&self) -> u64 {
         match self {
-            Event::Planned { job, .. } | Event::Copied { job, .. } | Event::Finished { job, .. } | Event::Prepared { job, .. } => *job,
+            Event::Planned { job, .. }
+            | Event::Copied { job, .. }
+            | Event::Finished { job, .. }
+            | Event::Prepared { job, .. }
+            | Event::Rescanned { job, .. }
+            | Event::Backup { job, .. } => *job,
+            Event::Watched(_) => 0,
         }
     }
 }
@@ -44,7 +57,7 @@ pub fn init(main: HWND) {
     MAIN.store(main.0 as isize, Ordering::SeqCst);
 }
 
-fn post(ev: Event) {
+pub fn post(ev: Event) {
     if let Ok(mut q) = QUEUE.lock() {
         q.push(ev);
     }
@@ -77,20 +90,32 @@ impl Job {
     }
 }
 
-fn start(work: impl FnOnce(u64, &AtomicBool) + Send + 'static) -> Job {
+fn start(name: &str, work: impl FnOnce(u64, &AtomicBool) + Send + 'static) -> Job {
     let id = NEXT_JOB.fetch_add(1, Ordering::Relaxed);
+    spawn_as(id, name, work).unwrap_or_else(|e| {
+        post(Event::Planned { job: id, result: Err(format!("could not start the import: {e}")) });
+        Job { id, cancel: Arc::new(AtomicBool::new(false)) }
+    })
+}
+
+/// Runs `work` on a new thread. Err when Windows could not start one.
+pub fn spawn(name: &str, work: impl FnOnce(u64, &AtomicBool) + Send + 'static) -> Result<Job, String> {
+    spawn_as(NEXT_JOB.fetch_add(1, Ordering::Relaxed), name, work)
+}
+
+fn spawn_as(id: u64, name: &str, work: impl FnOnce(u64, &AtomicBool) + Send + 'static) -> Result<Job, String> {
     let cancel = Arc::new(AtomicBool::new(false));
     let flag = cancel.clone();
-    let spawned = std::thread::Builder::new().name(format!("import-{id}")).spawn(move || work(id, &flag));
-    if let Err(e) = spawned {
-        post(Event::Planned { job: id, result: Err(format!("could not start the import: {e}")) });
-    }
-    Job { id, cancel }
+    std::thread::Builder::new()
+        .name(format!("{name}-{id}"))
+        .spawn(move || work(id, &flag))
+        .map(|_| Job { id, cancel })
+        .map_err(|e| format!("could not start a worker thread: {e}"))
 }
 
 /// Scans the chosen files and decides what to copy.
 pub fn plan(source: Source, known: Vec<KnownFile>, media: PathBuf) -> Job {
-    start(move |job, cancel| {
+    start("import", move |job, cancel| {
         let result = import::scan(&source, &media, cancel)
             .and_then(|cands| import::plan(cands, &known, &media, crate::sha256::new, cancel));
         post(Event::Planned { job, result });
@@ -99,7 +124,7 @@ pub fn plan(source: Source, known: Vec<KnownFile>, media: PathBuf) -> Job {
 
 /// Copies the approved files, one at a time, reporting each.
 pub fn copy(requests: Vec<(usize, CopyRequest)>, media: PathBuf) -> Job {
-    start(move |job, cancel| {
+    start("import", move |job, cancel| {
         for (index, req) in requests {
             if cancel.load(Ordering::Relaxed) {
                 post(Event::Finished { job, stopped: true });
@@ -119,8 +144,18 @@ pub fn copy(requests: Vec<(usize, CopyRequest)>, media: PathBuf) -> Job {
 
 /// Reads and decodes a library file for the clipboard.
 pub fn prepare(file: PathBuf) -> Job {
-    start(move |job, _cancel| {
+    start("prepare", move |job, _cancel| {
         let _com = crate::wic::ComThread::init();
         post(Event::Prepared { job, result: crate::transfer::prepare(&file) });
     })
+}
+
+/// Compares the Media folders with `records` (a snapshot of `(id, path)`).
+pub fn rescan(media: PathBuf, records: Vec<(u32, String)>) -> Option<Job> {
+    spawn("rescan", move |job, _cancel| {
+        let (orphans, missing_ids) = import::reconcile(&media, &records);
+        let missing = records.into_iter().filter(|(id, _)| missing_ids.contains(id)).collect();
+        post(Event::Rescanned { job, orphans, missing });
+    })
+    .ok()
 }

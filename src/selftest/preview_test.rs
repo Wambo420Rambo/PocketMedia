@@ -158,7 +158,7 @@ fn shot_popup(r: &mut Report, t: &Session, name: &str) {
     }
 }
 
-fn close_windows(r: &mut Report, t: &Session) {
+pub(super) fn close_windows(r: &mut Report, t: &Session) {
     let manager = send(t.main, CMD_MANAGER, 0);
     if is_visible(manager) {
         post(manager, WM_CLOSE, 0, 0);
@@ -171,7 +171,7 @@ fn close_windows(r: &mut Report, t: &Session) {
 }
 
 /// Opens the popup on All media with every type showing.
-fn open_all_media(r: &mut Report, t: &Session) -> bool {
+pub(super) fn open_all_media(r: &mut Report, t: &Session) -> bool {
     if !t.open(r) {
         return false;
     }

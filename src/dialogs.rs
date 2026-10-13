@@ -87,3 +87,30 @@ fn show(owner: HWND, kind: Pick) -> Option<Source> {
         }
     }
 }
+
+/// Self-test only: what the backup folder picker returns (None: cancelled).
+static TEST_BACKUP: Mutex<Option<Option<PathBuf>>> = Mutex::new(None);
+
+pub fn set_test_backup(folder: Option<PathBuf>) {
+    if let Ok(mut t) = TEST_BACKUP.lock() {
+        *t = Some(folder);
+    }
+}
+
+/// The folder picker for Back up library. None when the user cancelled.
+pub fn pick_backup_folder(owner: HWND) -> Option<PathBuf> {
+    if crate::app(|a| a.quiet.get()) {
+        return TEST_BACKUP.lock().ok()?.clone().flatten();
+    }
+    // SAFETY: COM is initialised on this (UI) thread by OleInitialize.
+    let dialog: IFileOpenDialog = unsafe { CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER) }.ok()?;
+    // SAFETY: dialog is a live COM object for every call below; strings are static.
+    unsafe {
+        let options = dialog.GetOptions().ok()? | FOS_FORCEFILESYSTEM | FOS_NOCHANGEDIR | FOS_PATHMUSTEXIST | FOS_PICKFOLDERS;
+        dialog.SetOptions(options).ok()?;
+        dialog.SetTitle(w!("Choose where to save the backup (outside PocketMedia)")).ok()?;
+        // Err when the user cancels.
+        dialog.Show(Some(owner)).ok()?;
+        path_of(&dialog.GetResult().ok()?)
+    }
+}

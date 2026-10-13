@@ -89,6 +89,10 @@ impl AddPanel {
             self.add.scan_failed("The Media folder is not set up.".into());
             return AddOutcome::None;
         };
+        if crate::backup::running() {
+            self.add.scan_failed(crate::backup::BUSY.into());
+            return AddOutcome::None;
+        }
         let known = library::with(|lib| lib.known_files(&media));
         self.add.begin_scan();
         self.job = Some(jobs::plan(source, known, media));
@@ -128,7 +132,7 @@ impl AddPanel {
                 }
                 self.add.copied(*index, result);
             }
-            Event::Prepared { .. } => {}
+            Event::Prepared { .. } | Event::Watched(_) | Event::Rescanned { .. } | Event::Backup { .. } => {}
             Event::Finished { stopped, .. } => {
                 self.job = None;
                 let mut status = self.add.finish(*stopped);
