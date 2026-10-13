@@ -5,6 +5,7 @@ use super::d2d::{Align, Color, Gfx, Painter};
 use super::layout::{Rect, TextStyle, fit_media};
 use crate::popup_state::Empty;
 use crate::sample::Item;
+use crate::thumbs::{self, Key, Look};
 use crate::text_field::TextField;
 
 pub const BG: Color = Color::rgb(0x191D26);
@@ -219,19 +220,57 @@ pub fn tile(p: &Painter, item: &Item, r: Rect, look: TileLook, dpi: f32) {
     p.text(&item.name, super::layout::Layout::name(r), TextStyle::Small, TEXT, Align::Start, true);
 }
 
-/// Thumbnail box: aspect-correct media placeholder, type badge and pixel size
-/// (CSS .pm-thumb). Used by tiles and the Manager's inspector.
+/// The thumbnail for a box (`.pm-thumb` rect): the media area inside the 1px
+/// border and the 6px clearance, in device pixels.
+pub fn thumb_key(id: u32, thumb: Rect, dpi: f32) -> Key {
+    let inner = thumb.inset(1.0);
+    Key::new(id, inner.w - 12.0, inner.h - 12.0, dpi)
+}
+
+/// Asks for the thumbnail of a tile just outside the visible area (prefetch).
+pub fn prefetch_tile(item: &Item, tile: Rect, dpi: f32) {
+    thumbs::prefetch(item, thumb_key(item.id, super::layout::Layout::thumb(tile), dpi));
+}
+
+/// Thumbnail box: the media (a moving frame, the thumbnail, or a placeholder
+/// while it is made), type badge and pixel size (CSS .pm-thumb). Used by tiles
+/// and the Manager's inspector. The media is centred and never larger than its
+/// own pixels, so a frame that starts playing never moves anything.
 pub fn thumb(p: &Painter, item: &Item, thumb: Rect, dpi: f32) {
     p.fill(thumb, 6.0, RAISED);
     p.stroke(thumb, 6.0, 1.0, BORDER);
     let inner = thumb.inset(1.0);
-    // Unknown size (fake imports): a square box and no size badge, as in focused-13.
-    let known = item.width > 0 && item.height > 0;
-    let (pw, ph) = if known { (item.width, item.height) } else { (300, 300) };
-    let (fw, fh) = fit_media(inner.w, inner.h, pw, ph, dpi);
-    let media = Rect::new(inner.x + (inner.w - fw) / 2.0, inner.y + (inner.h - fh) / 2.0, fw, fh);
-    p.fill(media, 3.0, SOFT);
-    p.stroke(media, 3.0, 1.0, SOFT_TEXT);
+    let key = thumb_key(item.id, thumb, dpi);
+    let look = thumbs::look(item, key, thumb);
+    let shown = match crate::preview::frame(&key) {
+        Some(frame) => Look::Ready(frame.0, frame.1),
+        None => look,
+    };
+    match shown {
+        Look::Ready(px, version) => {
+            let s = 96.0 / dpi.max(1.0);
+            let (fw, fh) = (px.width as f32 * s, px.height as f32 * s);
+            // Whole device pixels, so the bitmap maps 1:1 and stays sharp.
+            let snap = |v: f32| (v / s).round() * s;
+            let media = Rect::new(snap(inner.x + (inner.w - fw) / 2.0), snap(inner.y + (inner.h - fh) / 2.0), fw, fh);
+            p.image((key.id, key.w, key.h), version, &px, media);
+        }
+        Look::Pending => {
+            // Unknown size (fake imports): a square box, as in focused-13.
+            let known = item.width > 0 && item.height > 0;
+            let (pw, ph) = if known { (item.width, item.height) } else { (300, 300) };
+            let (fw, fh) = fit_media(inner.w, inner.h, pw, ph, dpi);
+            let media = Rect::new(inner.x + (inner.w - fw) / 2.0, inner.y + (inner.h - fh) / 2.0, fw, fh);
+            p.fill(media, 3.0, SOFT);
+            p.stroke(media, 3.0, 1.0, SOFT_TEXT);
+        }
+        Look::NoPreview => {
+            // A truthful placeholder: the file is still there to paste or drag.
+            let r = inner.inset(6.0);
+            p.stroke_dashed(r, 3.0, BORDER);
+            p.text("No preview", r, TextStyle::Tiny, MUTED, Align::Center, true);
+        }
+    }
 
     let badge = item.kind.badge();
     let bw = p.gfx().measure(badge, TextStyle::Tiny) + 10.0;
@@ -239,7 +278,7 @@ pub fn thumb(p: &Painter, item: &Item, thumb: Rect, dpi: f32) {
     p.fill(badge_r, 4.0, SURFACE);
     p.text(badge, badge_r, TextStyle::Tiny, TEXT, Align::Center, true);
 
-    if known {
+    if item.width > 0 && item.height > 0 {
         let size = format!("{} × {}", item.width, item.height);
         let sw = p.gfx().measure(&size, TextStyle::Tiny) + 8.0;
         let sh = TextStyle::Tiny.line() + 2.0;

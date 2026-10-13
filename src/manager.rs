@@ -25,6 +25,7 @@ use crate::settings_state::{Profile, SFocus, VideoPreview};
 use crate::text_field::TextField;
 use crate::ui::add_view::AddHit;
 use crate::ui::d2d::Gfx;
+use crate::thumbs::{self, Win};
 use crate::ui::layout::{COLUMNS, Rect, TextStyle};
 use crate::ui::manager_view::{self, MHit, ManagerLayout, ManagerUi};
 use crate::ui::settings_view::{self, SHit, SettingsLayout, SettingsUi};
@@ -177,8 +178,32 @@ pub fn hide() {
         v.s_pressed = SHit::None;
         v.scroll_drag = None;
     });
+    release_previews();
     // SAFETY: our own window; a stale HWND only makes it fail.
     let _ = unsafe { ShowWindow(hwnd(), SW_HIDE) };
+}
+
+/// Hidden or minimised: thumbnail work for the Manager is cancelled and its
+/// GIFs and hover video stop. With Use less memory its picture bitmaps go too.
+fn release_previews() {
+    let profile = crate::store::settings().profile;
+    thumbs::hidden(Win::Manager, profile);
+    if profile == Profile::LessMemory {
+        with_view(|v| v.gfx.release_images());
+    }
+}
+
+/// Self-test only: minimise (false) or restore (true) the Manager.
+pub fn test_show_state(restore: bool) {
+    // SAFETY: our own window; a stale HWND only makes it fail.
+    let _ = unsafe { ShowWindow(hwnd(), if restore { SW_RESTORE } else { SW_MINIMIZE }) };
+}
+
+/// Repaints the Manager if it is on screen (a thumbnail arrived).
+pub fn refresh() {
+    if is_visible() {
+        winutil::invalidate(hwnd());
+    }
 }
 
 pub fn destroy() {
@@ -285,30 +310,54 @@ impl View {
         TextMetrics::of(&self.gfx, &self.state.rename, TextStyle::Body, width)
     }
 
-    fn paint(&mut self) {
+    fn paint(&mut self, dirty: Option<Rect>) {
         let area = self.area();
-        if let Some(add) = self.add.as_ref() {
+        // SAFETY: tolerates any HWND.
+        let minimised = unsafe { IsIconic(hwnd()) }.as_bool();
+        thumbs::begin_frame(Win::Manager, self.dpi, dirty.is_none() || minimised);
+        if minimised {
+            // Nothing shows: an empty frame, so no thumbnail is wanted and no GIF plays.
+        } else if let Some(add) = self.add.as_ref() {
             add.paint(&mut self.gfx, hwnd(), self.dpi as f32, area);
-            return;
-        }
-        if self.state.page == Page::Settings {
+        } else if self.state.page == Page::Settings {
             let l = self.settings_layout();
             let ui = SettingsUi { hover: self.s_hover };
             let s = &self.state.settings;
-            let _ = self.gfx.draw(hwnd(), self.dpi as f32, |p| settings_view::paint(p, s, &l, &ui));
-            return;
+            let _ = self.gfx.draw(hwnd(), self.dpi as f32, None, |p| settings_view::paint(p, s, &l, &ui));
+        } else {
+            library::with(|lib| {
+                let l = self.layout(lib);
+                let ui = ManagerUi {
+                    hover: self.hover,
+                    dpi: self.dpi as f32,
+                    search: self.search_metrics(&l),
+                    rename: self.rename_metrics(&l, lib),
+                };
+                let state = &self.state;
+                let _ = self.gfx.draw(hwnd(), ui.dpi, dirty, |p| manager_view::paint(p, state, lib, &l, &ui));
+            });
         }
-        library::with(|lib| {
-            let l = self.layout(lib);
-            let ui = ManagerUi {
-                hover: self.hover,
-                dpi: self.dpi as f32,
-                search: self.search_metrics(&l),
-                rename: self.rename_metrics(&l, lib),
-            };
-            let state = &self.state;
-            let _ = self.gfx.draw(hwnd(), ui.dpi, |p| manager_view::paint(p, state, lib, &l, &ui));
-        });
+        thumbs::end_frame(Win::Manager);
+    }
+
+    /// The video tile under the pointer, when Video preview is Hover only.
+    fn hover_video(&self) -> Option<(thumbs::Key, std::path::PathBuf)> {
+        let MHit::Tile(i) = self.hover else { return None };
+        if crate::store::settings().video_preview != VideoPreview::HoverOnly {
+            return None;
+        }
+        let media = crate::paths::get()?.media.clone();
+        let dpi = self.dpi as f32;
+        let (key, rel) = library::with(|lib| {
+            let item = *self.state.visible(lib).get(i)?;
+            if item.kind != crate::sample::MediaKind::Video {
+                return None;
+            }
+            let tile = self.layout(lib).grid.tile(i, self.state.scroll);
+            let key = crate::ui::widgets::thumb_key(item.id, crate::ui::layout::Layout::thumb(tile), dpi);
+            Some((key, item.path.clone()))
+        })?;
+        (!thumbs::is_no_preview(&key)).then(|| (key, crate::import::media_file(&media, &rel)))
     }
 
     fn clamp_scroll(&mut self, show_selection: bool) {
@@ -511,6 +560,7 @@ impl View {
             self.clamp_scroll(false);
         }
         self.hover = self.hit(x, y);
+        crate::preview::hover(Win::Manager, self.hover_video());
     }
 
     fn wheel(&mut self, delta: i16) {
@@ -956,6 +1006,9 @@ fn rename_selected(s: &mut ManagerState) {
     });
     if let Some((old, new)) = plan {
         let (Some(from), Some(to)) = (media_path(&old), media_path(&new)) else { return };
+        if let Some(id) = s.selected {
+            crate::preview::release_item(id);
+        }
         if let Err(e) = crate::fileops::move_no_replace(&from, &to) {
             s.status = Some(if e.kind() == std::io::ErrorKind::AlreadyExists {
                 "A file with that name is already in the Media folder. Choose another name.".into()
@@ -975,6 +1028,9 @@ fn rename_selected(s: &mut ManagerState) {
 fn recycle_selected(s: &mut ManagerState) {
     let Some((name, rel)) = library::with(|lib| s.selected_item(lib).map(|i| (i.name.clone(), i.path.clone()))) else { return };
     let Some(path) = media_path(&rel) else { return };
+    if let Some(id) = s.selected {
+        crate::preview::release_item(id);
+    }
     match crate::fileops::recycle(&path) {
         Ok(()) => {
             library::with_mut(|lib| s.confirm_recycle(lib));
@@ -1037,7 +1093,10 @@ extern "system" fn manager_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
     let effect = match msg {
         WM_ERASEBKGND => return LRESULT(1),
         WM_PAINT => {
-            with_view(|v| v.paint());
+            with_view(|v| {
+                let dirty = winutil::update_rect(hwnd, v.dpi);
+                v.paint(dirty)
+            });
             // SAFETY: our own window; marks it painted.
             let _ = unsafe { ValidateRect(Some(hwnd), None) };
             return LRESULT(0);
@@ -1071,6 +1130,12 @@ extern "system" fn manager_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                     add.hover = AddHit::None;
                 }
             });
+            crate::preview::hover(Win::Manager, None);
+            Effect::None
+        }
+        // Minimised: nothing is visible, so previews stop like when hidden.
+        WM_SIZE if wparam.0 as u32 == SIZE_MINIMIZED => {
+            release_previews();
             Effect::None
         }
         WM_LBUTTONDOWN => with_view(|v| {

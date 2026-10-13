@@ -4,11 +4,12 @@
 
 use windows::Win32::Foundation::{D2DERR_RECREATE_TARGET, HWND, RECT};
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_UNKNOWN, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
+    D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_ALPHA_MODE_UNKNOWN, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_FACTORY_TYPE_SINGLE_THREADED,
-    D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES,
+    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES, D2D1_HWND_RENDER_TARGET_PROPERTIES,
+    D2D1_PRESENT_OPTIONS_RETAIN_CONTENTS, D2D1_RENDER_TARGET_PROPERTIES, ID2D1Bitmap,
     D2D1_DASH_STYLE_CUSTOM, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ELLIPSE, D2D1_ROUNDED_RECT, D2D1_STROKE_STYLE_PROPERTIES,
     D2D1CreateFactory, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1SolidColorBrush, ID2D1StrokeStyle,
 };
@@ -21,11 +22,14 @@ use windows::Win32::Graphics::DirectWrite::{
     DWRITE_LINE_SPACING_METHOD_UNIFORM, DWRITE_WORD_WRAPPING_NO_WRAP, DWRITE_WORD_WRAPPING_WRAP, DWriteCreateFactory, IDWriteFactory, IDWriteInlineObject,
     DWRITE_FONT_AXIS_TAG_WEIGHT, DWRITE_FONT_AXIS_VALUE, IDWriteTextFormat, IDWriteTextFormat3, IDWriteTextLayout, IDWriteTextLayout1, DWRITE_TEXT_RANGE,
 };
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN;
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_UNKNOWN};
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 use windows::core::{BOOL, HSTRING, Interface, Result};
 
+use std::cell::RefCell;
+
 use super::layout::{Rect, TextStyle};
+use crate::pixels::Pixels;
 
 /// 0xRRGGBB plus opacity.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -78,6 +82,20 @@ pub struct Gfx {
     /// 3px dash, 2px gap: the wireframe's 1px dashed border.
     dashed: ID2D1StrokeStyle,
     target: Option<(ID2D1HwndRenderTarget, ID2D1SolidColorBrush)>,
+    /// Bitmaps of the pictures drawn in the last full frame (they belong to the
+    /// render target, so they go with it).
+    images: RefCell<Vec<Image>>,
+}
+
+/// Identifies one picture slot: an item id and the thumbnail box size.
+pub type ImageKey = (u32, u32, u32);
+
+struct Image {
+    key: ImageKey,
+    version: u64,
+    size: (u32, u32),
+    bitmap: ID2D1Bitmap,
+    used: bool,
 }
 
 /// Prefer Windows 11's Segoe UI Variable (what the wireframe names), else Segoe UI.
@@ -138,7 +156,7 @@ impl Gfx {
         let dash_props = D2D1_STROKE_STYLE_PROPERTIES { dashStyle: D2D1_DASH_STYLE_CUSTOM, ..Default::default() };
         // SAFETY: plain property struct and a dash array that outlives the call.
         let dashed = unsafe { factory.CreateStrokeStyle(&dash_props, Some(&[3.0, 2.0]))? };
-        Ok(Self { factory, dwrite, formats, dashed, target: None })
+        Ok(Self { factory, dwrite, formats, dashed, target: None, images: RefCell::new(Vec::new()) })
     }
 
     fn format(&self, style: TextStyle) -> &Format {
@@ -214,21 +232,27 @@ impl Gfx {
         m.textPosition as usize + if trailing.as_bool() { m.length as usize } else { 0 }
     }
 
-    /// Draws one frame. `draw` gets a painter in DIPs. A lost device is
-    /// recreated on the next frame.
-    pub fn draw(&mut self, hwnd: HWND, dpi: f32, draw: impl FnOnce(&Painter)) -> Result<()> {
+    /// Draws one frame. `draw` gets a painter in DIPs. With `dirty`, only that
+    /// area is redrawn (the rest of the window keeps its pixels); a new or
+    /// resized target always gets a full frame. A lost device is recreated on
+    /// the next frame.
+    pub fn draw(&mut self, hwnd: HWND, dpi: f32, dirty: Option<Rect>, draw: impl FnOnce(&Painter)) -> Result<()> {
         let mut rc = RECT::default();
         // SAFETY: hwnd is our live window; rc is a local out-parameter.
         unsafe { GetClientRect(hwnd, &mut rc)? };
         let size = D2D_SIZE_U { width: (rc.right - rc.left) as u32, height: (rc.bottom - rc.top) as u32 };
+        let mut dirty = dirty;
         if self.target.is_none() {
+            dirty = None;
+            self.images.borrow_mut().clear();
             let props = D2D1_RENDER_TARGET_PROPERTIES {
                 pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_UNKNOWN, alphaMode: D2D1_ALPHA_MODE_UNKNOWN },
                 dpiX: dpi,
                 dpiY: dpi,
                 ..Default::default()
             };
-            let hwnd_props = D2D1_HWND_RENDER_TARGET_PROPERTIES { hwnd, pixelSize: size, presentOptions: D2D1_PRESENT_OPTIONS_NONE };
+            // Keep the pixels between frames, so a partial frame can redraw one tile.
+            let hwnd_props = D2D1_HWND_RENDER_TARGET_PROPERTIES { hwnd, pixelSize: size, presentOptions: D2D1_PRESENT_OPTIONS_RETAIN_CONTENTS };
             // SAFETY: property structs are fully initialised locals.
             let target = unsafe { self.factory.CreateHwndRenderTarget(&props, &hwnd_props)? };
             // SAFETY: target is live; the color is a plain struct.
@@ -240,17 +264,33 @@ impl Gfx {
         unsafe {
             if target.GetPixelSize() != size {
                 target.Resize(&size)?;
+                dirty = None;
             }
             target.SetDpi(dpi, dpi);
             target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
             target.BeginDraw();
         }
-        draw(&Painter { gfx: self, target, brush });
+        let full = dirty.is_none();
+        if full {
+            self.images.borrow_mut().iter_mut().for_each(|i| i.used = false);
+        }
+        let painter = Painter { gfx: self, target, brush, dirty };
+        if let Some(d) = dirty {
+            painter.push_clip(d);
+            draw(&painter);
+            painter.pop_clip();
+        } else {
+            draw(&painter);
+        }
         // SAFETY: paired with BeginDraw above.
         let result = unsafe { target.EndDraw(None, None) };
+        if full {
+            self.images.borrow_mut().retain(|i| i.used);
+        }
         if let Err(e) = result {
             if e.code() == D2DERR_RECREATE_TARGET {
                 self.target = None;
+                self.images.borrow_mut().clear();
                 return Ok(());
             }
             return Err(e);
@@ -258,9 +298,15 @@ impl Gfx {
         Ok(())
     }
 
+    /// Lets go of every picture bitmap (the window was hidden).
+    pub fn release_images(&mut self) {
+        self.images.borrow_mut().clear();
+    }
+
     /// Releases the render target (e.g. after a DPI change).
     pub fn reset_target(&mut self) {
         self.target = None;
+        self.images.borrow_mut().clear();
     }
 }
 
@@ -269,6 +315,8 @@ pub struct Painter<'a> {
     gfx: &'a Gfx,
     target: &'a ID2D1HwndRenderTarget,
     brush: &'a ID2D1SolidColorBrush,
+    /// The area being redrawn, or None for the whole window.
+    dirty: Option<Rect>,
 }
 
 /// A Direct2D point. The `windows` crate types it as `windows_numerics::Vector2`,
@@ -286,6 +334,70 @@ fn rect_f(r: Rect) -> D2D_RECT_F {
 }
 
 impl Painter<'_> {
+    /// False when `r` lies outside the area being redrawn (nothing to draw).
+    pub fn touches(&self, r: Rect) -> bool {
+        self.dirty.is_none_or(|d| r.x < d.right() && d.x < r.right() && r.y < d.bottom() && d.y < r.bottom())
+    }
+
+    /// True for a full frame (every drawn picture is listed, see thumbs.rs).
+    pub fn is_full(&self) -> bool {
+        self.dirty.is_none()
+    }
+
+    /// Draws `px` (premultiplied BGRA) into `dest`. The bitmap is kept while the
+    /// picture is drawn in every full frame, and refilled when `version` changes.
+    pub fn image(&self, key: ImageKey, version: u64, px: &Pixels, dest: Rect) {
+        let mut images = self.gfx.images.borrow_mut();
+        let found = images.iter().position(|i| i.key == key);
+        if let Some(i) = found {
+            images[i].used = true;
+        }
+        if !self.touches(dest) || px.width == 0 || px.height == 0 {
+            return;
+        }
+        let size = (px.width, px.height);
+        let found = match found {
+            Some(i) if images[i].version == version => Some(i),
+            Some(i) if images[i].size == size => {
+                // SAFETY: the bitmap is `size` big and `px.data` holds exactly that many rows.
+                let ok = unsafe { images[i].bitmap.CopyFromMemory(None, px.data.as_ptr() as *const _, px.width * 4) }.is_ok();
+                if ok {
+                    images[i].version = version;
+                    Some(i)
+                } else {
+                    images.swap_remove(i);
+                    None
+                }
+            }
+            Some(i) => {
+                images.swap_remove(i);
+                None
+            }
+            None => None,
+        };
+        let index = match found {
+            Some(i) => i,
+            None => {
+                let props = D2D1_BITMAP_PROPERTIES {
+                    pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+                    dpiX: 96.0,
+                    dpiY: 96.0,
+                };
+                let wanted = D2D_SIZE_U { width: px.width, height: px.height };
+                // SAFETY: `px.data` is width x height x 4 bytes and outlives the call.
+                let Ok(bitmap) = (unsafe { self.target.CreateBitmap(wanted, Some(px.data.as_ptr() as *const _), px.width * 4, &props) }) else {
+                    return;
+                };
+                images.push(Image { key, version, size, bitmap, used: true });
+                images.len() - 1
+            }
+        };
+        // SAFETY: called during a frame; the bitmap belongs to this target.
+        unsafe {
+            self.target.DrawBitmap(&images[index].bitmap, Some(&rect_f(dest)), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None)
+        };
+    }
+
     fn color(&self, c: Color) {
         // SAFETY: the brush is live for the frame.
         unsafe { self.brush.SetColor(&c.d2d()) };
@@ -297,6 +409,9 @@ impl Painter<'_> {
     }
 
     pub fn fill(&self, r: Rect, radius: f32, c: Color) {
+        if !self.touches(r) {
+            return;
+        }
         self.color(c);
         let rr = D2D1_ROUNDED_RECT { rect: rect_f(r), radiusX: radius, radiusY: radius };
         // SAFETY: called during a frame with a live brush.
@@ -305,6 +420,9 @@ impl Painter<'_> {
 
     /// Stroke drawn inside `r`, like a CSS border.
     pub fn stroke(&self, r: Rect, radius: f32, width: f32, c: Color) {
+        if !self.touches(r.inset(-width)) {
+            return;
+        }
         self.color(c);
         let r = r.inset(width / 2.0);
         let rr = D2D1_ROUNDED_RECT { rect: rect_f(r), radiusX: (radius - width / 2.0).max(0.0), radiusY: (radius - width / 2.0).max(0.0) };
@@ -313,6 +431,10 @@ impl Painter<'_> {
     }
 
     pub fn line(&self, x1: f32, y1: f32, x2: f32, y2: f32, width: f32, c: Color) {
+        let bounds = Rect::new(x1.min(x2), y1.min(y2), (x2 - x1).abs(), (y2 - y1).abs()).inset(-width);
+        if !self.touches(bounds) {
+            return;
+        }
         self.color(c);
         // SAFETY: as above.
         unsafe { self.target.DrawLine(pt(x1, y1), pt(x2, y2), self.brush, width, None) };
@@ -320,6 +442,9 @@ impl Painter<'_> {
 
     /// One line of text in `r`, vertically centred or top-aligned, with "…" when it does not fit.
     pub fn text(&self, s: &str, r: Rect, style: TextStyle, c: Color, align: Align, vcenter: bool) {
+        if !self.touches(r) {
+            return;
+        }
         let Some(layout) = self.gfx.layout(s, style, r.w, r.h) else { return };
         let f = self.gfx.format(style);
         let trimming = DWRITE_TRIMMING { granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER, delimiter: 0, delimiterCount: 0 };
@@ -337,6 +462,9 @@ impl Painter<'_> {
     /// One line of left-aligned, vertically centred text with extra space after
     /// each character (CSS letter-spacing), for the small capitals labels.
     pub fn text_spaced(&self, s: &str, r: Rect, style: TextStyle, c: Color, spacing: f32) {
+        if !self.touches(r) {
+            return;
+        }
         let Some(layout) = self.gfx.layout(s, style, r.w, r.h) else { return };
         let range = DWRITE_TEXT_RANGE { startPosition: 0, length: s.encode_utf16().count() as u32 };
         self.color(c);
@@ -367,6 +495,9 @@ impl Painter<'_> {
 
     /// 1px dashed border inside `r` (CSS `border: 1px dashed`).
     pub fn stroke_dashed(&self, r: Rect, radius: f32, c: Color) {
+        if !self.touches(r) {
+            return;
+        }
         self.color(c);
         let r = r.inset(0.5);
         let rr = D2D1_ROUNDED_RECT { rect: rect_f(r), radiusX: radius - 0.5, radiusY: radius - 0.5 };
@@ -376,6 +507,9 @@ impl Painter<'_> {
 
     /// Filled circle (radio buttons).
     pub fn fill_circle(&self, cx: f32, cy: f32, r: f32, c: Color) {
+        if !self.touches(Rect::new(cx - r, cy - r, r * 2.0, r * 2.0)) {
+            return;
+        }
         self.color(c);
         let e = D2D1_ELLIPSE { point: pt(cx, cy), radiusX: r, radiusY: r };
         // SAFETY: called during a frame with a live brush.

@@ -2,9 +2,8 @@
 //! State lives in `PopupState` and the shared `library`, geometry in
 //! `ui::layout`, drawing in `ui::paint`. Add media is an `AddPanel`.
 //!
-//! The items are fake (Phase 1-2). Clicking or pressing Enter on a tile runs the
-//! Phase 0 paste of the test PNG, and dragging a tile drags the test PNG, so
-//! the transfer risk test keeps working until Phase 4 replaces it.
+//! Tiles show real thumbnails (thumbs.rs); visible GIFs loop and a hovered
+//! video plays (preview.rs). Hiding the popup stops both.
 
 use std::cell::{Cell, RefCell};
 
@@ -25,7 +24,8 @@ use crate::popup_state::{Focus, ListKind, PopupState, TypeFilter};
 use crate::target::{self, NoTarget, Target};
 use crate::ui::add_view::AddHit;
 use crate::ui::d2d::Gfx;
-use crate::ui::layout::{self, COLUMNS, Grid, Hit, HitView, Layout, TextStyle};
+use crate::thumbs::{self, Win};
+use crate::ui::layout::{self, COLUMNS, Grid, Hit, HitView, Layout, Rect, TextStyle};
 use crate::ui::paint::{self, Ui};
 use crate::ui::widgets::TextMetrics;
 use crate::winutil::{self, WM_MOUSELEAVE};
@@ -253,6 +253,7 @@ pub fn close(restore_focus: bool) {
         v.pressed = Hit::None;
         v.scroll_drag = None;
     });
+    release_previews();
     if restore_focus
         && let Ok(t) = app(|a| a.target.borrow().clone())
         && t.still_exists()
@@ -262,6 +263,16 @@ pub fn close(restore_focus: bool) {
     }
     // SAFETY: our own window.
     let _ = unsafe { ShowWindow(hwnd(), SW_HIDE) };
+}
+
+/// The popup is hidden: thumbnail work for it is cancelled and its GIFs and
+/// hover video stop. With Use less memory its picture bitmaps go too.
+fn release_previews() {
+    let profile = crate::store::settings().profile;
+    thumbs::hidden(Win::Popup, profile);
+    if profile == crate::settings_state::Profile::LessMemory {
+        with_view(|v| v.gfx.release_images());
+    }
 }
 
 /// Self-test only: back to the state after start-up (the library is reset separately).
@@ -347,10 +358,12 @@ impl View {
         TextMetrics::for_search(&self.gfx, &self.state.search, &b)
     }
 
-    fn paint(&mut self) {
+    fn paint(&mut self, dirty: Option<Rect>) {
         let area = self.area();
+        thumbs::begin_frame(Win::Popup, self.dpi, dirty.is_none());
         if let Some(add) = self.add.as_ref() {
             add.paint(&mut self.gfx, hwnd(), self.dpi as f32, area);
+            thumbs::end_frame(Win::Popup);
             return;
         }
         let ui = Ui {
@@ -364,9 +377,27 @@ impl View {
         let View { state, gfx, layout, dpi, .. } = self;
         if let Some(layout) = layout.as_ref() {
             library::with(|lib| {
-                let _ = gfx.draw(hwnd(), *dpi as f32, |p| paint::paint(p, state, lib, layout, &ui));
+                let _ = gfx.draw(hwnd(), *dpi as f32, dirty, |p| paint::paint(p, state, lib, layout, &ui));
             });
         }
+        thumbs::end_frame(Win::Popup);
+    }
+
+    /// The video tile under the pointer, when Video preview is Hover only.
+    fn hover_video(&mut self) -> Option<(thumbs::Key, std::path::PathBuf)> {
+        let Hit::Tile(i) = self.hover else { return None };
+        if self.add.is_some() || crate::store::settings().video_preview != crate::settings_state::VideoPreview::HoverOnly {
+            return None;
+        }
+        let (dpi, scroll) = (self.dpi as f32, self.state.scroll);
+        let tile = self.ensure_layout().grid().tile(i, scroll);
+        let media = crate::paths::get()?.media.clone();
+        let (id, rel) = library::with(|lib| {
+            let item = *self.state.visible(lib).get(i)?;
+            (item.kind == crate::sample::MediaKind::Video).then(|| (item.id, item.path.clone()))
+        })?;
+        let key = crate::ui::widgets::thumb_key(id, Layout::thumb(tile), dpi);
+        (!thumbs::is_no_preview(&key)).then(|| (key, crate::import::media_file(&media, &rel)))
     }
 
     /// Click or Enter/Space on a control.
@@ -512,6 +543,8 @@ impl View {
             self.clamp_scroll();
         }
         self.hover = self.hit(x, y);
+        let video = self.hover_video();
+        crate::preview::hover(Win::Popup, video);
     }
 
     fn wheel(&mut self, delta: i16) {
@@ -755,7 +788,10 @@ extern "system" fn popup_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
     let effect = match msg {
         WM_ERASEBKGND => return LRESULT(1),
         WM_PAINT => {
-            with_view(|v| v.paint());
+            with_view(|v| {
+                let dirty = winutil::update_rect(hwnd, v.dpi);
+                v.paint(dirty)
+            });
             // SAFETY: our own window; marks it painted.
             let _ = unsafe { ValidateRect(Some(hwnd), None) };
             return LRESULT(0);
@@ -796,6 +832,7 @@ extern "system" fn popup_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
                     add.hover = AddHit::None;
                 }
             });
+            crate::preview::hover(Win::Popup, None);
             Effect::None
         }
         WM_LBUTTONDOWN => {

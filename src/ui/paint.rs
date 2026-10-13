@@ -94,10 +94,18 @@ fn gallery(p: &Painter, s: &PopupState, lib: &Library, l: &Layout, ui: &Ui) {
     let selected = s.selected_index(lib);
     let grid = l.grid();
     p.push_clip(l.gallery);
+    let margin = grid.row_pitch();
     for (i, item) in items.iter().enumerate() {
         let tile = grid.tile(i, s.scroll);
         if tile.bottom() < l.gallery.y || tile.y > l.gallery.bottom() {
-            continue; // draw only visible tiles
+            // Draw only visible tiles; ask early for the next row each way.
+            if p.is_full() && tile.bottom() >= l.gallery.y - margin && tile.y <= l.gallery.bottom() + margin {
+                widgets::prefetch_tile(item, tile, ui.dpi);
+            }
+            continue;
+        }
+        if !p.touches(tile) {
+            continue; // a partial frame for another tile
         }
         let is_selected = s.focus == Focus::Gallery && selected == Some(i);
         let look = TileLook { selected: is_selected, hovered: ui.hover == Hit::Tile(i), ring: is_selected && s.focus_visible };

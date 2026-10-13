@@ -3,7 +3,9 @@
 //! `test-results` is touched.
 //!
 //! - The library: the wireframe's 8 items as real files with the right pixel
-//!   sizes in their headers, so every earlier screen check still applies.
+//!   sizes, so every earlier screen check still applies. They are
+//!   real media: the GIFs animate, the JPEG and the MP4s decode (made once with
+//!   Windows' own encoders and kept in `test-results\seed-media-v1`).
 //! - An import source with mixed files, duplicates and subfolders.
 
 use std::path::{Path, PathBuf};
@@ -31,6 +33,50 @@ fn item_bytes(item: &Item) -> Vec<u8> {
     }
 }
 
+/// The seed files are made once and kept here (bump the version when the recipe changes).
+const SEED_DIR: &str = "seed-media-v1";
+
+/// A looping GIF whose whole canvas is red, blue, then green, 300 ms each.
+pub fn animated_gif(w: u32, h: u32, tag: &str) -> Vec<u8> {
+    use fixtures::GifFrame;
+    let (w, h) = (w as u16, h as u16);
+    let frames: Vec<GifFrame> = [1, 2, 3].iter().map(|&c| GifFrame::solid(0, 0, w, h, c, 30, 1, None)).collect();
+    fixtures::gif_frames(w, h, &frames, tag)
+}
+
+/// The bytes of a made file, made into `dir` the first time.
+fn made(dir: &Path, name: &str, make: impl FnOnce(&Path) -> Result<(), String>) -> Option<Vec<u8>> {
+    let path = dir.join(name);
+    if !path.exists() {
+        std::fs::create_dir_all(dir).ok()?;
+        // Keeps the extension: the MP4 writer picks its container by it.
+        let tmp = dir.join(format!("tmp-{name}"));
+        if let Err(e) = make(&tmp) {
+            crate::selftest::note(&format!("could not make {name}: {e} (using a header-only stand-in)"));
+            let _ = std::fs::remove_file(&tmp);
+            return None;
+        }
+        std::fs::rename(&tmp, &path).ok()?;
+    }
+    std::fs::read(&path).ok()
+}
+
+/// The real media for one of the wireframe's items.
+fn seed_bytes(item: &Item, dir: &Path) -> Vec<u8> {
+    let (w, h) = (item.width, item.height);
+    match crate::library::extension(&item.name).to_ascii_lowercase().as_str() {
+        ".gif" => animated_gif(w, h, &item.name),
+        ".jpg" => made(dir, &item.name, |p| super::media_gen::jpeg(p, w, h, item.id)).unwrap_or_else(|| item_bytes(item)),
+        ".mp4" => made(dir, &item.name, |p| super::media_gen::mp4(p, w, h, 30, 15, item.id)).unwrap_or_else(|| item_bytes(item)),
+        _ => item_bytes(item),
+    }
+}
+
+/// True when the seed videos are real H.264 files (this Windows has the encoder).
+pub fn real_videos(out: &Path) -> bool {
+    std::fs::read(out.join(SEED_DIR).join("Race clip.mp4")).is_ok_and(|b| b.len() > 4096)
+}
+
 /// Replaces the test library with the 8 example files. Refuses to run anywhere
 /// but the self-test's own folder.
 pub fn reset_library() -> Result<(), String> {
@@ -43,9 +89,10 @@ pub fn reset_library() -> Result<(), String> {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     }
+    let seed_dir = p.root.parent().map(|o| o.join(SEED_DIR)).ok_or("no results folder")?;
     let mut lib = Library::sample();
     for item in &mut lib.items {
-        let bytes = item_bytes(item);
+        let bytes = seed_bytes(item, &seed_dir);
         item.size = bytes.len() as u64;
         std::fs::write(crate::import::media_file(&p.media, &item.path), bytes).map_err(|e| e.to_string())?;
     }

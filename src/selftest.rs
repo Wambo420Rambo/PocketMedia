@@ -38,6 +38,8 @@ use crate::ui::layout::Hit;
 use crate::{StatusKind, WM_SELFTEST, app, exit, manager, popup, test_target};
 
 mod manager_test;
+mod media_gen;
+mod preview_test;
 mod seed;
 mod settings_test;
 mod window_test;
@@ -275,6 +277,7 @@ pub fn on_ui_command(wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             exit();
             0
         }
+        cmd @ preview_test::CMD_PREVIEW_DESCRIBE..=preview_test::CMD_MANAGER_SHOW => preview_test::on_ui_command(cmd, lparam.0),
         _ => 0,
     };
     LRESULT(value)
@@ -727,7 +730,7 @@ fn run_input_tests(r: &mut Report, t: &Session) -> bool {
     }
 
     // 12. The Manager, from a fresh fake library.
-    manager_test::run(r, t) && settings_test::run(r, t) && window_test::run(r, t)
+    manager_test::run(r, t) && settings_test::run(r, t) && window_test::run(r, t) && preview_test::run(r, t)
 }
 
 /// Files in the test library's Media folders (not counting temporary files).

@@ -5,11 +5,14 @@ use std::path::Path;
 
 use windows::Win32::Foundation::GENERIC_READ;
 use windows::Win32::Graphics::Imaging::{
-    CLSID_WICImagingFactory, GUID_WICPixelFormat32bppBGRA, IWICImagingFactory, IWICPalette,
-    WICBitmapDitherTypeNone, WICBitmapPaletteTypeCustom, WICDecodeMetadataCacheOnDemand,
+    CLSID_WICImagingFactory, GUID_WICPixelFormat32bppBGRA, GUID_WICPixelFormat32bppPBGRA, IWICBitmapDecoder,
+    IWICBitmapSource, IWICImagingFactory, IWICPalette, WICBitmapDitherTypeNone, WICBitmapInterpolationModeFant,
+    WICBitmapPaletteTypeCustom, WICDecodeMetadataCacheOnDemand,
 };
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize};
-use windows::core::HSTRING;
+use windows::core::{HSTRING, Interface};
+
+use crate::pixels::{self, Pixels};
 
 /// Larger images are not decoded for the clipboard (the file itself is still offered).
 pub const MAX_PIXELS: u64 = 64 * 1024 * 1024;
@@ -64,5 +67,102 @@ pub fn decode_first_frame(path: &Path) -> Result<Bgra, String> {
         let mut pixels = vec![0u8; (stride * height) as usize];
         converter.CopyPixels(std::ptr::null(), stride, &mut pixels).map_err(fail)?;
         Ok(Bgra { width, height, pixels })
+    }
+}
+
+/// Pictures larger than this are not previewed (a guard against absurd headers).
+const MAX_PREVIEW_PIXELS: u64 = 1 << 30;
+
+/// The WIC factory, kept by a worker thread for all its decoding.
+pub struct Wic(IWICImagingFactory);
+
+impl Wic {
+    /// Needs COM on this thread (`ComThread`).
+    pub fn new() -> Result<Self, String> {
+        // SAFETY: plain COM creation; the factory is owned and released by Drop.
+        unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER) }
+            .map(Wic)
+            .map_err(|e| format!("Windows Imaging Component is not available: {}", e.message()))
+    }
+
+    /// A decoder over our own handle to the file. Rust opens files with
+    /// FILE_SHARE_DELETE, so while a GIF animates the user can still rename it
+    /// or move it to the Recycle Bin. The handle must outlive the decoder.
+    fn open(&self, path: &Path) -> Result<(IWICBitmapDecoder, std::fs::File), String> {
+        use std::os::windows::io::AsRawHandle;
+        let file = std::fs::File::open(path).map_err(|e| format!("could not be opened: {e}"))?;
+        // SAFETY: the handle is valid and open for reading while `file` lives;
+        // callers keep `file` alive longer than the decoder.
+        let decoder = unsafe { self.0.CreateDecoderFromFileHandle(file.as_raw_handle() as usize, std::ptr::null(), WICDecodeMetadataCacheOnDemand) }
+            .map_err(|e| format!("could not be decoded: {}", e.message()))?;
+        Ok((decoder, file))
+    }
+
+    /// Premultiplied BGRA of `source` (already at its final size).
+    fn pbgra(&self, source: &IWICBitmapSource) -> Result<Pixels, String> {
+        let fail = |e: windows::core::Error| format!("could not be decoded: {}", e.message());
+        // SAFETY: COM objects used while alive; `data` is exactly stride x height bytes.
+        unsafe {
+            let converter = self.0.CreateFormatConverter().map_err(fail)?;
+            converter
+                .Initialize(source, &GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, None::<&IWICPalette>, 0.0, WICBitmapPaletteTypeCustom)
+                .map_err(fail)?;
+            let (mut w, mut h) = (0u32, 0u32);
+            converter.GetSize(&mut w, &mut h).map_err(fail)?;
+            let mut data = vec![0u8; (w * 4 * h) as usize];
+            converter.CopyPixels(std::ptr::null(), w * 4, &mut data).map_err(fail)?;
+            Ok(Pixels { width: w, height: h, data })
+        }
+    }
+
+    /// A picture's first frame, shrunk to fit `max_w` x `max_h` (never enlarged).
+    /// WIC's scaler lets JPEG decode at a reduced size, so large photos stay cheap.
+    pub fn picture_thumb(&self, path: &Path, max_w: u32, max_h: u32) -> Result<Pixels, String> {
+        let fail = |e: windows::core::Error| format!("could not be decoded: {}", e.message());
+        let (decoder, _file) = self.open(path)?;
+        // SAFETY: COM objects used while alive; out-pointers are locals.
+        unsafe {
+            let frame = decoder.GetFrame(0).map_err(fail)?;
+            let (mut sw, mut sh) = (0u32, 0u32);
+            frame.GetSize(&mut sw, &mut sh).map_err(fail)?;
+            if sw as u64 * sh as u64 > MAX_PREVIEW_PIXELS {
+                return Err(format!("{sw} x {sh} is too large to preview"));
+            }
+            let (tw, th) = pixels::fit(sw, sh, max_w, max_h);
+            if tw == 0 {
+                return Err("has no pixels".into());
+            }
+            let source: IWICBitmapSource = if (tw, th) == (sw, sh) {
+                frame.cast().map_err(fail)?
+            } else {
+                let scaler = self.0.CreateBitmapScaler().map_err(fail)?;
+                scaler.Initialize(&frame, tw, th, WICBitmapInterpolationModeFant).map_err(fail)?;
+                scaler.cast().map_err(fail)?
+            };
+            self.pbgra(&source)
+        }
+    }
+
+    /// A GIF opened for decoding its frames one at a time.
+    pub fn gif(&self, path: &Path) -> Result<GifFrames<'_>, String> {
+        let (decoder, file) = self.open(path)?;
+        Ok(GifFrames { wic: self, decoder, _file: file })
+    }
+}
+
+pub struct GifFrames<'a> {
+    wic: &'a Wic,
+    // Released before the file it reads (fields drop in this order).
+    decoder: IWICBitmapDecoder,
+    _file: std::fs::File,
+}
+
+impl GifFrames<'_> {
+    /// Frame `index` alone (its own rectangle, not the canvas), premultiplied BGRA.
+    pub fn frame(&self, index: u32) -> Result<Pixels, String> {
+        // SAFETY: the decoder is alive; GetFrame validates the index.
+        let frame = unsafe { self.decoder.GetFrame(index) }.map_err(|e| format!("frame {index}: {}", e.message()))?;
+        let source: IWICBitmapSource = frame.cast().map_err(|e| e.message())?;
+        self.wic.pbgra(&source)
     }
 }

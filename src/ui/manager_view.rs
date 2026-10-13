@@ -440,10 +440,18 @@ fn gallery(p: &Painter, s: &ManagerState, lib: &Library, l: &ManagerLayout, ui: 
     }
     let area = l.grid.area;
     p.push_clip(area);
+    let margin = l.grid.row_pitch();
     for (i, item) in items.iter().enumerate() {
         let tile = l.grid.tile(i, s.scroll);
         if tile.bottom() < area.y || tile.y > area.bottom() {
-            continue; // draw only visible tiles
+            // Draw only visible tiles; ask early for the next row each way.
+            if p.is_full() && tile.bottom() >= area.y - margin && tile.y <= area.bottom() + margin {
+                widgets::prefetch_tile(item, tile, ui.dpi);
+            }
+            continue;
+        }
+        if !p.touches(tile) {
+            continue; // a partial frame for another tile
         }
         let selected = s.selected == Some(item.id);
         let look = TileLook {

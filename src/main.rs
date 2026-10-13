@@ -8,6 +8,8 @@
 //! program, the library file `Data\pocketmedia.json`, import, names on disk,
 //! search and the Recycle Bin.
 //! Real transfer: paste and drag of the library's original files.
+//! Previews: thumbnails with a disk and a RAM cache, GIFs that loop
+//! while visible and a muted hover video.
 
 #![windows_subsystem = "windows"]
 
@@ -16,6 +18,7 @@ mod add_panel;
 mod dialogs;
 mod digest;
 mod fileops;
+mod gif;
 mod import;
 mod jobs;
 mod library;
@@ -25,8 +28,10 @@ mod media_info;
 mod names;
 mod paste;
 mod paths;
+mod pixels;
 mod popup;
 mod popup_state;
+mod preview;
 mod sample;
 mod search;
 mod selftest;
@@ -37,9 +42,12 @@ mod target;
 mod test_png;
 mod test_target;
 mod text_field;
+mod thumb_store;
+mod thumbs;
 mod transfer;
 mod tray;
 mod ui;
+mod video;
 mod wic;
 mod winutil;
 
@@ -345,6 +353,11 @@ extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
                 }
                 LRESULT(0)
             }
+            jobs::WM_PREVIEW => {
+                thumbs::on_wake();
+                preview::on_wake();
+                LRESULT(0)
+            }
             WM_TIMER if wparam.0 == TIMER_PASTE => {
                 paste::tick();
                 LRESULT(0)
@@ -354,6 +367,8 @@ extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
                     let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
                 }
                 let _ = KillTimer(Some(hwnd), TIMER_PASTE);
+                preview::shutdown();
+                thumbs::shutdown();
                 tray::remove(hwnd);
                 manager::destroy();
                 popup::destroy();

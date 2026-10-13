@@ -176,7 +176,7 @@ impl AddPanel {
             _ => (0.0, 0.0),
         };
         let ui = AddUi { hover: self.hover, caret_x, selection_w };
-        let _ = gfx.draw(hwnd, dpi, |p| add_view::paint(p, &self.add, &l, &ui));
+        let _ = gfx.draw(hwnd, dpi, None, |p| add_view::paint(p, &self.add, &l, &ui));
     }
 
     /// The mouse cursor should be an I-beam (over a name field).

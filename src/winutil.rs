@@ -6,7 +6,7 @@ use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
-    ClientToScreen, GetMonitorInfoW, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
+    ClientToScreen, GetMonitorInfoW, GetUpdateRect, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
     ScreenToClient,
 };
 use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
@@ -40,6 +40,37 @@ pub fn invalidate(hwnd: HWND) {
         // SAFETY: an asynchronous repaint request; a stale HWND only makes it fail.
         let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
     }
+}
+
+/// Asks for a repaint of `r` (DIPs) only, rounded out to whole pixels.
+pub fn invalidate_rect(hwnd: HWND, r: Rect, dpi: u32) {
+    if hwnd.is_invalid() {
+        return;
+    }
+    let s = dpi as f32 / 96.0;
+    let rc = RECT {
+        left: (r.x * s).floor() as i32 - 1,
+        top: (r.y * s).floor() as i32 - 1,
+        right: (r.right() * s).ceil() as i32 + 1,
+        bottom: (r.bottom() * s).ceil() as i32 + 1,
+    };
+    // SAFETY: an asynchronous repaint request for a local RECT; a stale HWND only makes it fail.
+    let _ = unsafe { InvalidateRect(Some(hwnd), Some(&rc), false) };
+}
+
+/// The part of the window waiting to be painted, in DIPs, or None when that is
+/// the whole client area. Call it in WM_PAINT before validating.
+pub fn update_rect(hwnd: HWND, dpi: u32) -> Option<Rect> {
+    let (mut rc, mut client) = (RECT::default(), RECT::default());
+    // SAFETY: our own window; out-parameters are locals.
+    let ok = unsafe { GetUpdateRect(hwnd, Some(&mut rc), false).as_bool() && GetClientRect(hwnd, &mut client).is_ok() };
+    let whole = rc.left <= client.left && rc.top <= client.top && rc.right >= client.right && rc.bottom >= client.bottom;
+    if !ok || whole {
+        return None;
+    }
+    let s = 96.0 / dpi.max(1) as f32;
+    let (x, y) = (rc.left as f32 * s, rc.top as f32 * s);
+    Some(Rect::new(x, y, rc.right as f32 * s - x, rc.bottom as f32 * s - y))
 }
 
 pub fn set_capture(hwnd: HWND) {

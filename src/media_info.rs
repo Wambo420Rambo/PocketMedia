@@ -126,6 +126,87 @@ pub mod fixtures {
         b
     }
 
+    /// One frame for `gif_frames`: palette indexes (0-127), top row first.
+    pub struct GifFrame {
+        pub left: u16,
+        pub top: u16,
+        pub width: u16,
+        pub height: u16,
+        pub delay_cs: u16,
+        /// GIF disposal code: 0/1 keep, 2 clear to background, 3 restore previous.
+        pub disposal: u8,
+        pub transparent: Option<u8>,
+        pub pixels: Vec<u8>,
+    }
+
+    impl GifFrame {
+        #[allow(clippy::too_many_arguments)]
+        pub fn solid(left: u16, top: u16, width: u16, height: u16, index: u8, delay_cs: u16, disposal: u8, transparent: Option<u8>) -> Self {
+            let pixels = vec![index & 0x7F; width as usize * height as usize];
+            GifFrame { left, top, width, height, delay_cs, disposal, transparent, pixels }
+        }
+    }
+
+    /// The 128-colour palette `gif_frames` uses, as RGB: 0 black, 1 red, 2 blue,
+    /// 3 green, 4 white, then a spread of colours.
+    pub fn palette(i: u8) -> [u8; 3] {
+        match i {
+            0 => [0, 0, 0],
+            1 => [255, 0, 0],
+            2 => [0, 0, 255],
+            3 => [0, 255, 0],
+            4 => [255, 255, 255],
+            i => [i.wrapping_mul(37), i.wrapping_mul(91), i.wrapping_mul(53)],
+        }
+    }
+
+    /// A real, looping, animated GIF. The image data uses 8-bit LZW codes with a
+    /// clear code every 126 pixels, so it is valid without compressing anything.
+    pub fn gif_frames(w: u16, h: u16, frames: &[GifFrame], tag: &str) -> Vec<u8> {
+        let mut b = b"GIF89a".to_vec();
+        b.extend(w.to_le_bytes());
+        b.extend(h.to_le_bytes());
+        b.extend([0xF6, 0, 0]); // global colour table of 128 entries
+        for i in 0..128u8 {
+            b.extend(palette(i));
+        }
+        b.extend([0x21, 0xFF, 11]);
+        b.extend(b"NETSCAPE2.0");
+        b.extend([3, 1, 0, 0, 0]); // loop forever
+        b.extend([0x21, 0xFE]);
+        for chunk in tag.as_bytes().chunks(255) {
+            b.push(chunk.len() as u8);
+            b.extend(chunk);
+        }
+        b.push(0);
+        for f in frames {
+            let packed = (f.disposal & 7) << 2 | f.transparent.is_some() as u8;
+            b.extend([0x21, 0xF9, 4, packed]);
+            b.extend(f.delay_cs.to_le_bytes());
+            b.extend([f.transparent.unwrap_or(0), 0]);
+            b.push(0x2C);
+            for v in [f.left, f.top, f.width, f.height] {
+                b.extend(v.to_le_bytes());
+            }
+            b.extend([0, 7]); // no local colour table; LZW minimum code size 7
+            let mut codes = vec![128u8];
+            for (i, &p) in f.pixels.iter().enumerate() {
+                if i > 0 && i % 126 == 0 {
+                    codes.push(128);
+                }
+                codes.push(p & 0x7F);
+            }
+            codes.push(129);
+            for chunk in codes.chunks(255) {
+                b.push(chunk.len() as u8);
+                b.extend(chunk);
+            }
+            b.push(0);
+        }
+        b.push(0x3B);
+        b
+    }
+
     /// JPEG markers with a frame header only (enough for the size; not decodable).
     pub fn jpeg(w: u16, h: u16, tag: &str) -> Vec<u8> {
         let mut b = vec![0xFF, 0xD8];

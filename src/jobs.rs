@@ -12,6 +12,8 @@ use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 use crate::import::{self, Copied, CopyRequest, KnownFile, Plan, Source};
 
 pub const WM_JOB: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 3;
+/// Thumbnails or preview frames are ready (thumbs.rs, preview.rs).
+pub const WM_PREVIEW: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 4;
 
 #[derive(Debug)]
 pub enum Event {
@@ -49,6 +51,13 @@ fn post(ev: Event) {
     let main = HWND(MAIN.load(Ordering::SeqCst) as *mut _);
     // SAFETY: posting to our own window; it tolerates a stale handle.
     let _ = unsafe { PostMessageW(Some(main), WM_JOB, WPARAM(0), LPARAM(0)) };
+}
+
+/// Wakes the UI thread with `msg` (from any thread).
+pub fn notify(msg: u32) {
+    let main = HWND(MAIN.load(Ordering::SeqCst) as *mut _);
+    // SAFETY: posting to our own window; it tolerates a stale handle.
+    let _ = unsafe { PostMessageW(Some(main), msg, WPARAM(0), LPARAM(0)) };
 }
 
 /// Everything that arrived since the last call (UI thread).
