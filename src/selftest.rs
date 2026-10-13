@@ -35,7 +35,7 @@ use windows::core::{HSTRING, PCWSTR};
 use crate::popup::TestTarget as Target;
 use crate::ui::add_view::AddHit;
 use crate::ui::layout::Hit;
-use crate::{StatusKind, WM_SELFTEST, app, assets, exit, manager, popup, test_target};
+use crate::{StatusKind, WM_SELFTEST, app, exit, manager, popup, test_target};
 
 mod manager_test;
 mod seed;
@@ -64,6 +64,10 @@ const CMD_FORGET_TARGET: usize = 16;
 const CMD_STORE_DESCRIBE: usize = 17;
 /// Reads the store from disk again, as a restart would, and reloads the Settings page.
 const CMD_STORE_REOPEN: usize = 18;
+/// lparam 0/1: sets Close after inserting (saved, as Settings would).
+const CMD_SET_CLOSE_AFTER: usize = 19;
+/// The next paste fails as if focus never came back.
+const CMD_FAIL_NEXT_PASTE: usize = 20;
 const CONFLICT_TITLE: &str = "PocketMedia - shortcut not available";
 
 static EXIT_CODE: AtomicI32 = AtomicI32::new(0);
@@ -213,6 +217,17 @@ pub fn on_ui_command(wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             if let Ok(mut d) = DESCRIBE.lock() {
                 *d = crate::store::describe();
             }
+            0
+        }
+        CMD_SET_CLOSE_AFTER => {
+            let mut settings = crate::store::settings();
+            settings.close_after_insert = lparam.0 != 0;
+            let _ = crate::store::save_settings(settings);
+            manager::reload_settings();
+            0
+        }
+        CMD_FAIL_NEXT_PASTE => {
+            crate::paste::FAIL_NEXT.store(true, Ordering::Relaxed);
             0
         }
         CMD_STORE_REOPEN => {
@@ -669,22 +684,10 @@ fn run_input_tests(r: &mut Report, t: &Session) -> bool {
     press(&[VK_TAB]);
     t.shot(r, "state-focus-ring");
 
-    // 8. Paste: type a name, Enter -> popup closes -> target receives Ctrl+V.
-    t.click(r, El::Search);
-    if !t.select_all_and_type(r, "square") || !guard(r, &t.allowed) {
+    // 8. Paste the original file of a picture, a GIF and a video into the target.
+    if !paste_tests(r, t) {
         return false;
     }
-    press(&[VK_RETURN]);
-    r.check("paste closes popup", wait_until(1500, || !is_visible(popup)), "");
-    let received = t.out.join("paste-received.png");
-    let got = wait_until(3000, || received.exists());
-    let same = got && std::fs::read(&received).map(|b| b == assets().png).unwrap_or(false);
-    r.check("target received the PNG by paste", same, if got { "bytes compared with the original" } else { "nothing arrived within 3 s" });
-    let formats = std::fs::read_to_string(t.out.join("paste-formats.txt")).unwrap_or_default();
-    let has = |f: &str| formats.lines().any(|l| l == f);
-    r.check("clipboard formats PNG + CF_DIB + CF_HDROP", has("PNG") && has("CF_DIB") && has("CF_HDROP"), &formats.replace('\n', ", "));
-    let (kind, text) = status(main);
-    r.check("app records paste result", kind == 1, &text);
 
     // 9. Drag a tile into the target window.
     if !t.open(r) {
@@ -912,6 +915,10 @@ fn tray_menu_test(r: &mut Report) {
 }
 
 fn drag_test(r: &mut Report, t: &Session) {
+    // The first tile of whichever list is showing.
+    let d = t.describe();
+    let dragged = d.split("names=").nth(1).and_then(|n| n.split('|').next()).unwrap_or("").to_string();
+    let _ = std::fs::remove_file(t.out.join("drop-received.png"));
     let (Some((fx, fy)), Some(to)) = (t.point(El::Tile(0)), window_rect(t.target)) else {
         r.check("drag tile and target found", false, "");
         return;
@@ -951,11 +958,127 @@ fn drag_test(r: &mut Report, t: &Session) {
     mouse_button(false);
     let received = t.out.join("drop-received.png");
     let got = wait_until(4000, || received.exists());
-    let same = got && std::fs::read(&received).map(|b| b == assets().png).unwrap_or(false);
-    r.check("target received the PNG by drag", same, if got { "bytes compared with the original" } else { "nothing dropped within 4 s" });
-    r.check("drag copied, original file kept", assets().file.exists(), &assets().file.display().to_string());
+    let source = media_file(&t.out, &dragged);
+    let original = std::fs::read(&source).ok();
+    let same = got && original.is_some() && std::fs::read(&received).ok() == original;
+    r.check(
+        &format!("target received {dragged} by drag, byte for byte"),
+        same,
+        if got { "bytes compared with the library file" } else { "nothing dropped within 4 s" },
+    );
+    let from = std::fs::read_to_string(t.out.join("drop-source.txt")).unwrap_or_default();
+    r.check("the drag offered the library's own file", from == source.display().to_string(), &from);
+    r.check("drag copied, the library file is kept", source.is_file(), &source.display().to_string());
     let (kind, text) = status(t.main);
     r.check("app records drag result", kind == 1, &text);
+    t.open(r);
+    t.click(r, El::List);
+    t.click(r, El::Row(0));
+    let d = t.describe();
+    r.check("a finished copy-drag goes to the top of Recently used", d.contains(&format!("names={dragged}|")), &d);
+}
+
+/// A library file in the self-test's Media folder, by name.
+fn media_file(out: &Path, name: &str) -> PathBuf {
+    let folder = match crate::media_info::kind_for(name) {
+        Some(k) => k.folder(),
+        None => "",
+    };
+    out.join("app").join("Media").join(folder).join(name)
+}
+
+/// Paste the original file of each kind into the test target, check
+/// the clipboard formats, history, Close after inserting off, and a failed paste.
+fn paste_tests(r: &mut Report, t: &Session) -> bool {
+    let fresh = |t: &Session| {
+        for f in ["paste-formats.txt", "paste-received.png", "paste-hdrop.txt", "paste-dib.txt"] {
+            let _ = std::fs::remove_file(t.out.join(f));
+        }
+    };
+    let paste = |r: &mut Report, t: &Session, query: &str| -> bool {
+        fresh(t);
+        if !t.open(r) {
+            return false;
+        }
+        t.click(r, El::Search);
+        if !t.select_all_and_type(r, query) || !guard(r, &t.allowed) {
+            return false;
+        }
+        press(&[VK_RETURN]);
+        true
+    };
+    // (search, file, formats that must be there, formats that must not)
+    let cases: [(&str, &str, &[&str], &[&str]); 3] = [
+        ("square", "Square.png", &["PNG", "CF_DIB", "CF_HDROP", "Preferred DropEffect"], &[]),
+        ("happy dance", "Happy dance.gif", &["GIF", "CF_HDROP", "Preferred DropEffect"], &["PNG", "CF_DIB"]),
+        ("race clip", "Race clip.mp4", &["CF_HDROP", "Preferred DropEffect"], &["PNG", "CF_DIB", "GIF"]),
+    ];
+    for (query, name, needed, absent) in cases {
+        if !paste(r, t, query) {
+            return false;
+        }
+        r.check(&format!("paste of {name} closes the popup"), wait_until(3000, || !is_visible(t.popup)), "");
+        let formats_file = t.out.join("paste-formats.txt");
+        let got = wait_until(3000, || formats_file.exists());
+        let formats = std::fs::read_to_string(&formats_file).unwrap_or_default();
+        let has = |f: &str| formats.lines().any(|l| l == f);
+        r.check(
+            &format!("{name}: the target received a paste with the right formats"),
+            got && needed.iter().all(|f| has(f)) && !absent.iter().any(|f| has(f)),
+            &formats.replace('\n', ", "),
+        );
+        let file = media_file(&t.out, name);
+        let hdrop = std::fs::read_to_string(t.out.join("paste-hdrop.txt")).unwrap_or_default();
+        r.check(&format!("{name}: the clipboard offers the original file"), hdrop == file.display().to_string(), &hdrop);
+        if name.ends_with(".png") {
+            let png = std::fs::read(t.out.join("paste-received.png")).ok();
+            r.check("the PNG on the clipboard is the original file, byte for byte", png.is_some() && png == std::fs::read(&file).ok(), "");
+            let dib = std::fs::read_to_string(t.out.join("paste-dib.txt")).unwrap_or_default();
+            r.check("the bitmap on the clipboard has the picture's size (300 x 300)", dib == "300 300", &dib);
+        }
+        let (kind, text) = status(t.main);
+        r.check(&format!("{name}: the app records the paste"), kind == 1, &text);
+    }
+    t.open(r);
+    t.click(r, El::List);
+    t.click(r, El::Row(0));
+    t.state_has(
+        r,
+        "pastes go to the top of Recently used, newest first",
+        &["names=Race clip.mp4|Happy dance.gif|Square.png|"],
+    );
+    if guard(r, &t.allowed) {
+        press(&[VK_ESCAPE]);
+    }
+    wait_until(1500, || !is_visible(t.popup));
+
+    // Close after inserting off: the popup stays (without focus), the paste still arrives.
+    send(t.main, CMD_SET_CLOSE_AFTER, 0);
+    if !paste(r, t, "hello") {
+        return false;
+    }
+    let formats_file = t.out.join("paste-formats.txt");
+    let got = wait_until(3000, || formats_file.exists());
+    r.check("with Close after inserting off, the paste still arrives", got, "");
+    r.check("…and the popup stays on screen", is_visible(t.popup), "");
+    r.check("…without taking focus from the app", foreground() == t.target, &describe_foreground());
+    t.shot(r, "state-popup-stays-open");
+    send(t.main, CMD_SET_CLOSE_AFTER, 1);
+    if t.open(r) && guard(r, &t.allowed) {
+        press(&[VK_ESCAPE]);
+    }
+    wait_until(1500, || !is_visible(t.popup));
+
+    // A paste that cannot be sent: the popup comes back and says so.
+    send(t.main, CMD_FAIL_NEXT_PASTE, 0);
+    if !paste(r, t, "wallpaper") {
+        return false;
+    }
+    let back = wait_until(4000, || is_visible(t.popup) && t.describe().contains("Paste didn't go through"));
+    r.check("a failed paste brings the popup back and says so", back, &t.describe());
+    r.check("nothing was sent to the app", !t.out.join("paste-formats.txt").exists(), "");
+    t.shot(r, "state-popup-paste-failed");
+    true
 }
 
 /// The folders beside the program.

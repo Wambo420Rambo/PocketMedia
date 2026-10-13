@@ -128,6 +128,7 @@ impl AddPanel {
                 }
                 self.add.copied(*index, result);
             }
+            Event::Prepared { .. } => {}
             Event::Finished { stopped, .. } => {
                 self.job = None;
                 let mut status = self.add.finish(*stopped);

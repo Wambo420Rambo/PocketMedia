@@ -29,7 +29,7 @@ use crate::ui::layout::{self, COLUMNS, Grid, Hit, HitView, Layout, TextStyle};
 use crate::ui::paint::{self, Ui};
 use crate::ui::widgets::TextMetrics;
 use crate::winutil::{self, WM_MOUSELEAVE};
-use crate::{SHORTCUT_LABEL, StatusKind, app, assets, manager, paste, set_status, transfer};
+use crate::{SHORTCUT_LABEL, StatusKind, app, manager, paste, set_status, transfer};
 
 const EMPTY_ACTIONS: [&str; 3] = ["Clear filters", "Show all media", "Add media"];
 const WHEEL_STEP: f32 = 48.0;
@@ -69,6 +69,9 @@ thread_local! {
     static DRAGGING: Cell<bool> = const { Cell::new(false) };
     /// A picker is open: losing activation to it must not close the popup.
     static MODAL: Cell<bool> = const { Cell::new(false) };
+    /// Close after inserting is off and a paste is handing focus to the target:
+    /// the popup stays on screen.
+    static KEEP_OPEN: Cell<bool> = const { Cell::new(false) };
     static POSITIONING: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -184,6 +187,37 @@ pub fn open(captured: Result<Target, NoTarget>) {
 /// A short line in the popup's footer, in place of the hint (e.g. "Copied to clipboard").
 pub fn show_status(text: &str) {
     with_view(|v| v.state.status = Some(text.into()));
+    invalidate();
+}
+
+/// The item under the gallery selection (the one Enter or a click acts on).
+fn selected_item_id() -> Option<u32> {
+    with_view(|v| library::with(|lib| v.state.selected_index(lib).and_then(|i| v.state.visible(lib).get(i).map(|it| it.id))))
+        .flatten()
+}
+
+/// Keep the popup on screen while a paste hands focus away (Close after inserting off).
+pub fn set_keep_open(on: bool) {
+    KEEP_OPEN.with(|k| k.set(on));
+}
+
+/// Shows the popup again without taking focus, so the target app keeps it.
+fn show_without_focus() {
+    let h = hwnd();
+    // SAFETY: our own window.
+    let _ = unsafe { ShowWindow(h, SW_SHOWNOACTIVATE) };
+    invalidate();
+}
+
+/// A paste did not go through: the popup comes back (without focus) and says so,
+/// so the item can be dragged instead.
+pub fn show_failed(text: &str) {
+    show_status(text);
+    show_without_focus();
+}
+
+/// Repaint after the library changed elsewhere (history after a paste).
+pub fn refresh() {
     invalidate();
 }
 
@@ -644,7 +678,11 @@ fn run(effect: Effect) {
     match effect {
         Effect::None => {}
         Effect::Close(restore) => close(restore),
-        Effect::Activate => paste::begin(),
+        Effect::Activate => {
+            if let Some(id) = selected_item_id() {
+                paste::begin(id);
+            }
+        }
         Effect::TileDown(pt) => {
             invalidate();
             // DragDetect runs its own loop until the pointer passes the system drag
@@ -693,11 +731,21 @@ fn run(effect: Effect) {
 /// Phase 1 stand-in: drags the Phase 0 test PNG (fake items have no files).
 fn drag_out() {
     paste::cancel();
+    let Some(id) = selected_item_id() else { return };
+    let file = library::with(|lib| lib.get(id).map(|i| i.path.clone()))
+        .and_then(|rel| crate::paths::get().map(|p| crate::import::media_file(&p.media, &rel)));
+    let Some(file) = file else { return };
     DRAGGING.with(|d| d.set(true));
-    let result = transfer::drag_file_out(hwnd(), &assets().file);
+    // Copy only: the shell's data object for the file, with DROPEFFECT_COPY alone.
+    let result = transfer::drag_file_out(hwnd(), &file);
     DRAGGING.with(|d| d.set(false));
     match result {
-        Ok(effect) if effect.0 & DROPEFFECT_COPY.0 != 0 => set_status("Drag: the target accepted a copy.", StatusKind::Good),
+        Ok(effect) if effect.0 & DROPEFFECT_COPY.0 != 0 => {
+            set_status("Drag: the target accepted a copy.", StatusKind::Good);
+            // History: recorded when a copy-drag completes.
+            library::with_mut(|lib| lib.record_use(id));
+            let _ = library::persist();
+        }
         Ok(_) => set_status("Drag ended without a drop.", StatusKind::Neutral),
         Err(e) => set_status(e, StatusKind::Bad),
     }
@@ -799,7 +847,8 @@ extern "system" fn popup_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
         WM_ACTIVATE => {
             // Clicking outside closes the popup, except while dragging out of it.
             let inactive = (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE;
-            if inactive && is_visible() && !DRAGGING.with(|d| d.get()) && !MODAL.with(|m| m.get()) {
+            let held = DRAGGING.with(|d| d.get()) || MODAL.with(|m| m.get()) || KEEP_OPEN.with(|k| k.get());
+            if inactive && is_visible() && !held {
                 Effect::Close(false)
             } else {
                 Effect::None

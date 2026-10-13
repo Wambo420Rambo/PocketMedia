@@ -1,6 +1,6 @@
-//! Clipboard, simulated paste and drag-out for the test PNG.
+//! Clipboard, simulated paste and drag-out for library files.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
 use windows::Win32::Graphics::Gdi::{BI_RGB, BITMAPINFOHEADER};
@@ -19,7 +19,6 @@ use windows::Win32::UI::Shell::{
 };
 use windows::core::{PCWSTR, w};
 
-use crate::test_png::{self, TestImage};
 
 pub fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -29,29 +28,75 @@ fn path_wide(path: &Path) -> Vec<u16> {
     to_wide(&path.to_string_lossy())
 }
 
-/// Replaces the clipboard with the test PNG as: "PNG" (encoded file bytes, read by
-/// browsers/Electron/Office), CF_DIB (classic bitmap apps), CF_HDROP (the file
-/// itself, for Explorer and file-attach targets) and Preferred DropEffect = copy.
-pub fn put_on_clipboard(owner: HWND, png: &[u8], image: &TestImage, file: &Path) -> Result<(), String> {
-    let png_format = unsafe { RegisterClipboardFormatW(w!("PNG")) };
-    let effect_format = unsafe { RegisterClipboardFormatW(w!("Preferred DropEffect")) };
-    if png_format == 0 || effect_format == 0 {
-        return Err("Windows refused to register the PNG clipboard formats.".into());
-    }
+/// What goes on the clipboard for one library item. Built off the UI thread by
+/// `prepare` (it reads and decodes files).
+#[derive(Debug, Default)]
+pub struct Payload {
+    /// The original file (CF_HDROP): Explorer, chat and mail apps attach it as is,
+    /// so GIFs stay animated and videos are not converted.
+    pub file: PathBuf,
+    /// "PNG": the original bytes of a PNG file.
+    pub png: Option<Vec<u8>>,
+    /// "JFIF": the original bytes of a JPEG file.
+    pub jfif: Option<Vec<u8>>,
+    /// "GIF": the original bytes of a GIF file (no static picture is offered, so
+    /// an app never pastes a frozen frame instead of the animation).
+    pub gif: Option<Vec<u8>>,
+    /// CF_DIB: the decoded picture, for apps that only take bitmaps (Paint).
+    pub dib: Option<Vec<u8>>,
+}
 
-    let dib = dib_bytes(image);
-    let hdrop = hdrop_bytes(file);
+/// Reads (and for pictures, decodes) a library file for the clipboard.
+/// Worker thread only: COM must be initialised there.
+pub fn prepare(file: &Path) -> Result<Payload, String> {
+    if !file.is_file() {
+        return Err(format!("{} is no longer in the Media folder", file.display()));
+    }
+    let ext = file.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    let read = || std::fs::read(file).map_err(|e| format!("{} could not be read: {e}", file.display()));
+    let decoded = || crate::wic::decode_first_frame(file).ok().map(|b| dib_from_bgra(&b));
+    let mut p = Payload { file: file.to_path_buf(), ..Default::default() };
+    match ext.as_str() {
+        "png" => {
+            p.png = Some(read()?);
+            p.dib = decoded();
+        }
+        "jpg" | "jpeg" => {
+            p.jfif = Some(read()?);
+            p.dib = decoded();
+        }
+        "gif" => p.gif = Some(read()?),
+        _ => {} // videos: the file only
+    }
+    Ok(p)
+}
+
+/// Replaces the clipboard with `p`: the file (CF_HDROP with Preferred DropEffect
+/// = copy), plus the original bytes and a bitmap where they apply.
+pub fn put_on_clipboard(owner: HWND, p: &Payload) -> Result<(), String> {
+    // SAFETY: registering a format name has no preconditions.
+    let reg = |name: windows::core::PCWSTR| unsafe { RegisterClipboardFormatW(name) };
+    let (png_f, jfif_f, gif_f, effect_f) = (reg(w!("PNG")), reg(w!("JFIF")), reg(w!("GIF")), reg(w!("Preferred DropEffect")));
+    if png_f == 0 || jfif_f == 0 || gif_f == 0 || effect_f == 0 {
+        return Err("Windows refused to register the clipboard formats.".into());
+    }
+    let hdrop = hdrop_bytes(&p.file);
     let effect = DROPEFFECT_COPY.0.to_le_bytes();
 
     open_clipboard(owner)?;
     let result = (|| {
+        // SAFETY: the clipboard is open by this thread.
         unsafe { EmptyClipboard() }.map_err(|e| format!("Could not empty the clipboard: {e}"))?;
-        set_data(png_format, png)?;
-        set_data(CF_DIB.0 as u32, &dib)?;
+        for (format, bytes) in [(png_f, &p.png), (jfif_f, &p.jfif), (gif_f, &p.gif), (CF_DIB.0 as u32, &p.dib)] {
+            if let Some(b) = bytes {
+                set_data(format, b)?;
+            }
+        }
         set_data(CF_HDROP.0 as u32, &hdrop)?;
-        set_data(effect_format, &effect)?;
+        set_data(effect_f, &effect)?;
         Ok(())
     })();
+    // SAFETY: closes the clipboard opened above.
     let _ = unsafe { CloseClipboard() };
     result
 }
@@ -89,21 +134,25 @@ fn set_data(format: u32, bytes: &[u8]) -> Result<(), String> {
     }
 }
 
-fn dib_bytes(image: &TestImage) -> Vec<u8> {
-    let pixels = image.bgra_bottom_up();
+/// A 32-bit bottom-up CF_DIB from top-down BGRA pixels.
+pub fn dib_from_bgra(b: &crate::wic::Bgra) -> Vec<u8> {
+    let stride = b.width as usize * 4;
     let header = BITMAPINFOHEADER {
         biSize: size_of::<BITMAPINFOHEADER>() as u32,
-        biWidth: test_png::WIDTH as i32,
-        biHeight: test_png::HEIGHT as i32, // positive = bottom-up
+        biWidth: b.width as i32,
+        biHeight: b.height as i32, // positive = bottom-up
         biPlanes: 1,
         biBitCount: 32,
         biCompression: BI_RGB.0,
-        biSizeImage: pixels.len() as u32,
+        biSizeImage: b.pixels.len() as u32,
         ..Default::default()
     };
-    let mut out = Vec::with_capacity(size_of::<BITMAPINFOHEADER>() + pixels.len());
+    let mut out = Vec::with_capacity(size_of::<BITMAPINFOHEADER>() + b.pixels.len());
+    // SAFETY: BITMAPINFOHEADER is a plain C struct; viewing it as bytes is sound.
     out.extend_from_slice(unsafe { as_bytes(&header) });
-    out.extend_from_slice(&pixels);
+    for row in b.pixels.chunks_exact(stride.max(1)).rev() {
+        out.extend_from_slice(row);
+    }
     out
 }
 
@@ -167,12 +216,38 @@ pub fn drag_file_out(source: HWND, file: &Path) -> Result<DROPEFFECT, String> {
     let wide = path_wide(file);
     unsafe {
         let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None)
-            .map_err(|e| format!("Could not open the test file for dragging: {e}"))?;
+            .map_err(|e| format!("Could not open the file for dragging: {e}"))?;
         let data: IDataObject = item
             .BindToHandler(None, &BHID_DataObject)
             .map_err(|e| format!("Could not create drag data: {e}"))?;
         // No custom IDropSource: the shell supplies its default one and drag image.
         SHDoDragDrop(Some(source), &data, None, DROPEFFECT_COPY)
             .map_err(|e| format!("Drag failed: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dib_rows_are_bottom_up_with_the_right_header() {
+        // 1 x 2: a red top row, a blue bottom row (BGRA).
+        let b = crate::wic::Bgra { width: 1, height: 2, pixels: vec![0, 0, 255, 255, 255, 0, 0, 255] };
+        let dib = dib_from_bgra(&b);
+        let h = size_of::<BITMAPINFOHEADER>();
+        assert_eq!(i32::from_le_bytes(dib[4..8].try_into().unwrap()), 1);
+        assert_eq!(i32::from_le_bytes(dib[8..12].try_into().unwrap()), 2, "positive height: bottom-up");
+        assert_eq!(&dib[h..h + 4], &[255, 0, 0, 255], "the bottom (blue) row comes first");
+        assert_eq!(&dib[h + 4..h + 8], &[0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn hdrop_lists_the_one_file() {
+        let bytes = hdrop_bytes(Path::new("C:\\PocketMedia\\Media\\GIFs\\a.gif"));
+        let offset = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        let wide: Vec<u16> = bytes[offset..].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let text = String::from_utf16_lossy(&wide);
+        assert_eq!(text, "C:\\PocketMedia\\Media\\GIFs\\a.gif\0\0");
     }
 }

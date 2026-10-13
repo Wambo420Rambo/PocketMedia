@@ -178,6 +178,14 @@ impl Library {
         }
     }
 
+    /// Records that an item was used (a paste was started, or a copy-drag
+    /// finished): newest first, 20 distinct items at most.
+    pub fn record_use(&mut self, id: u32) {
+        self.recent.retain(|r| *r != id);
+        self.recent.insert(0, id);
+        self.recent.truncate(crate::store::HISTORY_MAX);
+    }
+
     /// Checks a new name (without extension) for item `id` with the shared name
     /// rules. Its own current name never counts as taken, so changing only the
     /// letter case is allowed.
@@ -266,6 +274,19 @@ mod tests {
         assert!(!lib.recent.contains(&2));
         assert_eq!(lib.items.len(), 7);
         assert_eq!(lib.remove(2), None);
+    }
+
+    #[test]
+    fn history_keeps_20_distinct_items_newest_first() {
+        let mut lib = Library::sample();
+        lib.record_use(5);
+        assert_eq!(lib.recent[..3], [5, 1, 2]);
+        assert_eq!(lib.recent.iter().filter(|r| **r == 5).count(), 1);
+        for id in 100..130 {
+            lib.record_use(id);
+        }
+        assert_eq!(lib.recent.len(), 20);
+        assert_eq!(lib.recent[0], 129);
     }
 
     #[test]

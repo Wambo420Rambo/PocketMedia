@@ -162,6 +162,15 @@ fn clipboard_bytes(format: u32) -> Option<Vec<u8>> {
     }
 }
 
+/// The first path in CF_HDROP (the clipboard must be open).
+fn clipboard_hdrop() -> Option<String> {
+    let bytes = clipboard_bytes(15)?;
+    // DROPFILES: pFiles (offset of the list) is the first u32; fWide at byte 16.
+    let offset = u32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?) as usize;
+    let wide: Vec<u16> = bytes.get(offset..)?.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|u| *u != 0).collect();
+    Some(String::from_utf16_lossy(&wide))
+}
+
 fn on_paste(hwnd: HWND) {
     let Some(_open) = ClipboardOpen::open(hwnd) else {
         set_last("Ctrl+V received, but the clipboard was busy.".into(), hwnd);
@@ -178,6 +187,15 @@ fn on_paste(hwnd: HWND) {
         names.push(format_name(format));
     }
     write_result("paste-formats.txt", names.join("\n").as_bytes());
+    // The file offered with the paste (CF_HDROP), and the bitmap's size (CF_DIB).
+    if let Some(path) = clipboard_hdrop() {
+        write_result("paste-hdrop.txt", path.as_bytes());
+    }
+    if let Some(dib) = clipboard_bytes(8) {
+        let w = dib.get(4..8).map(|b| i32::from_le_bytes(b.try_into().unwrap_or_default())).unwrap_or(0);
+        let h = dib.get(8..12).map(|b| i32::from_le_bytes(b.try_into().unwrap_or_default())).unwrap_or(0);
+        write_result("paste-dib.txt", format!("{w} {h}").as_bytes());
+    }
     // SAFETY: registering a format name has no preconditions.
     let png = unsafe { RegisterClipboardFormatW(w!("PNG")) };
     match clipboard_bytes(png) {

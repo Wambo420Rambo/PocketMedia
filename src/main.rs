@@ -7,6 +7,7 @@
 //! The real library: the Media, Data and Cache folders beside the
 //! program, the library file `Data\pocketmedia.json`, import, names on disk,
 //! search and the Recycle Bin.
+//! Real transfer: paste and drag of the library's original files.
 
 #![windows_subsystem = "windows"]
 
@@ -39,11 +40,11 @@ mod text_field;
 mod transfer;
 mod tray;
 mod ui;
+mod wic;
 mod winutil;
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
-use std::sync::OnceLock;
 
 use windows::Win32::Foundation::{ERROR_HOTKEY_ALREADY_REGISTERED, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -58,27 +59,12 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
 use crate::target::{NoTarget, Target};
-use crate::test_png::TestImage;
 
 pub const WM_TRAY: u32 = WM_APP + 1;
 pub const WM_SELFTEST: u32 = WM_APP + 2;
 const HOTKEY_ID: i32 = 1;
 pub const TIMER_PASTE: usize = 1;
 pub const SHORTCUT_LABEL: &str = "Win + Alt + .";
-
-/// The test PNG, prepared once at startup.
-pub struct Assets {
-    pub image: TestImage,
-    pub bgra_bottom_up: Vec<u8>,
-    pub png: Vec<u8>,
-    pub file: PathBuf,
-}
-
-static ASSETS: OnceLock<Assets> = OnceLock::new();
-
-pub fn assets() -> &'static Assets {
-    ASSETS.get().expect("assets are initialised before the message loop")
-}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum StatusKind {
@@ -188,20 +174,10 @@ fn main() {
         }
     }
 
-    if let Err(e) = prepare_assets() {
-        fatal(&format!("Could not create the test PNG file: {e}"));
-        unsafe { OleUninitialize() };
-        return;
-    }
-
     if let Err(e) = run(&mode) {
         fatal(&e);
     }
 
-    let _ = std::fs::remove_file(&assets().file);
-    if let Some(dir) = assets().file.parent() {
-        let _ = std::fs::remove_dir(dir);
-    }
     unsafe { OleUninitialize() };
     std::process::exit(selftest::exit_code());
 }
@@ -239,14 +215,6 @@ fn load_library(media: &std::path::Path) -> Option<String> {
     })
 }
 
-fn prepare_assets() -> std::io::Result<()> {
-    let image = TestImage::generate();
-    let png = image.encode_png();
-    let file = test_png::write_test_file(&png)?;
-    let bgra_bottom_up = image.bgra_bottom_up();
-    let _ = ASSETS.set(Assets { image, bgra_bottom_up, png, file });
-    Ok(())
-}
 
 fn run(mode: &Mode) -> Result<(), String> {
     app(|a| a.quiet.set(matches!(mode, Mode::SelfTest(_))));
@@ -371,7 +339,7 @@ extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             WM_SELFTEST => selftest::on_ui_command(wparam, lparam),
             jobs::WM_JOB => {
                 for ev in jobs::take() {
-                    if !popup::on_job(&ev) {
+                    if !paste::on_prepared(&ev) && !popup::on_job(&ev) {
                         manager::on_job(&ev);
                     }
                 }

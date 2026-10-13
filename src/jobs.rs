@@ -21,12 +21,14 @@ pub enum Event {
     Copied { job: u64, index: usize, kind: crate::sample::MediaKind, result: Result<Copied, String> },
     /// Every copy is done, or the job was stopped.
     Finished { job: u64, stopped: bool },
+    /// A library item is ready for the clipboard.
+    Prepared { job: u64, result: Result<crate::transfer::Payload, String> },
 }
 
 impl Event {
     pub fn job(&self) -> u64 {
         match self {
-            Event::Planned { job, .. } | Event::Copied { job, .. } | Event::Finished { job, .. } => *job,
+            Event::Planned { job, .. } | Event::Copied { job, .. } | Event::Finished { job, .. } | Event::Prepared { job, .. } => *job,
         }
     }
 }
@@ -103,5 +105,13 @@ pub fn copy(requests: Vec<(usize, CopyRequest)>, media: PathBuf) -> Job {
             post(Event::Copied { job, index, kind: req.kind, result });
         }
         post(Event::Finished { job, stopped: false });
+    })
+}
+
+/// Reads and decodes a library file for the clipboard.
+pub fn prepare(file: PathBuf) -> Job {
+    start(move |job, _cancel| {
+        let _com = crate::wic::ComThread::init();
+        post(Event::Prepared { job, result: crate::transfer::prepare(&file) });
     })
 }
