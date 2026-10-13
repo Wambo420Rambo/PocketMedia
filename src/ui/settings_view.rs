@@ -10,7 +10,7 @@ use super::manager_view::{Frame, FrameHit, FrameLook, paint_border, paint_frame}
 use super::widgets::{self, ACCENT, BG, BORDER, MUTED, SOFT, SURFACE, TEXT};
 use crate::manager_state::Nav;
 use crate::paths;
-use crate::settings_state::{Profile, SFocus, SettingsPage, VideoPreview};
+use crate::settings_state::{BackupPanel, Profile, SFocus, SettingsPage, VideoPreview};
 
 /// The settings column is at most 700 wide; panels leave 10 for the scrollbar gutter.
 const CONTENT_W: f32 = 700.0;
@@ -69,6 +69,80 @@ pub enum SHit {
     Autostart,
     Cancel,
     Save,
+    /// The backup panel's buttons.
+    PanelCancel,
+    PanelOpen,
+    PanelDone,
+}
+
+/// The backup panel over the page (owner's request): a card in the middle of the
+/// content area; everything right of the sidebar is covered.
+pub struct PanelLayout {
+    pub cover: Rect,
+    pub card: Rect,
+    pub title: Rect,
+    /// Running: the bar, its percentage, and two lines (counts, current file).
+    pub bar: Rect,
+    pub percent: Rect,
+    pub line1: Rect,
+    pub line2: Rect,
+    /// Done: the result text.
+    pub text: Rect,
+    /// Right to left: the last button is the rightmost.
+    pub buttons: Vec<(SFocus, Rect)>,
+}
+
+const PANEL_CARD_W: f32 = 460.0;
+const PANEL_PAD_IN: f32 = 22.0;
+
+impl PanelLayout {
+    fn compute(panel: &BackupPanel, cover: Rect, gfx: &Gfx) -> Self {
+        let w = PANEL_CARD_W.min(cover.w - 40.0);
+        let iw = w - 2.0 * PANEL_PAD_IN;
+        let title_h = TextStyle::Title.line();
+        let body_h = match panel {
+            BackupPanel::Running(_) => 8.0 + 14.0 + TextStyle::Small.line() + 4.0 + TextStyle::Small.line(),
+            BackupPanel::Done { text, .. } => gfx.wrapped_height(text, TextStyle::Small, iw),
+        };
+        let h = PANEL_PAD_IN + title_h + 16.0 + body_h + 22.0 + BUTTON_H + PANEL_PAD_IN;
+        let card = Rect::new(cover.x + (cover.w - w) / 2.0, cover.y + ((cover.h - h) / 2.0).max(20.0), w, h);
+        let x = card.x + PANEL_PAD_IN;
+        let title = Rect::new(x, card.y + PANEL_PAD_IN, iw, title_h);
+        let body_y = title.bottom() + 16.0;
+        let percent_w = gfx.measure("100 %", TextStyle::Small) + 4.0;
+        let bar = Rect::new(x, body_y, iw - percent_w - 10.0, 8.0);
+        let percent = Rect::new(bar.right() + 10.0, body_y - 5.0, percent_w, 18.0);
+        let line1 = Rect::new(x, bar.bottom() + 14.0, iw, TextStyle::Small.line());
+        let line2 = Rect::new(x, line1.bottom() + 4.0, iw, TextStyle::Small.line());
+        let text = Rect::new(x, body_y, iw, body_h);
+        let buttons_y = body_y + body_h + 22.0;
+        let mut right = x + iw;
+        let mut buttons = Vec::new();
+        for f in panel.buttons().into_iter().rev() {
+            let label = panel_label(f);
+            let bw = text_button_w(gfx.measure(label, TextStyle::Body));
+            buttons.push((f, Rect::new(right - bw, buttons_y, bw, BUTTON_H)));
+            right -= bw + 8.0;
+        }
+        buttons.reverse();
+        PanelLayout { cover, card, title, bar, percent, line1, line2, text, buttons }
+    }
+}
+
+fn panel_label(f: SFocus) -> &'static str {
+    match f {
+        SFocus::PanelCancel => "Cancel backup",
+        SFocus::PanelOpen => "Open folder",
+        _ => "Done",
+    }
+}
+
+pub fn panel_hit(f: SFocus) -> SHit {
+    match f {
+        SFocus::PanelCancel => SHit::PanelCancel,
+        SFocus::PanelOpen => SHit::PanelOpen,
+        _ => SHit::PanelDone,
+    }
 }
 
 /// A resource-usage choice card.
@@ -114,6 +188,7 @@ pub struct SettingsLayout {
     pub note: Rect,
     pub cancel: Rect,
     pub save: Rect,
+    pub panel: Option<PanelLayout>,
 }
 
 /// Lays out one row starting at `y` (above its separator, if any).
@@ -219,6 +294,8 @@ impl SettingsLayout {
         panels[3] = Rect::new(x0, p3, panel_w, y - p3);
 
         let content_h = y + 18.5 - top;
+        let cover = Rect::new(frame.sidebar.right(), body_y, width - 1.0 - frame.sidebar.right(), height - 1.0 - body_y);
+        let panel = s.backup_panel.as_ref().map(|p| PanelLayout::compute(p, cover, gfx));
         SettingsLayout {
             frame,
             heading,
@@ -242,6 +319,7 @@ impl SettingsLayout {
             note,
             cancel,
             save,
+            panel,
         }
     }
 
@@ -265,13 +343,17 @@ impl SettingsLayout {
             SFocus::Autostart => self.autostart.control,
             SFocus::Cancel => self.cancel,
             SFocus::Save => self.save,
+            SFocus::PanelCancel | SFocus::PanelOpen | SFocus::PanelDone => self.panel.as_ref()?.buttons.iter().find(|(b, _)| *b == f)?.1,
         })
     }
 
     /// Scroll offset that brings `f` fully into the scroll area.
     pub fn scroll_to_show(&self, s: &SettingsPage, f: SFocus) -> f32 {
         let Some(r) = self.focus_rect(s, f) else { return s.scroll };
-        let inside = matches!(f, SFocus::Close | SFocus::QuickPopup | SFocus::Nav(_) | SFocus::Cancel | SFocus::Save);
+        let inside = matches!(
+            f,
+            SFocus::Close | SFocus::QuickPopup | SFocus::Nav(_) | SFocus::Cancel | SFocus::Save | SFocus::PanelCancel | SFocus::PanelOpen | SFocus::PanelDone
+        );
         if inside {
             return s.scroll;
         }
@@ -301,6 +383,10 @@ impl SettingsLayout {
             Some(FrameHit::Caption) => return SHit::Caption,
             Some(FrameHit::Nav(i)) => return SHit::Nav(i),
             None => {}
+        }
+        // The backup panel covers the page: only its buttons answer.
+        if let Some(panel) = &self.panel {
+            return panel.buttons.iter().find(|(_, r)| r.contains(x, y)).map_or(SHit::None, |(f, _)| panel_hit(*f));
         }
         if self.cancel.contains(x, y) {
             return SHit::Cancel;
@@ -426,5 +512,42 @@ pub fn paint(p: &Painter, s: &SettingsPage, l: &SettingsLayout, ui: &SettingsUi)
         let labels = VideoPreview::BOTH.map(VideoPreview::label);
         widgets::menu(p, &l.video_menu, &labels, row, s.draft.video_preview.index());
     }
+    if let (Some(panel), Some(pl)) = (&s.backup_panel, &l.panel) {
+        paint_panel(p, s, panel, pl, ui);
+    }
     paint_border(p, &l.frame);
+}
+
+fn paint_panel(p: &Painter, s: &SettingsPage, panel: &BackupPanel, l: &PanelLayout, ui: &SettingsUi) {
+    p.fill(l.cover, 0.0, BG.alpha(0.82));
+    p.fill(l.card, 8.0, SURFACE);
+    p.stroke(l.card, 8.0, 1.0, BORDER);
+    match panel {
+        BackupPanel::Running(step) => {
+            p.text("Backing up your library", l.title, TextStyle::Title, TEXT, Align::Start, true);
+            p.fill(l.bar, 4.0, BG);
+            p.stroke(l.bar, 4.0, 1.0, BORDER);
+            let f = step.fraction();
+            if f > 0.0 {
+                p.fill(Rect::new(l.bar.x, l.bar.y, (l.bar.w * f).max(8.0), l.bar.h), 4.0, ACCENT);
+            }
+            p.text(&format!("{} %", (f * 100.0).floor() as u32), l.percent, TextStyle::Small, TEXT, Align::End, true);
+            p.text(&step.counts(), l.line1, TextStyle::Small, TEXT, Align::Start, true);
+            p.text(&step.doing(), l.line2, TextStyle::Small, MUTED, Align::Start, true);
+        }
+        BackupPanel::Done { title, text, .. } => {
+            p.text(title, l.title, TextStyle::Title, TEXT, Align::Start, true);
+            p.text_wrapped(text, l.text.x, l.text.y, l.text.w, TextStyle::Small, MUTED);
+        }
+    }
+    let last = l.buttons.len().saturating_sub(1);
+    for (i, (f, r)) in l.buttons.iter().enumerate() {
+        let ring = s.focus_visible && s.focus == *f;
+        let hot = ui.hover == panel_hit(*f);
+        if i == last && *f == SFocus::PanelDone {
+            widgets::primary_button(p, *r, panel_label(*f), true, hot, ring);
+        } else {
+            widgets::button(p, *r, &[panel_label(*f)], hot, ring);
+        }
+    }
 }

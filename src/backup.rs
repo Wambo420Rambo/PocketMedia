@@ -32,9 +32,57 @@ pub const BUSY: &str = "A backup is running. Try again when it has finished.";
 const CHUNK: usize = 1 << 20;
 const RESTORE_NOTE: &str = "How to restore.txt";
 
+/// Where a running backup is, for the progress panel.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Step {
+    /// Files finished, of `total`.
+    pub done: usize,
+    pub total: usize,
+    /// Bytes copied, and bytes read back to check the copies, each of `bytes_total`
+    /// (the library's sizes; a file replaced meanwhile can make them run over).
+    pub copied: u64,
+    pub checked: u64,
+    pub bytes_total: u64,
+    /// The file being copied or checked.
+    pub current: String,
+    pub checking: bool,
+}
+
+impl Step {
+    /// How far along, 0 to 1, for the bar: the average of files done and bytes done
+    /// (copying and checking each count half of the bytes), so it moves with every
+    /// file and still slows down for a large video.
+    pub fn fraction(&self) -> f32 {
+        let files = (self.total > 0).then(|| self.done as f64 / self.total as f64);
+        let bytes = (self.bytes_total > 0).then(|| (self.copied + self.checked) as f64 / (2 * self.bytes_total) as f64);
+        let f = match (files, bytes) {
+            (Some(f), Some(b)) => (f + b) / 2.0,
+            (Some(x), None) | (None, Some(x)) => x,
+            (None, None) => 0.0,
+        };
+        f.clamp(0.0, 1.0) as f32
+    }
+
+    /// "120 of 340 files · 1.2 of 3.4 GB"
+    pub fn counts(&self) -> String {
+        let total = self.bytes_total.max(self.copied);
+        format!("{} of {} files · {} of {}", self.done, self.total, size_text(self.copied), size_text(total))
+    }
+
+    /// "Copying: Happy dance.gif", "Checking: …", then "Writing the library file…".
+    pub fn doing(&self) -> String {
+        match (self.current.is_empty(), self.checking) {
+            (true, _) if self.total > 0 && self.done == self.total => "Writing the library file…".into(),
+            (true, _) => "Getting ready…".into(),
+            (false, false) => format!("Copying: {}", self.current),
+            (false, true) => format!("Checking: {}", self.current),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Progress {
-    Copying { done: usize, total: usize },
+    Copying(Step),
     Finished { folder: PathBuf, files: usize, bytes: u64, left_out: Vec<String> },
     Failed(String),
     Cancelled,
@@ -114,8 +162,8 @@ fn check(cancel: &AtomicBool) -> Result<(), Stop> {
     if cancel.load(Ordering::Relaxed) { Err(Stop::Cancelled) } else { Ok(()) }
 }
 
-/// Runs a backup. `progress(done, total)` is called as files are copied.
-pub fn run(plan: &Plan, digest: NewDigest, cancel: &AtomicBool, progress: &mut dyn FnMut(usize, usize)) -> Progress {
+/// Runs a backup. `progress` is called as files are copied and checked.
+pub fn run(plan: &Plan, digest: NewDigest, cancel: &AtomicBool, progress: &mut dyn FnMut(&Step)) -> Progress {
     let dest = match check_destination(&plan.dest, &plan.root) {
         Ok(d) => d,
         Err(e) => return Progress::Failed(e),
@@ -147,7 +195,7 @@ fn copy_all(
     dest: &Path,
     digest: NewDigest,
     cancel: &AtomicBool,
-    progress: &mut dyn FnMut(usize, usize),
+    progress: &mut dyn FnMut(&Step),
     made: &mut Made,
 ) -> Result<Progress, Stop> {
     let failed = |what: &str, e: &dyn std::fmt::Display| Stop::Failed(format!("{what}: {e}"));
@@ -175,16 +223,29 @@ fn copy_all(
     let mut left_out = Vec::new();
     let mut bytes = 0u64;
     let mut copied = Vec::with_capacity(total);
+    let mut step = Step { total, bytes_total: plan.data.items.iter().map(|i| i.size).sum(), ..Step::default() };
     for (i, item) in plan.data.items.iter().enumerate() {
         check(cancel)?;
-        progress(i, total);
+        step.done = i;
+        step.current.clone_from(&item.name);
+        step.checking = false;
+        progress(&step);
         let src = media_file(&plan.media, &item.path);
         let dst = media_file(&media, &item.path);
         let delay = TEST_DELAY_MS.load(Ordering::Relaxed);
         if delay > 0 {
             std::thread::sleep(Duration::from_millis(delay));
         }
-        match copy_verified(&src, &dst, digest, cancel, made)? {
+        let mut on_bytes = |n: u64, checking: bool| {
+            if checking {
+                step.checked += n;
+            } else {
+                step.copied += n;
+            }
+            step.checking = checking;
+            progress(&step);
+        };
+        match copy_verified(&src, &dst, digest, cancel, made, &mut on_bytes)? {
             None => left_out.push(item.name.clone()),
             Some((size, hash)) => {
                 bytes += size;
@@ -192,7 +253,9 @@ fn copy_all(
             }
         }
     }
-    progress(total, total);
+    step.done = total;
+    step.current.clear();
+    progress(&step);
 
     // The library file lists exactly what was copied, with the sizes and hashes just checked.
     kept.items.retain(|it| copied.iter().any(|(id, _, _)| *id == it.id));
@@ -225,7 +288,7 @@ fn write_new(path: &Path, bytes: &[u8], made: &mut Made) -> io::Result<()> {
     f.sync_all()
 }
 
-fn hash_of(path: &Path, digest: NewDigest, cancel: &AtomicBool) -> Result<String, Stop> {
+fn hash_of(path: &Path, digest: NewDigest, cancel: &AtomicBool, on_bytes: &mut dyn FnMut(u64, bool)) -> Result<String, Stop> {
     let mut f = File::open(path).map_err(|e| Stop::Failed(format!("{} could not be read back: {e}", display_path(path))))?;
     let mut d: Box<dyn Digest> = digest().map_err(Stop::Failed)?;
     let mut buf = vec![0u8; CHUNK];
@@ -236,12 +299,21 @@ fn hash_of(path: &Path, digest: NewDigest, cancel: &AtomicBool) -> Result<String
             return Ok(d.finish());
         }
         d.update(&buf[..n]);
+        on_bytes(n as u64, true);
     }
 }
 
 /// Copies one file and checks the copy. None: the source is gone (removed
 /// outside PocketMedia during the backup).
-fn copy_verified(src: &Path, dst: &Path, digest: NewDigest, cancel: &AtomicBool, made: &mut Made) -> Result<Option<(u64, String)>, Stop> {
+/// `on_bytes(n, checking)` reports each chunk copied, then each chunk read back.
+fn copy_verified(
+    src: &Path,
+    dst: &Path,
+    digest: NewDigest,
+    cancel: &AtomicBool,
+    made: &mut Made,
+    on_bytes: &mut dyn FnMut(u64, bool),
+) -> Result<Option<(u64, String)>, Stop> {
     let name = display_path(src);
     let mut from = match File::open(src) {
         Ok(f) => f,
@@ -263,11 +335,12 @@ fn copy_verified(src: &Path, dst: &Path, digest: NewDigest, cancel: &AtomicBool,
         to.write_all(&buf[..n]).map_err(write_err)?;
         d.update(&buf[..n]);
         size += n as u64;
+        on_bytes(n as u64, false);
     }
     to.sync_all().map_err(write_err)?;
     drop(to);
     let hash = d.finish();
-    if hash_of(dst, digest, cancel)? != hash {
+    if hash_of(dst, digest, cancel, on_bytes)? != hash {
         return Err(Stop::Failed(format!("the copy of {name} does not match the original")));
     }
     Ok(Some((size, hash)))
@@ -301,7 +374,7 @@ pub fn size_text(bytes: u64) -> String {
 /// The line Settings shows for a backup event.
 pub fn describe(p: &Progress) -> String {
     match p {
-        Progress::Copying { done, total } => format!("Backing up… {done} of {total} files"),
+        Progress::Copying(s) => format!("Backing up… {} of {} files", s.done, s.total),
         Progress::Finished { folder, files, bytes, left_out } => {
             let name = folder.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
             let mut s = format!("Backup finished and checked: {files} files ({}) in \"{name}\".", size_text(*bytes));
@@ -347,10 +420,11 @@ pub fn start(dest: PathBuf) -> Result<(), String> {
     WORKING.store(true, Ordering::SeqCst);
     let job = jobs::spawn("backup", move |job, cancel| {
         let mut last = Instant::now() - Duration::from_secs(1);
-        let mut report = |done: usize, total: usize| {
-            if last.elapsed() >= Duration::from_millis(100) || done == total {
+        // At most ten updates a second (and always the last one).
+        let mut report = |step: &Step| {
+            if last.elapsed() >= Duration::from_millis(100) || step.done == step.total {
                 last = Instant::now();
-                jobs::post(Event::Backup { job, progress: Progress::Copying { done, total } });
+                jobs::post(Event::Backup { job, progress: Progress::Copying(step.clone()) });
             }
         };
         let result = run(&plan, crate::sha256::new, cancel, &mut report);
@@ -380,14 +454,14 @@ pub fn on_event(ev: &Event) -> bool {
     if current != Some(*job) {
         return true; // from a backup that already reported its end
     }
-    let done = !matches!(progress, Progress::Copying { .. });
+    let done = !matches!(progress, Progress::Copying(_));
     if done && let Ok(mut j) = JOB.lock() {
         *j = None;
     }
     if let Progress::Finished { folder, left_out, .. } = progress {
         crate::selftest::note(&format!("backup folder: {} (left out: {left_out:?})", display_path(folder)));
     }
-    crate::manager::backup_changed(&describe(progress), !done);
+    crate::manager::backup_changed(progress, &describe(progress), !done);
     true
 }
 
@@ -444,9 +518,9 @@ mod tests {
         Plan { root: root.join("app"), media, data, dest, stamp: "2026-10-13 1620".into() }
     }
 
-    fn run_plan(plan: &Plan) -> (Progress, Vec<(usize, usize)>) {
+    fn run_plan(plan: &Plan) -> (Progress, Vec<Step>) {
         let mut seen = Vec::new();
-        let p = run(plan, fnv, &AtomicBool::new(false), &mut |d, t| seen.push((d, t)));
+        let p = run(plan, fnv, &AtomicBool::new(false), &mut |s| seen.push(s.clone()));
         (p, seen)
     }
 
@@ -458,7 +532,8 @@ mod tests {
         let Progress::Finished { folder, files, bytes, left_out } = p else { panic!("{p:?}") };
         assert_eq!(folder, fs::canonicalize(&plan.dest).unwrap().join("PocketMedia backup 2026-10-13 1620"));
         assert_eq!((files, bytes, left_out.len()), (3, 4 + 3 * CHUNK as u64 + 5 + 2, 0));
-        assert_eq!(seen.last(), Some(&(3, 3)));
+        let last = seen.last().unwrap();
+        assert_eq!((last.done, last.total), (3, 3));
         for rel in ["Pictures/a.png", "GIFs/b.gif", "Videos/c.mp4"] {
             assert_eq!(fs::read(media_file(&folder.join("Media"), rel)).unwrap(), fs::read(media_file(&plan.media, rel)).unwrap(), "{rel}");
         }
@@ -527,13 +602,47 @@ mod tests {
     }
 
     #[test]
+    fn progress_counts_files_and_bytes_and_only_moves_forward() {
+        let root = temp("progress");
+        let mut plan = library(&root);
+        for it in &mut plan.data.items {
+            it.size = fs::metadata(media_file(&plan.media, &it.path)).unwrap().len();
+        }
+        let total: u64 = plan.data.items.iter().map(|i| i.size).sum();
+        let (p, seen) = run_plan(&plan);
+        assert!(matches!(p, Progress::Finished { .. }), "{p:?}");
+        assert!(seen.windows(2).all(|w| w[1].fraction() >= w[0].fraction()), "the bar never goes back");
+        assert!(seen.iter().any(|s| s.current == "a.png" && !s.checking), "it names the file being copied");
+        assert!(seen.iter().any(|s| s.checking), "and says when it checks a copy");
+        let last = seen.last().unwrap();
+        assert_eq!((last.copied, last.checked, last.bytes_total), (total, total, total));
+        assert_eq!(last.fraction(), 1.0);
+        assert_eq!(last.doing(), "Writing the library file…");
+        assert!(last.counts().starts_with("3 of 3 files · "), "{}", last.counts());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn step_text_and_bar() {
+        let s = Step { done: 120, total: 340, copied: 1288490189, checked: 0, bytes_total: 3650722201, current: "Happy dance.gif".into(), checking: false };
+        assert_eq!(s.counts(), "120 of 340 files · 1.2 GB of 3.4 GB");
+        assert_eq!(s.doing(), "Copying: Happy dance.gif");
+        assert!((s.fraction() - (120.0 / 340.0 + 0.176) / 2.0).abs() < 0.01, "{}", s.fraction());
+        let tiny_first = Step { done: 7, total: 156, copied: 8_900, checked: 8_900, bytes_total: 3_460_000, ..Step::default() };
+        assert!(tiny_first.fraction() > 0.02, "small files first still move the bar");
+        let over = Step { copied: 10, checked: 10, bytes_total: 5, ..Step::default() };
+        assert_eq!(over.fraction(), 1.0, "a file that grew never pushes the bar past the end");
+        assert!(over.counts().ends_with("10 bytes of 10 bytes"), "{}", over.counts());
+    }
+
+    #[test]
     fn cancel_removes_what_this_backup_made_and_nothing_else() {
         let root = temp("cancel");
         let plan = library(&root);
         fs::write(plan.dest.join("mine.txt"), b"keep").unwrap();
         let cancel = AtomicBool::new(false);
-        let p = run(&plan, fnv, &cancel, &mut |done, _| {
-            if done == 2 {
+        let p = run(&plan, fnv, &cancel, &mut |s| {
+            if s.done == 2 {
                 cancel.store(true, Ordering::Relaxed);
             }
         });

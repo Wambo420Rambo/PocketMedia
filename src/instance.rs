@@ -1,6 +1,7 @@
 //! One PocketMedia per user: the first launch holds a named mutex;
-//! a later launch finds the running one's window, tells it to show the quick
-//! popup, and exits. A launch from autostart that finds one running just exits.
+//! a later launch finds the running one's window, tells it what to do (show the
+//! quick popup, or with `--backup` open Back up library), and exits. A launch from
+//! autostart that finds one running just exits.
 
 use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, LPARAM, WPARAM};
 use windows::Win32::System::Threading::CreateMutexW;
@@ -33,15 +34,22 @@ pub fn claim() -> Option<Instance> {
     }
 }
 
+/// What a later launch asks for (the message's wParam): show the quick popup.
+pub const SHOW_POPUP: usize = 0;
+/// `--backup` (the uninstaller's Back up library… button): open Settings at Back
+/// up library and its folder picker.
+pub const BACK_UP: usize = 1;
+
 /// The message a later launch sends the running PocketMedia's main window.
 pub fn activate_message() -> u32 {
     // SAFETY: a static name; registering the same name again returns the same id.
     unsafe { RegisterWindowMessageW(w!("PocketMedia.Activate")) }
 }
 
-/// Asks the running PocketMedia to show its popup. It may still be starting, so
-/// its window is looked for for up to 5 seconds. Returns false if not found.
-pub fn activate_running(main_class: windows::core::PCWSTR) -> bool {
+/// Asks the running PocketMedia to do `what` (`SHOW_POPUP` or `BACK_UP`). It may
+/// still be starting, so its window is looked for for up to 5 seconds. Returns
+/// false if not found.
+pub fn activate_running(main_class: windows::core::PCWSTR, what: usize) -> bool {
     let msg = activate_message();
     for _ in 0..50 {
         // SAFETY: a static class name; no window title.
@@ -52,7 +60,7 @@ pub fn activate_running(main_class: windows::core::PCWSTR) -> bool {
                 GetWindowThreadProcessId(h, Some(&mut pid));
                 // Lets the running copy bring its popup to the front.
                 let _ = AllowSetForegroundWindow(pid);
-                return PostMessageW(Some(h), msg, WPARAM(0), LPARAM(0)).is_ok();
+                return PostMessageW(Some(h), msg, WPARAM(what), LPARAM(0)).is_ok();
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(100));

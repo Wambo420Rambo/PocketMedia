@@ -18,6 +18,8 @@ const ROW_PAD: f32 = 13.0;
 const ICON_COL: f32 = 20.0;
 const COL_GAP: f32 = 10.0;
 const ROUTE_W: f32 = 76.0;
+/// The × at the end of each review row (leaves a file out).
+const REMOVE_W: f32 = 28.0;
 const DROP_FILL: Color = Color::rgb(0x232434); // --pm-soft 35% over --pm-bg
 /// The panel is at most this wide and centred, so it reads well in the wide
 /// Manager window too (CSS .pm-import-host max-width).
@@ -31,6 +33,8 @@ pub enum AddHit {
     ChooseFiles,
     ImportExisting,
     RowInput(usize),
+    /// The × that leaves a file out of the import.
+    Remove(usize),
     ChooseAgain,
     Cancel,
     Add,
@@ -44,6 +48,8 @@ pub struct RowGeom {
     pub ext: Rect,
     pub message: Option<(Rect, String)>,
     pub route: Rect,
+    /// The × (while the list can be edited).
+    pub remove: Option<Rect>,
 }
 
 /// Everything positioned for one frame. Content rects are already shifted by scroll.
@@ -131,7 +137,8 @@ impl AddLayout {
         // Review page.
         let summary = Rect::new(x0, top, inner_w, TextStyle::Small.line());
         let name_x = x0 + ICON_COL + COL_GAP;
-        let name_w = inner_w - ICON_COL - COL_GAP - COL_GAP - ROUTE_W;
+        let name_w = inner_w - ICON_COL - COL_GAP - COL_GAP - ROUTE_W - COL_GAP - REMOVE_W;
+        let route_x = x0 + inner_w - REMOVE_W - COL_GAP - ROUTE_W;
         let mut y = summary.bottom() + 12.0;
         let mut rows = Vec::new();
         for row in &a.rows {
@@ -146,8 +153,11 @@ impl AddLayout {
             let r = Rect::new(x0, y, inner_w, ROW_PAD + inner_h + ROW_PAD + 1.0);
             let ext = Rect::new(name_x + name_w - ext_w, y + ROW_PAD, ext_w, INPUT_H);
             let message = msg.map(|m| (Rect::new(name_x, y + ROW_PAD + first_h + 3.0, name_w, msg_h - 3.0), m));
-            let route = Rect::new(x0 + inner_w - ROUTE_W, y + ROW_PAD, ROUTE_W, inner_h);
-            rows.push(RowGeom { row: r, input, ext, message, route });
+            let route = Rect::new(route_x, y + ROW_PAD, ROUTE_W, inner_h);
+            let remove = a
+                .editable()
+                .then(|| Rect::new(x0 + inner_w - REMOVE_W, y + ROW_PAD + (first_h - REMOVE_W) / 2.0, REMOVE_W, REMOVE_W));
+            rows.push(RowGeom { row: r, input, ext, message, route, remove });
             y = r.bottom();
         }
         let note_h = gfx.wrapped_height(NOTE, TextStyle::Small, inner_w);
@@ -208,7 +218,7 @@ impl AddLayout {
 
     pub fn focus_rect(&self, a: &AddMedia) -> Option<Rect> {
         match a.focus {
-            AddFocus::Row(i) => self.rows.get(i).map(|g| g.row),
+            AddFocus::Row(i) | AddFocus::Remove(i) => self.rows.get(i).map(|g| g.row),
             AddFocus::ChooseAgain => Some(self.choose_again),
             AddFocus::ChooseFiles => Some(self.choose_files),
             AddFocus::ImportExisting => Some(self.import_existing),
@@ -241,6 +251,9 @@ impl AddLayout {
             }
             if let Some(i) = self.rows.iter().position(|g| g.input.is_some_and(|r| r.contains(x, y))) {
                 return AddHit::RowInput(i);
+            }
+            if let Some(i) = self.rows.iter().position(|g| g.remove.is_some_and(|r| r.contains(x, y))) {
+                return AddHit::Remove(i);
             }
             if self.choose_again.contains(x, y) {
                 return AddHit::ChooseAgain;
@@ -415,6 +428,10 @@ fn review(
             _ => row.destination(),
         };
         p.text(route, g.route, TextStyle::Small, route_c, Align::End, true);
+        if let Some(r) = g.remove {
+            widgets::quiet_button(p, r, "×", TextStyle::Body, ui.hover == AddHit::Remove(i), true);
+            ring(AddFocus::Remove(i), r, 6.0);
+        }
         p.line(g.row.x, g.row.bottom() - 0.5, g.row.right(), g.row.bottom() - 0.5, 1.0, BORDER);
     }
     p.text_wrapped(NOTE, l.note.x, l.note.y, l.note.w, TextStyle::Small, MUTED);

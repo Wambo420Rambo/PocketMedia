@@ -2,6 +2,7 @@
 //! editable name per file, and progress while copying. No disk access here: the
 //! scan, plan and copies run in `import.rs` on a worker thread (`jobs.rs`).
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use crate::import::{self, Copied, CopyRequest, Plan, Status};
@@ -24,8 +25,11 @@ pub struct ImportRow {
     /// The source file name with extension.
     pub source: String,
     pub path: PathBuf,
+    pub size: u64,
     pub kind: Option<MediaKind>,
     pub status: RowStatus,
+    /// For a row skipped as the same file as an earlier row of this batch: that row.
+    pub dup_of: Option<usize>,
     /// Why a Skip row is skipped.
     pub skip_reason: Option<String>,
     /// Editable name without the extension (copy rows only).
@@ -81,6 +85,8 @@ pub enum AddFocus {
     ChooseFiles,
     ImportExisting,
     Row(usize),
+    /// The × that leaves row `i` out of the import.
+    Remove(usize),
     ChooseAgain,
     Cancel,
     Add,
@@ -156,8 +162,10 @@ impl AddMedia {
                 ImportRow {
                     source: p.cand.name.clone(),
                     path: p.cand.source.clone(),
+                    size: p.cand.size,
                     kind: p.cand.kind,
                     status,
+                    dup_of: None,
                     skip_reason,
                     name,
                     auto_renamed: p.auto_renamed,
@@ -166,6 +174,16 @@ impl AddMedia {
                 }
             })
             .collect();
+        // Link each in-batch duplicate to the earlier row it repeats (same name and
+        // size; the plan already found the content identical).
+        for (i, p) in plan.rows.iter().enumerate() {
+            if let Status::InBatch(name) = &p.status {
+                self.rows[i].dup_of = (0..i).rev().find(|j| {
+                    let r = &self.rows[*j];
+                    r.status == RowStatus::Copy && r.source == *name && r.size == p.cand.size
+                });
+            }
+        }
         self.stage = Stage::Review;
         self.scroll = 0.0;
         // Focus ← rather than the first name: a focused text box always shows its
@@ -181,6 +199,66 @@ impl AddMedia {
         self.stage = Stage::Start;
         self.focus = AddFocus::ChooseFiles;
         self.error = None;
+    }
+
+    /// The × on a review row: leaves that file out of this import (the row goes).
+    /// A later row that was skipped as the same file takes its place, with a free
+    /// name, so that content is still added once. With no rows left, back to the start.
+    pub fn remove(&mut self, i: usize, library: &[&str]) {
+        if self.stage != Stage::Review || i >= self.rows.len() {
+            return;
+        }
+        if self.rows[i].status == RowStatus::Copy {
+            let dups: Vec<usize> = (i + 1..self.rows.len()).filter(|j| self.rows[*j].dup_of == Some(i)).collect();
+            if let Some((&first, rest)) = dups.split_first() {
+                let base = self.free_base(first, i, library);
+                let row = &mut self.rows[first];
+                row.status = RowStatus::Copy;
+                row.skip_reason = None;
+                row.dup_of = None;
+                row.auto_renamed = base.1;
+                row.name = TextField::default();
+                row.name.insert(&base.0);
+                let reason = format!("Same file as {} above", row.source);
+                for &j in rest {
+                    self.rows[j].dup_of = Some(first);
+                    self.rows[j].skip_reason = Some(reason.clone());
+                }
+            }
+        }
+        self.rows.remove(i);
+        for r in &mut self.rows {
+            if let Some(d) = r.dup_of.as_mut()
+                && *d > i
+            {
+                *d -= 1;
+            }
+        }
+        if self.rows.is_empty() {
+            self.reset();
+            return;
+        }
+        self.focus = AddFocus::Remove(i.min(self.rows.len() - 1));
+        self.validate(library);
+    }
+
+    /// Row `row`'s file name, or `name (2)`, `name (3)`… whichever is not taken by
+    /// the library or another row being added (row `leaving` does not count).
+    fn free_base(&self, row: usize, leaving: usize, library: &[&str]) -> (String, bool) {
+        let r = &self.rows[row];
+        let stem = crate::search::name_without_extension(&r.source).trim().to_string();
+        let ext = r.ext().to_lowercase();
+        let mut taken: HashSet<String> = library.iter().map(|n| n.to_lowercase()).collect();
+        for (j, other) in self.rows.iter().enumerate() {
+            if j != leaving && other.status == RowStatus::Copy {
+                taken.insert(format!("{}{}", other.name.text().trim(), other.ext()).to_lowercase());
+            }
+        }
+        let free = |b: &str| !taken.contains(&format!("{b}{ext}").to_lowercase());
+        if free(&stem) {
+            return (stem, false);
+        }
+        (2..1000).map(|n| format!("{stem} ({n})")).find(|b| free(b)).map_or((stem, false), |b| (b, true))
     }
 
     pub fn validate(&mut self, library: &[&str]) {
@@ -321,7 +399,12 @@ impl AddMedia {
         match self.stage {
             Stage::Start => order.extend([AddFocus::ChooseFiles, AddFocus::ImportExisting]),
             Stage::Review => {
-                order.extend((0..self.rows.len()).filter(|i| self.rows[*i].status == RowStatus::Copy).map(AddFocus::Row));
+                for i in 0..self.rows.len() {
+                    if self.rows[i].status == RowStatus::Copy {
+                        order.push(AddFocus::Row(i));
+                    }
+                    order.push(AddFocus::Remove(i));
+                }
                 order.extend([AddFocus::ChooseAgain, AddFocus::Cancel]);
                 if self.can_add() {
                     order.push(AddFocus::Add);
@@ -453,5 +536,82 @@ mod tests {
         rename(&mut a, 0, "Cat");
         a.begin_copy();
         assert_eq!(a.focus_order(), [AddFocus::Close, AddFocus::Back, AddFocus::Cancel]);
+    }
+
+    #[test]
+    fn the_x_leaves_a_file_out() {
+        let mut a = review();
+        a.remove(2, &LIBRARY); // Clip.mp4
+        let names: Vec<&str> = a.rows.iter().map(|r| r.source.as_str()).collect();
+        assert_eq!(names, ["Cat.png", "Wave.gif", "IMG_4821.png", "Portrait.png", "notes.txt"]);
+        assert_eq!(a.summary(), "3 ready to add · 1 duplicate skipped · 1 not supported");
+        assert_eq!(a.add_label(), "Add 3 files");
+        let reqs = a.begin_copy().unwrap();
+        assert!(reqs.iter().all(|(_, r)| r.ext != ".mp4"), "the removed file is not copied");
+    }
+
+    #[test]
+    fn removing_a_bad_row_enables_add_and_skipped_rows_can_go_too() {
+        let mut a = review();
+        rename(&mut a, 3, "Cat"); // collides with row 0
+        assert!(!a.can_add());
+        a.remove(3, &LIBRARY);
+        assert!(a.can_add(), "the collision left with the row");
+        a.remove(4, &LIBRARY); // notes.txt (unsupported)
+        a.remove(3, &LIBRARY); // Portrait.png (already in the library)
+        assert_eq!(a.summary(), "3 ready to add");
+        assert_eq!(a.focus, AddFocus::Remove(2), "focus stays on an × near the removed row");
+    }
+
+    #[test]
+    fn removing_every_row_goes_back_to_the_start() {
+        let mut a = review();
+        while !a.rows.is_empty() {
+            a.remove(0, &LIBRARY);
+        }
+        assert_eq!(a.stage, Stage::Start);
+        assert!(!a.can_add());
+    }
+
+    #[test]
+    fn removing_a_file_promotes_its_duplicate_with_a_free_name() {
+        let big = |name: &str, status: Status, base: &str| {
+            let mut r = row(name, status, base, false);
+            r.cand.size = 7;
+            r
+        };
+        let plan = Plan {
+            rows: vec![
+                big("Dog.png", Status::Copy, "Dog"),
+                big("Cat.png", Status::Copy, "Cat"),
+                // Another folder's Cat.png, same content: skipped as a duplicate.
+                big("Cat.png", Status::InBatch("Cat.png".into()), "Cat"),
+                big("Cat.png", Status::InBatch("Cat.png".into()), "Cat"),
+            ],
+            library_hashes: vec![],
+        };
+        let mut a = AddMedia::new();
+        a.load_plan(&plan, &["Cat.png"]);
+        assert_eq!(a.rows[2].dup_of, Some(1));
+        assert_eq!(a.ready(), 2);
+        a.remove(1, &["Cat.png"]);
+        assert_eq!(a.ready(), 2, "the content is still added once");
+        assert_eq!(a.rows[1].status, RowStatus::Copy);
+        assert_eq!(a.rows[1].name.text(), "Cat (2)", "Cat.png is taken by the library");
+        assert_eq!(a.rows[1].message().as_deref(), Some(AUTO_RENAMED));
+        assert_eq!(a.rows[2].dup_of, Some(1), "the other copy now points at the promoted row");
+        assert!(a.can_add());
+        a.remove(2, &["Cat.png"]);
+        assert_eq!(a.ready(), 2);
+    }
+
+    #[test]
+    fn tab_reaches_each_rows_x() {
+        let a = review();
+        let order = a.focus_order();
+        let pos = |f: AddFocus| order.iter().position(|o| *o == f).unwrap();
+        assert!(pos(AddFocus::Row(0)) < pos(AddFocus::Remove(0)));
+        assert!(pos(AddFocus::Remove(0)) < pos(AddFocus::Row(1)));
+        assert!(order.contains(&AddFocus::Remove(5)), "skipped rows have an × too");
     }
 }

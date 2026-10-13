@@ -12,8 +12,11 @@
 //!   stays on screen without taking focus, and the next paste goes to the same app.
 
 use std::cell::Cell;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use windows::Win32::Foundation::HWND;
+use windows::Win32::System::Ole::DROPEFFECT_COPY;
 use windows::Win32::UI::WindowsAndMessaging::{IsIconic, KillTimer, SW_RESTORE, SetForegroundWindow, SetTimer, ShowWindow};
 
 use crate::jobs::{self, Event};
@@ -31,6 +34,53 @@ thread_local! {
     static PREPARING: Cell<Option<(u64, u32)>> = const { Cell::new(None) };
     /// The item whose Ctrl+V is waiting for focus.
     static PASTING: Cell<Option<u32>> = const { Cell::new(None) };
+    /// Ctrl+C in the Manager: the clipboard job being prepared (job id, item id).
+    static COPYING: Cell<Option<(u64, u32)>> = const { Cell::new(None) };
+}
+
+/// The line the Manager shows after Ctrl+C.
+pub const COPIED_IN_MANAGER: &str = "Copied to clipboard. Paste it with Ctrl+V.";
+
+/// Item `id`'s file in the Media folder.
+fn media_file(id: u32) -> Option<PathBuf> {
+    library::with(|lib| lib.get(id).map(|i| i.path.clone()))
+        .and_then(|rel| crate::paths::get().map(|p| crate::import::media_file(&p.media, &rel)))
+}
+
+/// Ctrl+C in the Manager: puts item `id` on the clipboard with the same formats
+/// as a paste from the popup, and nothing more (no app to paste into, no history).
+/// The result is shown in the Manager. False if the item is gone.
+pub fn copy(id: u32) -> bool {
+    let Some(file) = media_file(id) else { return false };
+    let job = jobs::prepare(file);
+    COPYING.with(|c| c.set(Some((job.id, id))));
+    true
+}
+
+/// How a drag of a library item ended.
+pub enum Dragged {
+    /// The target accepted a copy.
+    Copied,
+    NoDrop,
+    Failed(String),
+}
+
+/// Drags item `id` out of `source` as a copy of its original file (the shell's
+/// data object, copy only). A finished copy-drag goes to Recently used.
+/// Used by the popup and the Manager.
+pub fn drag_item(source: HWND, id: u32) -> Dragged {
+    let Some(file) = media_file(id) else {
+        return Dragged::Failed("That item is no longer in the library.".into());
+    };
+    match transfer::drag_file_out(source, &file) {
+        Ok(effect) if effect.0 & DROPEFFECT_COPY.0 != 0 => {
+            library::with_mut(|lib| lib.record_use(id));
+            let _ = library::persist();
+            Dragged::Copied
+        }
+        Ok(_) => Dragged::NoDrop,
+        Err(e) => Dragged::Failed(e),
+    }
 }
 
 /// Self-test only: the next paste fails as if focus never came back.
@@ -51,9 +101,7 @@ pub fn cancel() {
 /// Click or Enter on a tile: start preparing item `id` for the clipboard.
 pub fn begin(id: u32) {
     cancel();
-    let file = library::with(|lib| lib.get(id).map(|i| i.path.clone()))
-        .and_then(|rel| crate::paths::get().map(|p| crate::import::media_file(&p.media, &rel)));
-    let Some(file) = file else {
+    let Some(file) = media_file(id) else {
         popup::show_status("That item is no longer in the library.");
         return;
     };
@@ -64,6 +112,26 @@ pub fn begin(id: u32) {
 /// A finished clipboard preparation. Returns true if it was a paste job.
 pub fn on_prepared(ev: &Event) -> bool {
     let Event::Prepared { job, result } = ev else { return false };
+    if COPYING.with(|c| c.get()).is_some_and(|(j, _)| j == *job) {
+        COPYING.with(|c| c.set(None));
+        let main = app(|a| a.main.get());
+        let done = match result {
+            Ok(p) => transfer::put_on_clipboard(main, p),
+            Err(e) => Err(e.clone()),
+        };
+        let line = match done {
+            Ok(()) => {
+                set_status("Copied to clipboard from the Manager.", StatusKind::Good);
+                COPIED_IN_MANAGER.to_string()
+            }
+            Err(e) => {
+                set_status(format!("Copy failed: {e}"), StatusKind::Bad);
+                format!("Could not copy: {e}")
+            }
+        };
+        crate::manager::show_status(&line);
+        return true;
+    }
     let Some((_, id)) = PREPARING.with(|p| p.get()).filter(|(j, _)| j == job) else {
         return true; // an older click; a newer one replaced it
     };

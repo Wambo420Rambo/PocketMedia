@@ -4,12 +4,12 @@
 
 use std::time::Duration;
 
-use windows::Win32::UI::Input::KeyboardAndMouse::{VK_A, VK_BACK, VK_CONTROL, VK_ESCAPE, VK_TAB};
+use windows::Win32::UI::Input::KeyboardAndMouse::{VK_A, VK_BACK, VK_C, VK_CONTROL, VK_ESCAPE, VK_TAB, VK_V};
 
 use super::{
     ALL, CMD_FOCUS, CMD_MANAGER, CMD_MANAGER_ADD_POINT, CMD_MANAGER_DESCRIBE, CMD_MANAGER_POINT, CMD_RESET,
-    DESCRIBE, El, Report, Session, capture_screen, describe_foreground, foreground, guard, is_visible, mouse_button,
-    mouse_to, press, save_capture, send, type_unicode, unpack, wait_until, window_rect,
+    DESCRIBE, El, Report, Session, capture_screen, describe_foreground, drag_to_target, foreground, guard, is_visible,
+    media_file, mouse_button, mouse_to, press, save_capture, send, type_unicode, unpack, wait_until, window_rect,
 };
 use crate::ui::manager_view::MHit;
 
@@ -309,6 +309,8 @@ pub(super) fn run(r: &mut Report, t: &Session) -> bool {
         &["total=12", "selected=\"Hello (2).gif\"", "names=Hello (2).gif|IMG_4821.png|Clip.mp4|Wave.gif|Cat.png|", "5 files added"],
     );
 
+    transfer_tests(r, t, &m);
+
     // The popup sees the same library: the rename, the removal and the import.
     if !t.open(r) {
         return false;
@@ -331,4 +333,63 @@ pub(super) fn run(r: &mut Report, t: &Session) -> bool {
     // The UI thread still answers and the (hidden) window still exists.
     r.check("the app is still running after ×", send(t.main, CMD_MANAGER, 0) == hwnd, "");
     true
+}
+
+/// Like the quick popup: Ctrl+C on the selected item puts its
+/// file on the clipboard, and a tile drags out to another app as a copy.
+fn transfer_tests(r: &mut Report, t: &Session, m: &Mgr) {
+    let d = m.describe();
+    let name = d.split("names=").nth(1).and_then(|n| n.split('|').next()).unwrap_or("").to_string();
+    let file = media_file(&t.out, &name);
+
+    // Ctrl+C here, then Ctrl+V in the test target: the target gets the library file.
+    for f in ["paste-formats.txt", "paste-received.png", "paste-hdrop.txt", "paste-dib.txt"] {
+        let _ = std::fs::remove_file(t.out.join(f));
+    }
+    m.click(r, MHit::Tile(0));
+    if !guard(r, &t.allowed) {
+        return;
+    }
+    press(&[VK_CONTROL, VK_C]);
+    let copied = wait_until(4000, || m.describe().contains(crate::paste::COPIED_IN_MANAGER));
+    m.park();
+    m.shot(r, "phase7-manager-copied");
+    send(t.main, CMD_FOCUS, t.target);
+    wait_until(1500, || foreground() == t.target);
+    if guard(r, &t.allowed) {
+        press(&[VK_CONTROL, VK_V]);
+    }
+    let formats = t.out.join("paste-formats.txt");
+    let got = wait_until(4000, || formats.exists());
+    let hdrop = std::fs::read_to_string(t.out.join("paste-hdrop.txt")).unwrap_or_default();
+    r.check(
+        &format!("Ctrl+C in the Manager copies {name}; Ctrl+V in another app gets the library file"),
+        copied && got && hdrop == file.display().to_string(),
+        &format!("status shown: {copied}; target got: {hdrop:?}"),
+    );
+
+    // Drag a tile from the Manager to the test target.
+    send(t.main, CMD_FOCUS, m.hwnd);
+    wait_until(1500, || foreground() == m.hwnd);
+    let _ = std::fs::remove_file(t.out.join("drop-received.png"));
+    let Some(from) = unpack(send(t.main, CMD_MANAGER_POINT, code(MHit::Tile(0)))) else {
+        r.check("find the Manager's first tile", false, "");
+        return;
+    };
+    if !drag_to_target(r, t, from) {
+        return;
+    }
+    let received = t.out.join("drop-received.png");
+    let dropped = wait_until(4000, || received.exists());
+    let same = dropped && std::fs::read(&received).ok().is_some_and(|b| std::fs::read(&file).ok() == Some(b));
+    let from_file = std::fs::read_to_string(t.out.join("drop-source.txt")).unwrap_or_default();
+    r.check(
+        &format!("a tile drags out of the Manager: the target gets {name}, byte for byte"),
+        same && from_file == file.display().to_string(),
+        &from_file,
+    );
+    r.check("…as a copy: the library file stays", file.is_file(), &file.display().to_string());
+    send(t.main, CMD_FOCUS, m.hwnd);
+    wait_until(1500, || foreground() == m.hwnd);
+    m.has(r, "…and the Manager says a copy was dropped", &["Dropped a copy"]);
 }

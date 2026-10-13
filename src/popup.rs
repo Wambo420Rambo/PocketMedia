@@ -9,7 +9,6 @@ use std::cell::{Cell, RefCell};
 
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{ScreenToClient, ValidateRect};
-use windows::Win32::System::Ole::DROPEFFECT_COPY;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     DragDetect, VIRTUAL_KEY, VK_A, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F4, VK_HOME,
@@ -29,7 +28,7 @@ use crate::ui::layout::{self, COLUMNS, Grid, Hit, HitView, Layout, Rect, TextSty
 use crate::ui::paint::{self, Ui};
 use crate::ui::widgets::TextMetrics;
 use crate::winutil::{self, WM_MOUSELEAVE};
-use crate::{SHORTCUT_LABEL, StatusKind, app, manager, paste, set_status, transfer};
+use crate::{SHORTCUT_LABEL, StatusKind, app, manager, paste, set_status};
 
 const EMPTY_ACTIONS: [&str; 3] = ["Clear filters", "Show all media", "Add media"];
 const WHEEL_STEP: f32 = 48.0;
@@ -769,26 +768,18 @@ fn run(effect: Effect) {
     invalidate();
 }
 
-/// Phase 1 stand-in: drags the Phase 0 test PNG (fake items have no files).
+/// Drags the selected item out as a copy of its original file.
 fn drag_out() {
     paste::cancel();
     let Some(id) = selected_item_id() else { return };
-    let file = library::with(|lib| lib.get(id).map(|i| i.path.clone()))
-        .and_then(|rel| crate::paths::get().map(|p| crate::import::media_file(&p.media, &rel)));
-    let Some(file) = file else { return };
+    // While dragging, losing focus must not close the popup.
     DRAGGING.with(|d| d.set(true));
-    // Copy only: the shell's data object for the file, with DROPEFFECT_COPY alone.
-    let result = transfer::drag_file_out(hwnd(), &file);
+    let result = paste::drag_item(hwnd(), id);
     DRAGGING.with(|d| d.set(false));
     match result {
-        Ok(effect) if effect.0 & DROPEFFECT_COPY.0 != 0 => {
-            set_status("Drag: the target accepted a copy.", StatusKind::Good);
-            // History: recorded when a copy-drag completes.
-            library::with_mut(|lib| lib.record_use(id));
-            let _ = library::persist();
-        }
-        Ok(_) => set_status("Drag ended without a drop.", StatusKind::Neutral),
-        Err(e) => set_status(e, StatusKind::Bad),
+        paste::Dragged::Copied => set_status("Drag: the target accepted a copy.", StatusKind::Good),
+        paste::Dragged::NoDrop => set_status("Drag ended without a drop.", StatusKind::Neutral),
+        paste::Dragged::Failed(e) => set_status(e, StatusKind::Bad),
     }
 }
 

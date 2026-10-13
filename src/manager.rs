@@ -12,7 +12,7 @@ use windows::Win32::Graphics::Gdi::{ScreenToClient, ValidateRect};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    VIRTUAL_KEY, VK_A, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F2, VK_F4, VK_HOME, VK_LEFT,
+    DragDetect, VIRTUAL_KEY, VK_A, VK_BACK, VK_C, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F2, VK_F4, VK_HOME, VK_LEFT,
     VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP, VK_V,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -21,7 +21,7 @@ use windows::core::w;
 use crate::add_panel::{AddOutcome, AddPanel, Area};
 use crate::library::{self, Library, extension};
 use crate::manager_state::{MFocus, ManagerState, Nav, Page, Sort};
-use crate::settings_state::{Profile, SFocus, VideoPreview};
+use crate::settings_state::{BackupPanel, Profile, SFocus, VideoPreview};
 use crate::text_field::TextField;
 use crate::ui::add_view::AddHit;
 use crate::ui::d2d::Gfx;
@@ -65,6 +65,10 @@ enum Effect {
     Pick(crate::dialogs::Pick),
     /// Show the folder picker for Back up library (modal).
     PickBackup,
+    /// Pressed on a tile: a drag takes a copy of its file out, like the quick popup.
+    TileDown,
+    /// Ctrl+C: put the item's file on the clipboard, like the quick popup.
+    Copy(u32),
 }
 
 thread_local! {
@@ -169,6 +173,38 @@ pub fn show() {
     winutil::invalidate(h);
 }
 
+/// The uninstaller's Back up library… button (`pocketmedia.exe --backup`): shows
+/// Settings scrolled to Back up library and opens its folder picker, as clicking
+/// the button there does. Unsaved Settings edits and an open Add media panel are
+/// left as they are (the Manager is only shown); a running backup is only shown.
+pub fn back_up_from_uninstaller() {
+    show();
+    if hwnd().is_invalid() {
+        return;
+    }
+    let pick = with_view(|v| {
+        if v.add.is_some() || (v.state.page == Page::Settings && v.state.settings.dirty()) {
+            return false;
+        }
+        library::with(|lib| v.state.navigate(Nav::Settings, lib));
+        v.s_hover = SHit::None;
+        v.state.settings.scroll = 100_000.0;
+        v.clamp_settings_scroll(false);
+        !crate::backup::running()
+    })
+    .unwrap_or(false);
+    winutil::invalidate(hwnd());
+    if pick {
+        run(Effect::PickBackup);
+    }
+}
+
+/// The line under the inspector (copy and drag results). Empty clears it.
+pub fn show_status(text: &str) {
+    with_view(|v| v.state.status = (!text.is_empty()).then(|| text.to_string()));
+    winutil::invalidate(hwnd());
+}
+
 pub fn hide() {
     with_view(|v| {
         v.state.sort_open = None;
@@ -201,10 +237,20 @@ pub fn test_show_state(restore: bool) {
 }
 
 /// Back up library progress or its result, shown beside Save and Cancel.
-pub fn backup_changed(text: &str, running: bool) {
+pub fn backup_changed(progress: &crate::backup::Progress, text: &str, running: bool) {
+    use crate::backup::Progress;
+    let panel = match progress {
+        Progress::Copying(step) => BackupPanel::Running(step.clone()),
+        Progress::Finished { folder, .. } => {
+            BackupPanel::Done { title: "Backup finished".into(), text: text.into(), folder: Some(folder.clone()) }
+        }
+        Progress::Failed(_) => BackupPanel::Done { title: "Backup failed".into(), text: text.into(), folder: None },
+        Progress::Cancelled => BackupPanel::Done { title: "Backup cancelled".into(), text: text.into(), folder: None },
+    };
     with_view(|v| {
         v.state.settings.backup_running = running;
         v.state.settings.show_note(text);
+        v.state.settings.set_backup_panel(panel);
     });
     winutil::invalidate(hwnd());
 }
@@ -521,13 +567,14 @@ impl View {
                 Effect::None
             }
             MHit::Tile(i) => {
-                library::with(|lib| {
+                let picked = library::with(|lib| {
                     let id = self.state.visible(lib).get(i).map(|item| item.id);
                     if let Some(id) = id {
                         self.state.select(id, lib);
                     }
+                    id.is_some()
                 });
-                Effect::None
+                if picked { Effect::TileDown } else { Effect::None }
             }
             MHit::Scrollbar => {
                 self.scroll_drag = Some((y, self.state.scroll));
@@ -646,6 +693,11 @@ impl View {
             }
             _ => {}
         }
+        // Ctrl+C copies the selected item's file, like the quick popup (the text
+        // fields keep their own keys).
+        if ctrl && vk == VK_C && !matches!(s.focus, MFocus::Search | MFocus::RenameInput) {
+            return s.selected_item(lib).map_or(Effect::None, |item| Effect::Copy(item.id));
+        }
         let press = matches!(vk, VK_RETURN | VK_SPACE);
         match s.focus {
             MFocus::Search => {
@@ -756,6 +808,9 @@ impl View {
             SHit::OpenFolder => SFocus::OpenFolder,
             SHit::ChooseFolder => SFocus::ChooseFolder,
             SHit::Backup => SFocus::Backup,
+            SHit::PanelCancel => SFocus::PanelCancel,
+            SHit::PanelOpen => SFocus::PanelOpen,
+            SHit::PanelDone => SFocus::PanelDone,
             SHit::Autostart => SFocus::Autostart,
             SHit::Cancel => SFocus::Cancel,
             SHit::Save => SFocus::Save,
@@ -822,6 +877,20 @@ impl View {
                 st.show_note("Cancelling the backup…");
             }
             SHit::Backup => return Effect::PickBackup,
+            SHit::PanelCancel => {
+                crate::backup::cancel();
+                st.show_note("Cancelling the backup…");
+            }
+            SHit::PanelOpen => {
+                let folder = match &st.backup_panel {
+                    // Without the \\?\ prefix canonicalize adds: File Explorer wants a plain path.
+                    Some(BackupPanel::Done { folder: Some(f), .. }) => std::path::PathBuf::from(crate::import::display_path(f)),
+                    _ => return Effect::None,
+                };
+                let note = open_folder_note(&folder, "the backup");
+                self.state.settings.show_note(&note);
+            }
+            SHit::PanelDone => st.close_backup_panel(),
             SHit::Autostart => st.toggle_autostart(),
             SHit::Cancel => st.cancel(),
             SHit::Save => {
@@ -864,6 +933,11 @@ impl View {
             st.tab(shift);
             return Effect::None;
         }
+        // Escape closes a finished backup's panel (a running backup is stopped only with its button).
+        if vk == VK_ESCAPE && matches!(st.backup_panel, Some(BackupPanel::Done { .. })) {
+            st.focus_visible = true;
+            return self.activate_settings(SHit::PanelDone);
+        }
         let press = matches!(vk, VK_RETURN | VK_SPACE);
         let hit = match st.focus {
             SFocus::Nav(i) => match vk {
@@ -904,6 +978,7 @@ impl View {
                 SFocus::Backup => SHit::Backup,
                 SFocus::Cancel => SHit::Cancel,
                 SFocus::Save => SHit::Save,
+                SFocus::PanelCancel | SFocus::PanelOpen | SFocus::PanelDone => settings_view::panel_hit(focus),
                 _ => SHit::None,
             },
             _ => SHit::None,
@@ -1010,7 +1085,10 @@ fn run(effect: Effect) {
                 None => "Backup cancelled: no folder was chosen.".to_string(),
                 Some(dest) => match crate::backup::start(dest) {
                     Ok(()) => {
-                        with_view(|v| v.state.settings.backup_running = true);
+                        with_view(|v| {
+                            v.state.settings.backup_running = true;
+                            v.state.settings.set_backup_panel(BackupPanel::Running(crate::backup::Step::default()));
+                        });
                         "Backing up…".to_string()
                     }
                     Err(e) => format!("Backup failed: {e}"),
@@ -1018,6 +1096,35 @@ fn run(effect: Effect) {
             };
             with_view(|v| v.state.settings.show_note(&note));
             winutil::invalidate(h);
+        }
+        Effect::TileDown => {
+            let mut pt = POINT::default();
+            // SAFETY: pt is a valid out pointer.
+            let _ = unsafe { GetCursorPos(&mut pt) };
+            // DragDetect runs its own loop until the pointer passes the system drag
+            // threshold (drag) or the button is released (a click: just the selection).
+            // SAFETY: our own window; pt is in screen coordinates.
+            if unsafe { DragDetect(h, pt) }.as_bool() {
+                let id = with_view(|v| library::with(|lib| v.state.selected_item(lib).map(|i| i.id))).flatten();
+                if let Some(id) = id {
+                    match crate::paste::drag_item(h, id) {
+                        crate::paste::Dragged::Copied => {
+                            crate::set_status("Drag from the Manager: the target accepted a copy.", crate::StatusKind::Good);
+                            show_status("Dropped a copy. The original stays in your library.");
+                        }
+                        crate::paste::Dragged::NoDrop => crate::set_status("Drag ended without a drop.", crate::StatusKind::Neutral),
+                        crate::paste::Dragged::Failed(e) => {
+                            crate::set_status(e.clone(), crate::StatusKind::Bad);
+                            show_status(&format!("Could not drag: {e}"));
+                        }
+                    }
+                }
+            }
+        }
+        Effect::Copy(id) => {
+            if !crate::paste::copy(id) {
+                show_status("That item is no longer in the library.");
+            }
         }
         Effect::PasteText => {
             if let Some(text) = winutil::clipboard_text(h) {
@@ -1130,13 +1237,18 @@ fn show_selected_in_explorer(s: &ManagerState) -> Option<String> {
 /// from the test); the path that would open is recorded for `describe`.
 fn open_media_folder() -> String {
     let Some(p) = crate::paths::get() else { return "The Media folder is not set up.".into() };
+    open_folder_note(&p.media, "the Media folder")
+}
+
+/// Opens `folder` in File Explorer (the self-test only records it) and says how it went.
+fn open_folder_note(folder: &std::path::Path, what: &str) -> String {
     if crate::app(|a| a.quiet.get()) {
-        OPENED.with(|o| *o.borrow_mut() = Some(p.media.display().to_string()));
-        return "Opened the Media folder.".into();
+        OPENED.with(|o| *o.borrow_mut() = Some(folder.display().to_string()));
+        return format!("Opened {what}.");
     }
-    match winutil::open_folder(&p.media) {
-        Ok(()) => "Opened the Media folder.".into(),
-        Err(e) => format!("Could not open the Media folder: {e}."),
+    match winutil::open_folder(folder) {
+        Ok(()) => format!("Opened {what}."),
+        Err(e) => format!("Could not open {what}: {e}."),
     }
 }
 
@@ -1359,6 +1471,9 @@ pub fn settings_element_center(hit: SHit) -> Option<POINT> {
             SHit::Autostart => l.autostart.control,
             SHit::Cancel => l.cancel,
             SHit::Save => l.save,
+            SHit::PanelCancel | SHit::PanelOpen | SHit::PanelDone => {
+                l.panel.as_ref()?.buttons.iter().find(|(f, _)| settings_view::panel_hit(*f) == hit)?.1
+            }
             // The empty title bar.
             SHit::None => Rect::new(l.frame.caption.right() + 40.0, l.frame.titlebar.y + 10.0, 1.0, 1.0),
             // Test-only: a spot inside the scroll area but beside every control (for the wheel).
@@ -1402,7 +1517,7 @@ pub fn describe() -> String {
             return format!(
                 "screen=settings profile={:?} video={:?} close_after={} autostart={} saved={:?}/{:?}/{}/{} dirty={} \
                  focus={:?} focus_visible={} video_open={} scroll={:.0} max_scroll={:.0} autostart_visible={} \
-                 line={:?} opened={:?} media={:?} nav_selected={} backup_running={}",
+                 line={:?} opened={:?} media={:?} nav_selected={} backup_running={} panel={}",
                 d.profile,
                 d.video_preview,
                 d.close_after_insert,
@@ -1423,6 +1538,11 @@ pub fn describe() -> String {
                 crate::paths::media_text(),
                 Nav::ORDER.iter().filter(|n| v.state.nav_selected(**n)).map(|n| n.label()).collect::<Vec<_>>().join("+"),
                 st.backup_running,
+                match &st.backup_panel {
+                    None => "none".to_string(),
+                    Some(BackupPanel::Running(step)) => format!("running:{}:{}", step.counts(), step.doing()),
+                    Some(BackupPanel::Done { title, .. }) => format!("done:{title}"),
+                },
             );
         }
         let s = &v.state;

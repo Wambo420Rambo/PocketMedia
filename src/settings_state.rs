@@ -90,6 +90,30 @@ pub enum SFocus {
     Autostart,
     Cancel,
     Save,
+    /// The backup panel's buttons.
+    PanelCancel,
+    PanelOpen,
+    PanelDone,
+}
+
+/// The panel over Settings while a backup runs, and its result afterwards
+/// (shows how the backup is going).
+#[derive(Clone, Debug, PartialEq)]
+pub enum BackupPanel {
+    Running(crate::backup::Step),
+    /// Finished, failed or cancelled. `folder` is the finished backup, to open.
+    Done { title: String, text: String, folder: Option<std::path::PathBuf> },
+}
+
+impl BackupPanel {
+    /// The panel's buttons, in Tab order (the last is the default one).
+    pub fn buttons(&self) -> Vec<SFocus> {
+        match self {
+            BackupPanel::Running(_) => vec![SFocus::PanelCancel],
+            BackupPanel::Done { folder: Some(_), .. } => vec![SFocus::PanelOpen, SFocus::PanelDone],
+            BackupPanel::Done { .. } => vec![SFocus::PanelDone],
+        }
+    }
 }
 
 pub const SAVED: &str = "Settings saved.";
@@ -109,6 +133,8 @@ pub struct SettingsPage {
     pub note: Option<String>,
     /// Back up library is running: its button reads "Cancel backup".
     pub backup_running: bool,
+    /// Shown over the page while it is Some.
+    pub backup_panel: Option<BackupPanel>,
 }
 
 impl Default for SettingsPage {
@@ -133,6 +159,7 @@ impl SettingsPage {
             video_open: None,
             note: None,
             backup_running: false,
+            backup_panel: None,
         }
     }
 
@@ -210,9 +237,34 @@ impl SettingsPage {
         }
     }
 
+    /// Shows the backup panel (or updates it). Focus moves to its default button.
+    pub fn set_backup_panel(&mut self, panel: BackupPanel) {
+        let first = self.backup_panel.as_ref().map(std::mem::discriminant) != Some(std::mem::discriminant(&panel));
+        let buttons = panel.buttons();
+        // Focus moves to the panel when it appears, or when it was on something the
+        // panel covers; the sidebar keeps it otherwise.
+        let sidebar = matches!(self.focus, SFocus::QuickPopup | SFocus::Close | SFocus::Nav(_));
+        if first || !(sidebar || buttons.contains(&self.focus)) {
+            self.focus = *buttons.last().unwrap_or(&SFocus::Backup);
+        }
+        self.video_open = None;
+        self.backup_panel = Some(panel);
+    }
+
+    /// Done on the panel: back to the page, at Back up library.
+    pub fn close_backup_panel(&mut self) {
+        self.backup_panel = None;
+        self.focus = SFocus::Backup;
+    }
+
     pub fn focus_order(&self) -> Vec<SFocus> {
         let mut order = vec![SFocus::QuickPopup, SFocus::Close];
         order.extend((0..5).map(SFocus::Nav));
+        // While the backup panel shows, only the sidebar and its buttons can be reached.
+        if let Some(panel) = &self.backup_panel {
+            order.extend(panel.buttons());
+            return order;
+        }
         order.extend([
             SFocus::Profile,
             SFocus::Video,
@@ -243,6 +295,23 @@ impl SettingsPage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_backup_panel_takes_focus_and_tab_order() {
+        let mut p = SettingsPage::new();
+        p.set_backup_panel(BackupPanel::Running(crate::backup::Step::default()));
+        assert_eq!(p.focus, SFocus::PanelCancel);
+        assert!(!p.focus_order().contains(&SFocus::Backup), "the page under the panel cannot be reached");
+        assert!(p.focus_order().contains(&SFocus::Nav(0)), "the sidebar still can");
+        p.focus = SFocus::Nav(1);
+        p.set_backup_panel(BackupPanel::Running(crate::backup::Step { done: 1, total: 2, ..Default::default() }));
+        assert_eq!(p.focus, SFocus::Nav(1), "progress updates leave focus alone");
+        p.set_backup_panel(BackupPanel::Done { title: "Backup finished".into(), text: "ok".into(), folder: Some("D:/b".into()) });
+        assert_eq!(p.focus, SFocus::PanelDone);
+        assert_eq!(p.focus_order()[7..], [SFocus::PanelOpen, SFocus::PanelDone]);
+        p.close_backup_panel();
+        assert_eq!((p.backup_panel.is_none(), p.focus), (true, SFocus::Backup));
+    }
 
     #[test]
     fn defaults_match_the_goal() {

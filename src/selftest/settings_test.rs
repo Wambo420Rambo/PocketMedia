@@ -40,6 +40,9 @@ pub(super) fn code(h: SHit) -> isize {
         SHit::Autostart => 45,
         SHit::Cancel => 50,
         SHit::Save => 51,
+        SHit::PanelCancel => 60,
+        SHit::PanelOpen => 61,
+        SHit::PanelDone => 62,
     }
 }
 
@@ -60,6 +63,9 @@ pub(super) fn decode(c: isize) -> SHit {
         45 => SHit::Autostart,
         50 => SHit::Cancel,
         51 => SHit::Save,
+        60 => SHit::PanelCancel,
+        61 => SHit::PanelOpen,
+        62 => SHit::PanelDone,
         _ => SHit::None,
     }
 }

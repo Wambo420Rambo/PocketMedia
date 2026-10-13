@@ -233,6 +233,7 @@ impl AddPanel {
                     AddHit::ImportExisting => AddFocus::ImportExisting,
                     AddHit::ChooseAgain => AddFocus::ChooseAgain,
                     AddHit::Cancel => AddFocus::Cancel,
+                    AddHit::Remove(i) => AddFocus::Remove(i),
                     _ => AddFocus::Add,
                 };
                 self.pressed = other;
@@ -276,6 +277,7 @@ impl AddPanel {
             AddHit::Cancel => return AddOutcome::Leave,
             AddHit::Back if !a.reviewing() => return AddOutcome::Leave,
             AddHit::Back | AddHit::ChooseAgain => a.reset(),
+            AddHit::Remove(i) if a.editable() => library::with(|lib| a.remove(i, &lib.names())),
             AddHit::ChooseFiles => return AddOutcome::Pick(Pick::Files),
             AddHit::ImportExisting => return AddOutcome::Pick(Pick::Folder),
             AddHit::Add => {
@@ -365,6 +367,7 @@ impl AddPanel {
                     AddFocus::ChooseAgain => AddHit::ChooseAgain,
                     AddFocus::Cancel => AddHit::Cancel,
                     AddFocus::Add => AddHit::Add,
+                    AddFocus::Remove(i) => AddHit::Remove(i),
                     AddFocus::Row(_) => AddHit::None,
                 };
                 return self.activate(gfx, area, hit);
@@ -427,6 +430,7 @@ impl AddPanel {
             AddHit::ChooseFiles if !a.reviewing() => l.choose_files,
             AddHit::ImportExisting if !a.reviewing() => l.import_existing,
             AddHit::RowInput(i) => l.rows.get(i)?.input?,
+            AddHit::Remove(i) => l.rows.get(i)?.remove?,
             AddHit::ChooseAgain if a.editable() => l.choose_again,
             AddHit::Cancel if a.reviewing() => l.cancel,
             AddHit::Add if a.editable() => l.add,

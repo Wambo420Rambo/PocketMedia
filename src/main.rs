@@ -125,9 +125,10 @@ pub fn set_status(text: impl Into<String>, kind: StatusKind) {
 }
 
 /// Command-line modes. A normal launch has no arguments and opens the popup;
-/// `--autostart` (from the Run key) starts quietly in the tray.
+/// `--autostart` (from the Run key) starts quietly in the tray; `--backup` (the
+/// uninstaller's Back up library… button) opens Settings at Back up library.
 enum Mode {
-    Normal { exit_after_start: bool, autostart: bool },
+    Normal { exit_after_start: bool, autostart: bool, backup: bool },
     SelfTest(PathBuf),
     TestTarget(PathBuf),
     /// Self-test only: load the library beside this copy of the program (as a
@@ -144,9 +145,10 @@ fn parse_mode() -> Mode {
         Some("--self-test") => Mode::SelfTest(path("test-results")),
         Some("--test-target") => Mode::TestTarget(path("test-results")),
         Some("--check-library") => Mode::CheckLibrary(path("check-library.txt")),
-        Some("--exit-after-start") => Mode::Normal { exit_after_start: true, autostart: false },
-        Some(autostart::ARG) => Mode::Normal { exit_after_start: false, autostart: true },
-        _ => Mode::Normal { exit_after_start: false, autostart: false },
+        Some("--exit-after-start") => Mode::Normal { exit_after_start: true, autostart: false, backup: false },
+        Some(autostart::ARG) => Mode::Normal { exit_after_start: false, autostart: true, backup: false },
+        Some("--backup") => Mode::Normal { exit_after_start: false, autostart: false, backup: true },
+        _ => Mode::Normal { exit_after_start: false, autostart: false, backup: false },
     }
 }
 
@@ -192,8 +194,11 @@ fn main() {
                 );
                 std::process::exit(1);
             }
+            Mode::Normal { backup: true, .. } => {
+                instance::activate_running(MAIN_CLASS, instance::BACK_UP);
+            }
             _ => {
-                instance::activate_running(MAIN_CLASS);
+                instance::activate_running(MAIN_CLASS, instance::SHOW_POPUP);
             }
         }
         std::process::exit(0);
@@ -345,6 +350,7 @@ fn run(mode: &Mode) -> Result<(), String> {
         match mode {
             Mode::SelfTest(out) => selftest::start(out.clone(), main),
             Mode::Normal { exit_after_start: true, .. } => exit(),
+            Mode::Normal { backup: true, .. } => manager::back_up_from_uninstaller(),
             Mode::Normal { autostart: false, .. } => popup::open(target::capture_foreground()),
             _ => {}
         }
@@ -448,8 +454,12 @@ extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
                 LRESULT(0)
             }
             m if m != 0 && m == app(|a| a.activate.get()) => {
-                // Another launch of PocketMedia: show the popup of this one.
-                popup::open(target::capture_foreground());
+                // Another launch of PocketMedia: do what it asked, here.
+                if wparam.0 == instance::BACK_UP {
+                    manager::back_up_from_uninstaller();
+                } else {
+                    popup::open(target::capture_foreground());
+                }
                 LRESULT(0)
             }
             m if m != 0 && m == app(|a| a.taskbar_created.get()) => {

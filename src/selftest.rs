@@ -88,6 +88,8 @@ enum El {
     AddChooseFiles,
     AddImportExisting,
     AddRow(usize),
+    /// The × that removes review row `i`.
+    AddRemove(usize),
     AddChooseAgain,
     AddCancel,
     AddAdd,
@@ -112,6 +114,7 @@ impl El {
             El::AddChooseFiles => 200,
             El::AddImportExisting => 201,
             El::AddRow(i) => 210 + i as isize,
+            El::AddRemove(i) => 240 + i as isize,
             El::AddChooseAgain => 230,
             El::AddCancel => 231,
             El::AddAdd => 232,
@@ -132,6 +135,7 @@ impl El {
             200 => AddHit::ChooseFiles,
             201 => AddHit::ImportExisting,
             210..=229 => AddHit::RowInput((code - 210) as usize),
+            240..=259 => AddHit::Remove((code - 240) as usize),
             230 => AddHit::ChooseAgain,
             231 => AddHit::Cancel,
             232 => AddHit::Add,
@@ -821,6 +825,15 @@ fn add_media_test(r: &mut Report, t: &Session) -> bool {
             "rows=Cat.png:ok|Wave.gif:ok|Clip.mp4:ok|IMG_4821.png:ok|Portrait.png:skip|Hello (2).gif:ok-numbered",
         ],
     );
+    // The × leaves a file out; Choose again below brings the full list back.
+    t.click(r, El::AddRemove(2));
+    t.park();
+    t.shot(r, "phase7-add-media-row-removed");
+    t.state_has(
+        r,
+        "the × on a review row leaves that file out",
+        &["stage=review", "label=\"Add 4 files\"", "rows=Cat.png:ok|Wave.gif:ok|IMG_4821.png:ok|Portrait.png:skip|Hello (2).gif:ok-numbered"],
+    );
     t.wheel_at(r, El::AddMain, 10);
     t.park();
     t.shot(r, "focused-12-add-media-files-review-scrolled1");
@@ -947,33 +960,9 @@ fn drag_test(r: &mut Report, t: &Session) {
         r.check("drag test layout", false, "popup overlaps the target window; screen too small");
         return;
     }
-    let (tx, ty) = ((to.left + to.right) / 2, (to.top + to.bottom) / 2);
-    if !guard(r, &t.allowed) {
+    if !drag_to_target(r, t, (fx, fy)) {
         return;
     }
-    mouse_to(fx, fy);
-    std::thread::sleep(Duration::from_millis(150));
-    mouse_button(true);
-    std::thread::sleep(Duration::from_millis(150));
-    for i in 1..=5 {
-        mouse_to(fx + i * 6, fy + i * 2); // past the system drag threshold
-        std::thread::sleep(Duration::from_millis(30));
-    }
-    for i in 1..=15 {
-        mouse_to(fx + (tx - fx) * i / 15, fy + (ty - fy) * i / 15);
-        std::thread::sleep(Duration::from_millis(40));
-    }
-    std::thread::sleep(Duration::from_millis(300));
-    // Only release over our own target; otherwise move back and release over the tile.
-    let over = window_at(tx, ty);
-    if window_pid(over) != window_pid(t.target) {
-        mouse_to(fx, fy);
-        std::thread::sleep(Duration::from_millis(100));
-        mouse_button(false);
-        r.check("drag reaches test target", false, &format!("window under pointer belongs to pid {}", window_pid(over)));
-        return;
-    }
-    mouse_button(false);
     let received = t.out.join("drop-received.png");
     let got = wait_until(4000, || received.exists());
     let source = media_file(&t.out, &dragged);
@@ -994,6 +983,51 @@ fn drag_test(r: &mut Report, t: &Session) {
     t.click(r, El::Row(0));
     let d = t.describe();
     r.check("a finished copy-drag goes to the top of Recently used", d.contains(&format!("names={dragged}|")), &d);
+}
+
+/// Drags from `from` (a tile) to a point of the test target that no other window
+/// covers, and releases there. If the target cannot be reached, the button is
+/// released back over the tile and a FAIL is logged; returns false.
+fn drag_to_target(r: &mut Report, t: &Session, from: (i32, i32)) -> bool {
+    let Some(to) = window_rect(t.target) else {
+        return r.check("drag target found", false, "");
+    };
+    let pid = window_pid(t.target);
+    // The centre first, then a grid over the target (another window may cover part of it).
+    let spot = std::iter::once((4, 4))
+        .chain((1..8).flat_map(|i| (1..8).map(move |j| (i, j))))
+        .map(|(i, j)| (to.left + (to.right - to.left) * i / 8, to.top + (to.bottom - to.top) * j / 8))
+        .find(|&(x, y)| window_pid(window_at(x, y)) == pid);
+    let Some((tx, ty)) = spot else {
+        return r.check("drag reaches test target", false, "other windows cover the whole test target");
+    };
+    let (fx, fy) = from;
+    if !guard(r, &t.allowed) {
+        return false;
+    }
+    mouse_to(fx, fy);
+    std::thread::sleep(Duration::from_millis(150));
+    mouse_button(true);
+    std::thread::sleep(Duration::from_millis(150));
+    for i in 1..=5 {
+        mouse_to(fx + i * 6, fy + i * 2); // past the system drag threshold
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    for i in 1..=15 {
+        mouse_to(fx + (tx - fx) * i / 15, fy + (ty - fy) * i / 15);
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    // Only release over our own target; otherwise move back and release over the tile.
+    let over = window_at(tx, ty);
+    if window_pid(over) != pid {
+        mouse_to(fx, fy);
+        std::thread::sleep(Duration::from_millis(100));
+        mouse_button(false);
+        return r.check("drag reaches test target", false, &format!("window under pointer belongs to pid {}", window_pid(over)));
+    }
+    mouse_button(false);
+    true
 }
 
 /// A library file in the self-test's Media folder, by name.
@@ -1198,6 +1232,32 @@ fn instance_test(r: &mut Report, t: &Session, exe: &Path) {
         &format!("exit code {code:?}, popup visible {}", is_visible(t.popup)),
     );
     r.check("the tray icon and shortcut stay with the running copy", tray_icon_rect(t.main).is_some() && send(t.main, CMD_HOTKEY_OK, 0) == 1, "");
+
+    // The uninstaller's Back up library… button: a launch with --backup shows
+    // Settings at Back up library and opens its folder picker (closed here).
+    let manager = send(t.main, CMD_MANAGER, 0);
+    if is_visible(manager) {
+        post(manager, WM_CLOSE, 0, 0);
+        wait_until(1500, || !is_visible(manager));
+    }
+    crate::dialogs::set_test_backup(None);
+    let describe = || {
+        send(t.main, CMD_MANAGER_DESCRIBE, 0);
+        DESCRIBE.lock().map(|d| d.clone()).unwrap_or_default()
+    };
+    let code = launch(&["--backup"]);
+    let manager = send(t.main, CMD_MANAGER, 0);
+    let done = wait_until(4000, || is_visible(manager) && describe().contains("Backup cancelled: no folder was chosen."));
+    let d = describe();
+    r.check(
+        "a launch with --backup (the uninstaller's Back up library…) opens Settings and the backup folder picker",
+        code == Some(0) && done && d.contains("screen=settings"),
+        &format!("exit code {code:?}; {d}"),
+    );
+    if is_visible(manager) {
+        post(manager, WM_CLOSE, 0, 0);
+        wait_until(1500, || !is_visible(manager));
+    }
 }
 
 // ---------------------------------------------------------------- helpers

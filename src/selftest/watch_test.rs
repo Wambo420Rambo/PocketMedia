@@ -367,23 +367,33 @@ fn backup_tests(r: &mut Report, t: &Session) -> bool {
     crate::dialogs::set_test_backup(Some(not_folder));
     s.click(r, SHit::Backup);
     r.check("a backup that cannot be made reports the failure", note_has(&s, "Backup failed:", 5000), &s.describe());
+    r.check("…in the backup panel, which offers Done", note_has(&s, "panel=done:Backup failed", 2000), &s.describe());
+    s.click(r, SHit::PanelDone);
+    r.check("Done closes the panel", note_has(&s, "panel=none", 2000), &s.describe());
 
     // Cancel while copying (each file is slowed down so there is time to press it).
     crate::dialogs::set_test_backup(Some(dest.clone()));
     crate::backup::TEST_DELAY_MS.store(60, Ordering::SeqCst);
     s.click(r, SHit::Backup);
     let running = note_has(&s, "Backing up", 3000) && s.describe().contains("backup_running=true");
-    r.check("Back up library runs and shows its progress; the button becomes Cancel backup", running, &s.describe());
+    r.check("Back up library runs and shows its progress", running, &s.describe());
+    // The progress panel: bar, files and bytes, the file being copied.
+    let panel = note_has(&s, " files · ", 3000) && wait_until(3000, || s.describe().contains(":Copying: ") || s.describe().contains(":Checking: "));
+    r.check("the backup panel shows files, bytes and the file being copied", panel, &s.describe());
+    s.park();
+    s.shot(r, "phase7-backup-panel-running");
     s.shot(r, "phase6-settings-backup-running");
     if running {
-        // PocketMedia's own changes wait: Choose folder… (import) is refused while it runs.
-        s.click(r, SHit::ChooseFolder);
+        // PocketMedia's own changes wait: an import is refused while it runs
+        // (Add media on the Library page; the panel covers Settings).
+        page(r, &s, false);
+        s.manager_click(r, MHit::AddMedia);
+        s.add_click(r, El::AddChooseFiles);
         let d = s.describe();
         r.check("an import cannot start during a backup", d.contains(crate::backup::BUSY), &d);
-        // The refusal leaves the Add media start page; ← goes back to Settings.
+        // The refusal leaves the Add media start page; ← goes back to the Library.
         s.add_click(r, El::AddBack);
-        // …and so does Rename on the Library page.
-        page(r, &s, false);
+        // …and so does Rename.
         s.manager_click(r, MHit::Tile(0));
         s.manager_click(r, MHit::RenameInput);
         if guard(r, &t.allowed) {
@@ -395,21 +405,37 @@ fn backup_tests(r: &mut Report, t: &Session) -> bool {
         let d = s.describe();
         r.check("a Rename waits for the backup", d.contains(crate::backup::BUSY), &d);
         page(r, &s, true);
-        s.scroll_to(100_000);
-        r.check("Settings still shows the running backup", s.describe().contains("backup_running=true"), &s.describe());
-        s.click(r, SHit::Backup);
+        r.check(
+            "Settings still shows the running backup in its panel",
+            s.describe().contains("backup_running=true") && s.describe().contains("panel=running"),
+            &s.describe(),
+        );
+        s.click(r, SHit::PanelCancel);
         let cancelled = note_has(&s, "Backup cancelled", 10_000);
         let left = std::fs::read_dir(&dest).map(|d| d.count()).unwrap_or(99);
         r.check("Cancel backup stops it and removes the unfinished copy", cancelled && left == 0, &format!("{} / {left} left", s.describe()));
+        r.check("…and the panel says so", note_has(&s, "panel=done:Backup cancelled", 3000), &s.describe());
+        s.click(r, SHit::PanelDone);
     }
     crate::backup::TEST_DELAY_MS.store(0, Ordering::SeqCst);
 
-    // A full backup.
+    // A full backup. Back up library is at the end of the page (coming back to
+    // Settings scrolled it to the top).
+    s.scroll_to(100_000);
     s.click(r, SHit::Backup);
     let done = note_has(&s, "Backup finished and checked", 60_000);
     r.check("Back up library finishes and checks every copy", done, &s.describe());
     s.park();
     s.shot(r, "phase6-settings-backup-finished");
+    s.shot(r, "phase7-backup-panel-finished");
+    r.check("the panel shows the result with Open folder and Done", s.describe().contains("panel=done:Backup finished"), &s.describe());
+    s.click(r, SHit::PanelOpen);
+    let d = s.describe();
+    let opened_value = d.split("opened=\"").nth(1).and_then(|o| o.split('"').next()).unwrap_or("").to_string();
+    let opened = note_has(&s, "Opened the backup.", 2000) && opened_value.contains("PocketMedia backup ") && !opened_value.starts_with("\\\\?");
+    r.check("Open folder opens the new backup", opened, &s.describe());
+    s.click(r, SHit::PanelDone);
+    r.check("Done closes the panel and Settings is back", note_has(&s, "panel=none", 2000), &s.describe());
     close_windows(r, t);
     if done { backup_contents(r, t, &dest) } else { true }
 }
