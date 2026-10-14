@@ -1,6 +1,7 @@
 //! What the Manager window shows: type filter, name search, sort, the selected
 //! item with its rename field, and keyboard focus. No drawing, no Win32.
 
+use crate::fileops::RecycleError;
 use crate::library::{Library, extension};
 use crate::names::NameError;
 use crate::popup_state::TypeFilter;
@@ -342,6 +343,19 @@ impl ManagerState {
         self.focus = MFocus::Recycle;
     }
 
+    /// Move to Recycle Bin did not happen: the item stays, and the line says why.
+    pub fn recycle_failed(&mut self, name: &str, error: &RecycleError) {
+        self.cancel_recycle();
+        self.status = Some(match error {
+            RecycleError::WouldDelete => {
+                format!("{name} was not removed: Windows can't put it in the Recycle Bin here and would delete it permanently.")
+            }
+            RecycleError::Failed(e) => {
+                format!("Could not move {name} to the Recycle Bin: {}. It is still in your library.", e.trim_end_matches('.'))
+            }
+        });
+    }
+
     /// Removes the selected item after confirmation (its file is already in the
     /// Recycle Bin) and selects the one that took its place.
     pub fn confirm_recycle(&mut self, lib: &mut Library) {
@@ -532,6 +546,28 @@ mod tests {
         assert!(lib.get(2).is_none());
         assert_eq!(m.selected, Some(3), "Race clip took Square's place");
         assert_eq!(m.rename.text(), "Race clip");
+    }
+
+    #[test]
+    fn a_file_windows_would_not_recycle_stays_and_the_user_is_told() {
+        // Refusing must keep the item and say so, never claim the bin.
+        let (mut m, lib) = setup();
+        m.select(2, &lib);
+        m.ask_recycle();
+        m.recycle_failed("Square.png", &RecycleError::WouldDelete);
+        assert!(!m.confirming);
+        assert_eq!(m.selected, Some(2));
+        assert_eq!(lib.items.len(), 8);
+        let line = m.status.clone().unwrap_or_default();
+        assert!(line.starts_with("Square.png was not removed:"), "{line}");
+        assert!(line.contains("delete it permanently"), "{line}");
+        assert!(!line.contains("was moved"), "{line}");
+        m.ask_recycle();
+        m.recycle_failed("Square.png", &RecycleError::Failed("Windows reported: Access is denied.".into()));
+        assert_eq!(
+            m.status.as_deref(),
+            Some("Could not move Square.png to the Recycle Bin: Windows reported: Access is denied. It is still in your library.")
+        );
     }
 
     #[test]

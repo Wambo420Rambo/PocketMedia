@@ -132,6 +132,23 @@ pub fn read_info(r: &mut impl Read) -> Result<GifInfo, String> {
     Ok(GifInfo { width, height, frames })
 }
 
+/// Refuses a GIF with a frame larger than its canvas. A crafted file can pair a
+/// small canvas with a 65535 x 65535 frame, which would need gigabytes to decode.
+pub fn check_frames(info: &GifInfo) -> Result<(), String> {
+    match info.frames.iter().position(|f| !frame_fits(f.width, f.height, info)) {
+        Some(i) => {
+            let f = &info.frames[i];
+            Err(format!("frame {i} is {} x {}, larger than the {} x {} picture", f.width, f.height, info.width, info.height))
+        }
+        None => Ok(()),
+    }
+}
+
+/// A frame of `width` x `height` pixels fits on the canvas.
+pub fn frame_fits(width: u32, height: u32, info: &GifInfo) -> bool {
+    width <= info.width && height <= info.height
+}
+
 /// The canvas a GIF's frames are drawn on, in premultiplied BGRA. GIF alpha is
 /// all-or-nothing, so a frame pixel either replaces the canvas pixel or not.
 pub struct Composer {
@@ -245,6 +262,30 @@ mod tests {
         assert_eq!(info.frames.len(), 1);
         assert!(read_info(&mut &b"GIF89a"[..]).is_err());
         assert!(read_info(&mut &b"PNG..."[..]).is_err());
+    }
+
+    #[test]
+    fn a_frame_larger_than_the_canvas_is_refused() {
+        // A 100 x 100 canvas with a 65535 x 65535 frame.
+        let bytes = crate::media_info::fixtures::gif_oversized_frame(100, 100, 65535, 65535);
+        let info = read_info(&mut bytes.as_slice()).unwrap();
+        assert_eq!((info.frames[0].width, info.frames[0].height), (65535, 65535));
+        let err = check_frames(&info).unwrap_err();
+        assert!(err.contains("65535 x 65535") && err.contains("100 x 100"), "{err}");
+        // One dimension too large is enough.
+        let wide = crate::media_info::fixtures::gif_oversized_frame(100, 100, 101, 1);
+        assert!(check_frames(&read_info(&mut wide.as_slice()).unwrap()).is_err());
+    }
+
+    #[test]
+    fn frames_that_fit_the_canvas_are_accepted() {
+        let frames = [GifFrame::solid(0, 0, 4, 3, 1, 5, 0, None), GifFrame::solid(2, 1, 2, 2, 2, 5, 0, None)];
+        let info = read_info(&mut gif_frames(4, 3, &frames, "t").as_slice()).unwrap();
+        assert_eq!(check_frames(&info), Ok(()));
+        // Offset frames that hang over the edge are clipped when drawn, not refused.
+        let over = [GifFrame::solid(3, 2, 4, 3, 1, 5, 0, None)];
+        assert_eq!(check_frames(&read_info(&mut gif_frames(4, 3, &over, "t").as_slice()).unwrap()), Ok(()));
+        assert!(frame_fits(4, 3, &info) && !frame_fits(5, 3, &info) && !frame_fits(4, 4, &info));
     }
 
     #[test]

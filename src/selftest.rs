@@ -674,6 +674,22 @@ fn run_input_tests(r: &mut Report, t: &Session) -> bool {
 
     t.click(r, El::Search);
     t.park();
+    // Ctrl+Backspace after a space that is more than one byte used to end the
+    // app. U+3000 is what Japanese and Chinese input methods
+    // type; U+00A0 comes with pasted text.
+    for (typed, kept) in [("猫\u{3000}犬", "猫\u{3000}"), ("dance\u{00A0}happy", "dance\u{00A0}")] {
+        if !t.select_all_and_type(r, typed) || !guard(r, &t.allowed) {
+            return false;
+        }
+        press(&[VK_CONTROL, VK_BACK]);
+        std::thread::sleep(Duration::from_millis(200));
+        let d = t.describe();
+        r.check(
+            &format!("Ctrl+Backspace after {typed:?} deletes one word and the app keeps running"),
+            d.contains(&format!("query={kept:?}")),
+            &d,
+        );
+    }
     for (query, name, expected) in [
         ("dance happy", "focused-04-popup-search-words-any-order", &["Happy dance.gif"][..]),
         ("celeb", "focused-05-popup-search-partial", &["Celebration.mp4"][..]),

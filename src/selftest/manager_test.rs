@@ -261,6 +261,23 @@ pub(super) fn run(r: &mut Report, t: &Session) -> bool {
     m.has(r, "the confirmation replaces the Open folder note", &["status=\"\""]);
     m.click(r, MHit::ConfirmCancel);
     m.has(r, "Cancel keeps the item", &["confirming=false", "total=8", "selected=\"Renamed clip.mp4\""]);
+    // A file Windows would not recycle (no Recycle Bin on the drive, larger than
+    // the bin, or the bin set to delete right away) is refused, never deleted.
+    // The self-test makes Windows' answer "no" for one file.
+    let clip = media.join("Videos").join("Renamed clip.mp4");
+    crate::fileops::refuse_next_for_test(true);
+    m.click(r, MHit::Recycle);
+    m.click(r, MHit::ConfirmMove);
+    crate::fileops::refuse_next_for_test(false);
+    m.has(
+        r,
+        "a file Windows would delete permanently is kept, and the line says so",
+        &["total=8", "confirming=false", "selected=\"Renamed clip.mp4\"", "Renamed clip.mp4 was not removed:", "delete it permanently"],
+    );
+    r.check("the refused file is still in the Media folder, unchanged", clip.is_file(), &clip.display().to_string());
+    m.shot(r, "state-manager-recycle-refused");
+
+    let bin_before = crate::fileops::recycle_bin_items(&media);
     m.click(r, MHit::Recycle);
     m.click(r, MHit::ConfirmMove);
     m.has(
@@ -268,7 +285,13 @@ pub(super) fn run(r: &mut Report, t: &Session) -> bool {
         "confirming moves it to the Recycle Bin and selects the next item",
         &["total=7", "selected=\"Hello.gif\"", "Renamed clip.mp4 was moved to the Recycle Bin."],
     );
-    r.check("the file left the Media folder", !media.join("Videos").join("Renamed clip.mp4").exists(), "");
+    r.check("the file left the Media folder", !clip.exists(), "");
+    let bin_after = crate::fileops::recycle_bin_items(&media);
+    r.check(
+        "the file is in the Recycle Bin (its item count went up)",
+        matches!((bin_before, bin_after), (Some(a), Some(b)) if b > a),
+        &format!("items before {bin_before:?}, after {bin_after:?}"),
+    );
 
     // focused-31: a search with no match.
     if !m.click(r, MHit::Search) || !guard(r, &t.allowed) {

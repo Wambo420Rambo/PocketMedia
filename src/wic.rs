@@ -63,9 +63,8 @@ pub fn decode_first_frame(path: &Path) -> Result<Bgra, String> {
         if width as u64 * height as u64 > MAX_PIXELS {
             return Err(format!("{width} x {height} is too large to put on the clipboard as a picture"));
         }
-        let stride = width * 4;
-        let mut pixels = vec![0u8; (stride * height) as usize];
-        converter.CopyPixels(std::ptr::null(), stride, &mut pixels).map_err(fail)?;
+        let mut pixels = pixels::bgra_buffer(width, height, MAX_PIXELS)?;
+        converter.CopyPixels(std::ptr::null(), width * 4, &mut pixels).map_err(fail)?;
         Ok(Bgra { width, height, pixels })
     }
 }
@@ -98,8 +97,9 @@ impl Wic {
         Ok((decoder, file))
     }
 
-    /// Premultiplied BGRA of `source` (already at its final size).
-    fn pbgra(&self, source: &IWICBitmapSource) -> Result<Pixels, String> {
+    /// Premultiplied BGRA of `source` (already at its final size). Sources of
+    /// more than `max_pixels` are refused before anything is allocated.
+    fn pbgra(&self, source: &IWICBitmapSource, max_pixels: u64) -> Result<Pixels, String> {
         let fail = |e: windows::core::Error| format!("could not be decoded: {}", e.message());
         // SAFETY: COM objects used while alive; `data` is exactly stride x height bytes.
         unsafe {
@@ -109,7 +109,7 @@ impl Wic {
                 .map_err(fail)?;
             let (mut w, mut h) = (0u32, 0u32);
             converter.GetSize(&mut w, &mut h).map_err(fail)?;
-            let mut data = vec![0u8; (w * 4 * h) as usize];
+            let mut data = pixels::bgra_buffer(w, h, max_pixels)?;
             converter.CopyPixels(std::ptr::null(), w * 4, &mut data).map_err(fail)?;
             Ok(Pixels { width: w, height: h, data })
         }
@@ -139,7 +139,7 @@ impl Wic {
                 scaler.Initialize(&frame, tw, th, WICBitmapInterpolationModeFant).map_err(fail)?;
                 scaler.cast().map_err(fail)?
             };
-            self.pbgra(&source)
+            self.pbgra(&source, tw as u64 * th as u64)
         }
     }
 
@@ -158,11 +158,21 @@ pub struct GifFrames<'a> {
 }
 
 impl GifFrames<'_> {
-    /// Frame `index` alone (its own rectangle, not the canvas), premultiplied BGRA.
-    pub fn frame(&self, index: u32) -> Result<Pixels, String> {
-        // SAFETY: the decoder is alive; GetFrame validates the index.
-        let frame = unsafe { self.decoder.GetFrame(index) }.map_err(|e| format!("frame {index}: {}", e.message()))?;
+    /// Frame `index` alone (its own rectangle, not the canvas), premultiplied
+    /// BGRA. A second guard after `gif::check_frames`: a frame WIC sizes larger
+    /// than `canvas` (w, h) is refused before its pixels are allocated. (WIC
+    /// may report an absurd frame smaller and fail while decoding instead.)
+    pub fn frame(&self, index: u32, canvas: (u32, u32)) -> Result<Pixels, String> {
+        let fail = |e: windows::core::Error| format!("frame {index}: {}", e.message());
+        // SAFETY: the decoder is alive; GetFrame validates the index; out-pointers are locals.
+        let frame = unsafe { self.decoder.GetFrame(index) }.map_err(fail)?;
+        let (mut w, mut h) = (0u32, 0u32);
+        // SAFETY: as above.
+        unsafe { frame.GetSize(&mut w, &mut h) }.map_err(fail)?;
+        if w > canvas.0 || h > canvas.1 {
+            return Err(format!("frame {index} is {w} x {h}, larger than the {} x {} picture", canvas.0, canvas.1));
+        }
         let source: IWICBitmapSource = frame.cast().map_err(|e| e.message())?;
-        self.wic.pbgra(&source)
+        self.wic.pbgra(&source, canvas.0 as u64 * canvas.1 as u64)
     }
 }

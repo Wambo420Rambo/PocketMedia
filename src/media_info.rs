@@ -126,6 +126,23 @@ pub mod fixtures {
         b
     }
 
+    /// A hostile GIF: a small `w` x `h` canvas whose only frame
+    /// claims to be `fw` x `fh` pixels, with one pixel of image data.
+    pub fn gif_oversized_frame(w: u16, h: u16, fw: u16, fh: u16) -> Vec<u8> {
+        let mut b = b"GIF89a".to_vec();
+        b.extend(w.to_le_bytes());
+        b.extend(h.to_le_bytes());
+        b.extend([0x80, 0, 0]); // global colour table of 2 entries
+        b.extend([0xAB, 0x93, 0xFF, 0x19, 0x1D, 0x26]);
+        b.extend([0x2C, 0, 0, 0, 0]); // image at 0,0
+        b.extend(fw.to_le_bytes());
+        b.extend(fh.to_le_bytes());
+        b.push(0);
+        b.extend([2, 2, 0x44, 0x01, 0]); // LZW: clear, 0, end
+        b.push(0x3B);
+        b
+    }
+
     /// One frame for `gif_frames`: palette indexes (0-127), top row first.
     pub struct GifFrame {
         pub left: u16,

@@ -53,10 +53,21 @@ pub struct GifAnimation<'w> {
     out: (u32, u32),
 }
 
+/// The frame table of the GIF at `path`.
+fn read_info(path: &Path) -> Result<GifInfo, String> {
+    let file = File::open(path).map_err(|e| format!("could not be opened: {e}"))?;
+    gif::read_info(&mut BufReader::new(file))
+}
+
 impl<'w> GifAnimation<'w> {
     pub fn open(wic: &'w Wic, path: &Path, max_w: u32, max_h: u32) -> Result<Self, String> {
-        let file = File::open(path).map_err(|e| format!("could not be opened: {e}"))?;
-        let info = gif::read_info(&mut BufReader::new(file))?;
+        let info = read_info(path)?;
+        gif::check_frames(&info)?;
+        Self::with_info(wic, path, info, max_w, max_h)
+    }
+
+    /// `info` must have passed `gif::check_frames`.
+    fn with_info(wic: &'w Wic, path: &Path, info: GifInfo, max_w: u32, max_h: u32) -> Result<Self, String> {
         if info.width as u64 * info.height as u64 > MAX_GIF_CANVAS {
             return Err(format!("{} x {} is too large to animate", info.width, info.height));
         }
@@ -77,7 +88,7 @@ impl<'w> GifAnimation<'w> {
         if i == 0 {
             self.composer.reset();
         }
-        let raw = self.frames.frame(i as u32)?;
+        let raw = self.frames.frame(i as u32, (self.info.width, self.info.height))?;
         let mut f = self.info.frames[i];
         // WIC's own size for the frame's pixels wins over the header's.
         f.width = raw.width;
@@ -92,9 +103,14 @@ impl<'w> GifAnimation<'w> {
 }
 
 /// A GIF's thumbnail: its first frame composed on the canvas. Canvases too
-/// large to compose use WIC's first frame directly.
+/// large to compose, and GIFs whose frame table cannot be read, use WIC's first
+/// frame directly. A GIF with a frame larger than its canvas gets no thumbnail.
 pub fn gif_thumb(wic: &Wic, path: &Path, max_w: u32, max_h: u32) -> Result<Pixels, String> {
-    match GifAnimation::open(wic, path, max_w, max_h) {
+    let Ok(info) = read_info(path) else {
+        return wic.picture_thumb(path, max_w, max_h);
+    };
+    gif::check_frames(&info)?;
+    match GifAnimation::with_info(wic, path, info, max_w, max_h) {
         Ok(mut g) => g.next().map(|(px, _)| px),
         Err(_) => wic.picture_thumb(path, max_w, max_h),
     }

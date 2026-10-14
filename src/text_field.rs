@@ -87,7 +87,9 @@ impl TextField {
         }
         let before = &self.text[..self.caret];
         let trimmed = before.trim_end();
-        let start = trimmed.rfind(char::is_whitespace).map(|i| i + 1).unwrap_or(0);
+        // The word starts just after the last space; a space can be several
+        // bytes long (U+00A0, U+3000), so step over its full width.
+        let start = trimmed.char_indices().rev().find(|(_, c)| c.is_whitespace()).map(|(i, c)| i + c.len_utf8()).unwrap_or(0);
         self.text.replace_range(start..self.caret, "");
         self.caret = start;
     }
@@ -191,6 +193,39 @@ mod tests {
         assert_eq!(f.text(), "happy ");
         f.delete_word_back();
         assert_eq!(f.text(), "");
+    }
+
+    #[test]
+    fn ctrl_backspace_after_a_multibyte_space_keeps_the_space() {
+        // U+3000 (typed by Japanese and Chinese input methods), U+00A0
+        // (pasted text) and U+2003 used to panic here.
+        for space in ['\u{3000}', '\u{00A0}', '\u{2003}'] {
+            let mut f = field(&format!("a{space}b"));
+            f.delete_word_back();
+            assert_eq!(f.text(), format!("a{space}"));
+            f.delete_word_back();
+            assert_eq!(f.text(), "");
+        }
+        let mut f = field("猫\u{3000}犬");
+        f.delete_word_back();
+        assert_eq!(f.text(), "猫\u{3000}");
+        f.insert("鳥");
+        assert_eq!(f.text(), "猫\u{3000}鳥");
+    }
+
+    #[test]
+    fn ctrl_backspace_never_panics_on_any_caret_position() {
+        let text = "é\u{3000}😀 \u{00A0}x\u{2028}y";
+        for units in 0..=text.encode_utf16().count() {
+            let mut f = field(text);
+            f.set_caret_utf16(units);
+            let after = text[f.caret..].to_string();
+            f.delete_word_back();
+            // Only text before the caret goes; the caret stays on a char boundary.
+            assert!(f.text().is_char_boundary(f.caret));
+            assert_eq!(&f.text()[f.caret..], after);
+            assert!(text.starts_with(&f.text()[..f.caret]));
+        }
     }
 
     #[test]

@@ -15,6 +15,21 @@ impl Pixels {
     }
 }
 
+/// A zeroed buffer for `width` x `height` 32-bit pixels. Sizes are computed in
+/// u64 (a u32 `w * 4 * h` wraps), anything above `max_pixels` is refused, and a
+/// failed allocation is an error instead of an abort.
+pub fn bgra_buffer(width: u32, height: u32, max_pixels: u64) -> Result<Vec<u8>, String> {
+    let pixels = width as u64 * height as u64;
+    if pixels > max_pixels {
+        return Err(format!("{width} x {height} is too large to preview"));
+    }
+    let len = pixels.checked_mul(4).and_then(|b| usize::try_from(b).ok()).ok_or_else(|| format!("{width} x {height} is too large to preview"))?;
+    let mut data = Vec::new();
+    data.try_reserve_exact(len).map_err(|_| format!("not enough memory for {width} x {height} pixels"))?;
+    data.resize(len, 0);
+    Ok(data)
+}
+
 /// The largest size with `src`'s aspect that fits in `max_w` x `max_h`, never
 /// larger than `src` itself (no upscaling) and at least 1 x 1.
 pub fn fit(src_w: u32, src_h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
@@ -183,6 +198,19 @@ mod tests {
 
     fn solid(w: u32, h: u32, px: [u8; 4]) -> Vec<u8> {
         px.iter().copied().cycle().take((w * h * 4) as usize).collect()
+    }
+
+    #[test]
+    fn pixel_buffers_are_sized_in_u64_and_capped() {
+        // 65535 x 65535 x 4 wraps to 4,294,443,012 in u32.
+        assert!(bgra_buffer(65535, 65535, 1 << 30).is_err());
+        assert!(bgra_buffer(65535, 65535, 2048 * 2048).is_err());
+        assert!(bgra_buffer(2049, 2048, 2048 * 2048).is_err());
+        assert_eq!(bgra_buffer(2048, 2048, 2048 * 2048).map(|b| b.len()), Ok(2048 * 2048 * 4));
+        assert_eq!(bgra_buffer(3, 2, 6), Ok(vec![0; 24]));
+        assert_eq!(bgra_buffer(0, 5, 6), Ok(vec![]));
+        // An allocation that cannot succeed is an error, not an abort.
+        assert!(bgra_buffer(u32::MAX, u32::MAX, u64::MAX).is_err());
     }
 
     #[test]

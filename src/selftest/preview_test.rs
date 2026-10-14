@@ -232,6 +232,7 @@ pub(super) fn run(r: &mut Report, t: &Session) -> bool {
         r.check("Happy dance.gif's tile changes frames on screen (red, blue, green)", seen.len() >= 2, &format!("saw {seen:?} at {at:?}"));
     }
     shot_popup(r, t, "phase5-popup-gif-frame");
+    hostile_gif_test(r, &t.out);
 
     // 3. Hiding the popup stops the animation and releases the RAM cache (Use less memory).
     if !guard(r, &t.allowed) {
@@ -271,6 +272,32 @@ pub(super) fn run(r: &mut Report, t: &Session) -> bool {
 
     // 7. The stress test.
     stress_test(r, t)
+}
+
+/// A crafted GIF: a 100 x 100 picture whose frame claims to be
+/// 65535 x 65535. It must get no preview, without a 16 GiB allocation or a crash.
+fn hostile_gif_test(r: &mut Report, out: &Path) {
+    let path = out.join("hostile-frame.gif");
+    if let Err(e) = std::fs::write(&path, fixtures::gif_oversized_frame(100, 100, 65535, 65535)) {
+        r.check("write the hostile GIF", false, &e.to_string());
+        return;
+    }
+    let wic = match crate::wic::Wic::new() {
+        Ok(w) => w,
+        Err(e) => {
+            r.check("WIC for the hostile GIF", false, &e);
+            return;
+        }
+    };
+    let before = private_bytes();
+    let thumb = crate::preview::gif_thumb(&wic, &path, 200, 200).map(|p| (p.width, p.height));
+    let animation = crate::preview::GifAnimation::open(&wic, &path, 200, 200).map(|g| g.frame_count());
+    let frame = wic.gif(&path).and_then(|g| g.frame(0, (100, 100)).map(|p| (p.width, p.height)));
+    let growth = private_bytes().saturating_sub(before);
+    r.check("a GIF frame larger than its picture gets no thumbnail", thumb.is_err(), &format!("{thumb:?}"));
+    r.check("the same GIF is not animated", animation.is_err(), &format!("{animation:?}"));
+    r.check("WIC's own decode of the frame fails safely (an error, not a crash)", frame.is_err(), &format!("{frame:?}"));
+    r.check("no large allocation was made for it (under 64 MiB)", growth < 64 << 20, &mib(growth));
 }
 
 fn hover_tests(r: &mut Report, t: &Session) {

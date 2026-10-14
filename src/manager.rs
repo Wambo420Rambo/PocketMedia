@@ -1272,10 +1272,7 @@ fn recycle_selected(s: &mut ManagerState) {
                 s.status = Some(format!("{name} is in the Recycle Bin, but {e}."));
             }
         }
-        Err(e) => {
-            s.cancel_recycle();
-            s.status = Some(format!("Could not move {name} to the Recycle Bin: {e}. It is still in your library."));
-        }
+        Err(e) => s.recycle_failed(&name, &e),
     }
 }
 
