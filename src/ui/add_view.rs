@@ -64,6 +64,8 @@ pub struct AddLayout {
     pub main: Rect,
     pub footer: Rect,
     pub safety: Rect,
+    /// The notice in place of the safety line, when there is one.
+    pub notice: Option<Rect>,
     pub cancel: Rect,
     pub add: Rect,
     // Start page
@@ -105,17 +107,20 @@ impl AddLayout {
         let subtitle = Rect::new(text_x, heading.bottom() + 2.0, heading.w, TextStyle::Small.line());
         let main_y = 1.0 + HEAD_H + 6.0;
 
-        // Footer: the safety line, then the actions (review only) at its right.
+        // Footer: the safety line (or a notice, which may wrap and makes the footer
+        // taller), then the actions (review only) at its right.
         let review = a.reviewing();
-        let footer_h = 16.0 + BUTTON_H + 16.0;
+        let add_w = widgets::text_button_w(gfx, &a.add_label(), TextStyle::Medium);
+        let cancel_w = widgets::text_button_w(gfx, "Cancel", TextStyle::Body);
+        let safety_w = if review { inner_w - add_w - 8.0 - cancel_w - 12.0 } else { inner_w };
+        let notice_h = a.notice.as_deref().map(|n| gfx.wrapped_height(n, TextStyle::Small, safety_w));
+        let footer_h = 16.0 + notice_h.unwrap_or(0.0).max(BUTTON_H) + 16.0;
         let footer = Rect::new(host_x, height - 1.0 - footer_h, host_w, footer_h);
         let actions_y = footer.y + 16.0;
-        let add_w = widgets::text_button_w(gfx, &a.add_label(), TextStyle::Medium);
         let add = Rect::new(x0 + inner_w - add_w, actions_y, add_w, BUTTON_H);
-        let cancel_w = widgets::text_button_w(gfx, "Cancel", TextStyle::Body);
         let cancel = Rect::new(add.x - 8.0 - cancel_w, actions_y, cancel_w, BUTTON_H);
-        let safety_w = if review { cancel.x - 12.0 - x0 } else { inner_w };
         let safety = Rect::new(x0, actions_y, safety_w, BUTTON_H);
+        let notice = notice_h.map(|h| Rect::new(x0, actions_y + ((BUTTON_H - h) / 2.0).max(0.0), safety_w, h));
 
         let main = Rect::new(x0, main_y, inner_w, (footer.y - main_y).max(0.0));
         let top = main.y - a.scroll;
@@ -180,6 +185,7 @@ impl AddLayout {
             main,
             footer,
             safety,
+            notice,
             cancel,
             add,
             drop,
@@ -311,7 +317,10 @@ pub fn paint(p: &Painter, a: &AddMedia, l: &AddLayout, ui: &AddUi) {
 
     // Footer
     p.line(l.footer.x + PAD, l.footer.y + 0.5, l.footer.right() - PAD, l.footer.y + 0.5, 1.0, LINE);
-    p.text("Your originals stay where they are.", l.safety, TextStyle::Small, SUBTLE, Align::Start, true);
+    match (l.notice, a.notice.as_deref()) {
+        (Some(r), Some(n)) => p.text_wrapped(n, r.x, r.y, r.w, TextStyle::Small, ACCENT),
+        _ => p.text("Your originals stay where they are.", l.safety, TextStyle::Small, SUBTLE, Align::Start, true),
+    }
     if a.reviewing() {
         widgets::button(p, l.cancel, &["Cancel"], ui.hover == AddHit::Cancel, focused(AddFocus::Cancel));
         widgets::primary_button(p, l.add, &a.add_label(), a.can_add(), ui.hover == AddHit::Add, focused(AddFocus::Add));

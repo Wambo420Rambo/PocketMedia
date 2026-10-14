@@ -303,7 +303,7 @@ fn own_rename(r: &mut Report, t: &Session, expect_items: i64) -> bool {
 }
 
 /// Popup -> Open manager. Returns the Settings driver (the Manager shows the Library page).
-fn open_manager<'a>(r: &mut Report, t: &'a Session) -> Option<(Set<'a>, isize)> {
+pub(super) fn open_manager<'a>(r: &mut Report, t: &'a Session) -> Option<(Set<'a>, isize)> {
     if !t.open(r) || !t.click(r, El::OpenManager) {
         return None;
     }
@@ -316,7 +316,7 @@ fn open_manager<'a>(r: &mut Report, t: &'a Session) -> Option<(Set<'a>, isize)> 
 }
 
 /// Shows the Settings page (true) or the Library page (false) of the Manager.
-fn page(r: &mut Report, s: &Set, settings: bool) {
+pub(super) fn page(r: &mut Report, s: &Set, settings: bool) {
     let on_settings = s.describe().starts_with("screen=settings");
     match (settings, on_settings) {
         (true, false) => {
@@ -371,9 +371,10 @@ fn backup_tests(r: &mut Report, t: &Session) -> bool {
     s.click(r, SHit::PanelDone);
     r.check("Done closes the panel", note_has(&s, "panel=none", 2000), &s.describe());
 
-    // Cancel while copying (each file is slowed down so there is time to press it).
+    // Cancel while copying (each file is slowed down so there is time to press it,
+    // and for the "(unfinished)" checks: about 19 s for the 156 files here).
     crate::dialogs::set_test_backup(Some(dest.clone()));
-    crate::backup::TEST_DELAY_MS.store(60, Ordering::SeqCst);
+    crate::backup::TEST_DELAY_MS.store(120, Ordering::SeqCst);
     s.click(r, SHit::Backup);
     let running = note_has(&s, "Backing up", 3000) && s.describe().contains("backup_running=true");
     r.check("Back up library runs and shows its progress", running, &s.describe());
@@ -410,6 +411,8 @@ fn backup_tests(r: &mut Report, t: &Session) -> bool {
             s.describe().contains("backup_running=true") && s.describe().contains("panel=running"),
             &s.describe(),
         );
+        // "(unfinished)" while it runs; Windows' end of session and Exit ask first.
+        super::uninstall_test::while_backing_up(r, t, &s, &dest);
         s.click(r, SHit::PanelCancel);
         let cancelled = note_has(&s, "Backup cancelled", 10_000);
         let left = std::fs::read_dir(&dest).map(|d| d.count()).unwrap_or(99);
@@ -420,11 +423,21 @@ fn backup_tests(r: &mut Report, t: &Session) -> bool {
     crate::backup::TEST_DELAY_MS.store(0, Ordering::SeqCst);
 
     // A full backup. Back up library is at the end of the page (coming back to
-    // Settings scrolled it to the top).
+    // Settings scrolled it to the top). Media also holds files that are not library
+    // items: the uninstaller would delete them, so they are backed up too.
+    let extra = super::uninstall_test::extra_media(&media(t));
+    let partial = super::uninstall_test::partial_file(&media(t));
+    let placed = extra.iter().all(|(path, bytes)| path.parent().is_some_and(|d| std::fs::create_dir_all(d).is_ok()) && put(path, bytes))
+        && put(&partial, b"half a download");
+    r.check("(test setup: a file in a subfolder of Media, a .webp, a loose file and a .partial file)", placed, "");
     s.scroll_to(100_000);
     s.click(r, SHit::Backup);
     let done = note_has(&s, "Backup finished and checked", 60_000);
     r.check("Back up library finishes and checks every copy", done, &s.describe());
+    let finished_line = s.describe();
+    if done {
+        super::uninstall_test::after_backup(r, t, &s, &dest);
+    }
     s.park();
     s.shot(r, "phase6-settings-backup-finished");
     s.shot(r, "phase7-backup-panel-finished");
@@ -437,12 +450,36 @@ fn backup_tests(r: &mut Report, t: &Session) -> bool {
     s.click(r, SHit::PanelDone);
     r.check("Done closes the panel and Settings is back", note_has(&s, "panel=none", 2000), &s.describe());
     close_windows(r, t);
-    if done { backup_contents(r, t, &dest) } else { true }
+    let ok = if done { backup_contents(r, t, &dest, &finished_line) } else { true };
+    for (path, _) in &extra {
+        let _ = std::fs::remove_file(path);
+    }
+    let _ = std::fs::remove_dir_all(media(t).join("Pictures").join("Trip"));
+    let _ = std::fs::remove_file(&partial);
+    ok
 }
 
-/// The backup holds every library file, byte for byte, and a library file that
-/// lists exactly them; restored into another folder, PocketMedia finds them all.
-fn backup_contents(r: &mut Report, t: &Session, dest: &Path) -> bool {
+/// Every file under `dir` (relative `/` paths), links not followed.
+fn files_under(dir: &Path, rel: &str, out: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let Ok(kind) = e.file_type() else { continue };
+        let name = e.file_name().to_string_lossy().to_string();
+        let child = if rel.is_empty() { name } else { format!("{rel}/{name}") };
+        if kind.is_symlink() {
+            continue;
+        } else if kind.is_dir() {
+            files_under(&e.path(), &child, out);
+        } else {
+            out.push(child);
+        }
+    }
+}
+
+/// The backup holds every file in Media (library items and everything else, but
+/// no temporary .partial file), byte for byte, and a library file that lists
+/// exactly the library items; restored into another folder, PocketMedia finds them all.
+fn backup_contents(r: &mut Report, t: &Session, dest: &Path, finished_line: &str) -> bool {
     let Some(folder) = std::fs::read_dir(dest).ok().and_then(|d| d.flatten().map(|e| e.path()).find(|p| p.is_dir())) else {
         return r.check("the backup folder exists", false, &dest.display().to_string());
     };
@@ -470,12 +507,34 @@ fn backup_contents(r: &mut Report, t: &Session, dest: &Path) -> bool {
         .map(|i| i.name.as_str())
         .collect();
     r.check("every backed-up file matches the original byte for byte", mismatched.is_empty(), &format!("{mismatched:?}"));
-    let files_in_backup: usize = crate::import::FOLDERS
+    // Everything in Media, not only library items.
+    let mut in_media = Vec::new();
+    files_under(&app_media, "", &mut in_media);
+    let mut in_backup = Vec::new();
+    files_under(&folder.join("Media"), "", &mut in_backup);
+    let wanted: Vec<&String> = in_media.iter().filter(|f| !f.to_lowercase().ends_with(".partial")).collect();
+    let missing: Vec<&&String> = wanted
         .iter()
-        .filter_map(|f| std::fs::read_dir(folder.join("Media").join(f)).ok())
-        .map(|d| d.count())
-        .sum();
-    r.check("the backup holds no other media files", files_in_backup == data.items.len(), &files_in_backup.to_string());
+        .filter(|f| {
+            let a = std::fs::read(crate::import::media_file(&app_media, f)).ok();
+            a.is_none() || a != std::fs::read(crate::import::media_file(&folder.join("Media"), f)).ok()
+        })
+        .collect();
+    r.check(
+        "the backup holds every file in Media byte for byte: subfolders, other file types and loose files too",
+        missing.is_empty() && in_backup.len() == wanted.len(),
+        &format!("{} files in Media (without .partial), {} in the backup; missing or different: {missing:?}", wanted.len(), in_backup.len()),
+    );
+    let extra = super::uninstall_test::extra_media(&app_media);
+    let named: Vec<String> = extra.iter().filter_map(|(p, _)| p.strip_prefix(&app_media).ok()).map(|p| p.to_string_lossy().replace('\\', "/")).collect();
+    r.check(
+        "…including Pictures/Trip/day 1/beach.png, Pictures/holiday.webp and the loose file; the .partial file is left out",
+        named.iter().all(|n| in_backup.contains(n)) && !in_backup.iter().any(|f| f.to_lowercase().ends_with(".partial")),
+        &format!("{named:?}"),
+    );
+    let others = wanted.len() - data.items.len().min(wanted.len());
+    let says = format!("{} library items + {others} other file{}", data.items.len(), if others == 1 { "" } else { "s" });
+    r.check("the result line says \"N library items + M other files\"", finished_line.contains(&says), &format!("expected {says:?} in {finished_line}"));
     r.check(
         "caches are not backed up; the restore note is there",
         !folder.join("Cache").exists() && folder.join("How to restore.txt").is_file(),
@@ -554,6 +613,38 @@ fn autostart_tests(r: &mut Report, t: &Session) -> bool {
     send(t.main, CMD_STORE_REOPEN, 0);
     s.has(r, "Settings follows the entry Windows has (off)", &["autostart=false"]);
     r.check("the entry can be added and removed", set.is_ok() && unset.is_ok(), &format!("{set:?} {unset:?}"));
+
+    // Another copy's Autostart is never taken over (a stand-in file
+    // plays the other copy's program; only the self-test's own key is written).
+    let other = t.out.join("other-autostart").join("pocketmedia.exe");
+    let theirs = format!("\"{}\" {}", crate::import::display_path(&other), crate::autostart::ARG);
+    let prepared = other.parent().is_some_and(|d| std::fs::create_dir_all(d).is_ok())
+        && put(&other, b"another copy")
+        && crate::autostart::write_for_test(&theirs).is_ok();
+    send(t.main, CMD_STORE_REOPEN, 0);
+    s.scroll_to(100_000);
+    s.has(r, "another copy's Autostart entry shows as off here", &["autostart=false"]);
+    s.click(r, SHit::Autostart);
+    s.click(r, SHit::Save);
+    let d = s.describe();
+    r.check(
+        "Autostart on + Save keeps another copy's entry and says why",
+        prepared && crate::autostart::read().as_deref() == Some(theirs.as_str()) && d.contains("Autostart is left off: it starts the PocketMedia in") && d.contains("autostart=false"),
+        &format!("{:?}; {d}", crate::autostart::read()),
+    );
+    s.park();
+    s.shot(r, "state-settings-autostart-other-copy");
+    let off = crate::autostart::set(false);
+    r.check("…and Autostart off leaves that entry alone", off.is_ok() && crate::autostart::read().as_deref() == Some(theirs.as_str()), &format!("{off:?}"));
+    let _ = std::fs::remove_file(&other);
+    let on = crate::autostart::set(true);
+    r.check(
+        "an entry whose program is gone is stale and is replaced",
+        on.is_ok() && crate::autostart::read().as_deref() == Some(command.as_str()),
+        &format!("{on:?} {:?}", crate::autostart::read()),
+    );
+    let _ = crate::autostart::set(false);
+    send(t.main, CMD_STORE_REOPEN, 0);
     send(t.main, CMD_SETTINGS_SCROLL, 0);
     close_windows(r, t);
     true

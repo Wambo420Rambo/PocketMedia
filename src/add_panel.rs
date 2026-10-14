@@ -411,7 +411,7 @@ impl AddPanel {
             })
             .collect();
         format!(
-            "screen=add stage={} can_add={} label={:?} summary={:?} error={:?} rows={}",
+            "screen=add stage={} can_add={} label={:?} summary={:?} error={:?} notice={:?} rows={}",
             match a.stage {
                 Stage::Start => "start",
                 Stage::Scanning => "scanning",
@@ -422,6 +422,7 @@ impl AddPanel {
             a.add_label(),
             a.summary(),
             a.error.as_deref().unwrap_or(""),
+            a.notice.as_deref().unwrap_or(""),
             rows.join("|")
         )
     }

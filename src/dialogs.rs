@@ -97,9 +97,17 @@ pub fn set_test_backup(folder: Option<PathBuf>) {
     }
 }
 
+/// Self-test only: how many times the backup folder picker was asked for.
+static TEST_BACKUP_ASKED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn backup_picker_asked() -> usize {
+    TEST_BACKUP_ASKED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// The folder picker for Back up library. None when the user cancelled.
 pub fn pick_backup_folder(owner: HWND) -> Option<PathBuf> {
     if crate::app(|a| a.quiet.get()) {
+        TEST_BACKUP_ASKED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         return TEST_BACKUP.lock().ok()?.clone().flatten();
     }
     // SAFETY: COM is initialised on this (UI) thread by OleInitialize.

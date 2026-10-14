@@ -1,14 +1,23 @@
-//! Back up library (Settings): copies the originals in Media and a
+//! Back up library (Settings): copies the whole Media folder and a
 //! consistent library file to a folder the user picks, on a worker thread.
 //!
+//! - Everything under Media is copied, not only library items: the
+//!   uninstaller deletes the whole folder, so subfolders, other file types and
+//!   loose files are saved too. Temporary `.partial` files are left out, and
+//!   junctions and symbolic links are never followed.
 //! - The library file in the backup is written from a snapshot taken when the
-//!   backup starts, and lists exactly the files that were copied, so the two
-//!   always agree. While it runs, PocketMedia's own changes (import, Rename,
+//!   backup starts, and lists exactly the library items that were copied, so the
+//!   two always agree. While it runs, PocketMedia's own changes (import, Rename,
 //!   Move to Recycle Bin) wait; a file removed outside PocketMedia meanwhile is
 //!   left out and reported.
 //! - Every copy is read back and compared (SHA-256) before the backup counts as
-//!   finished. Nothing is ever overwritten: the backup goes into a new folder,
-//!   `PocketMedia backup <date> <time>`.
+//!   finished. Nothing is ever overwritten.
+//! - The backup is written into `PocketMedia backup <date> <time> (unfinished)`
+//!   and gets its final name, `PocketMedia backup <date> <time>`, only after
+//!   every copy was checked. A backup that was interrupted (the PC
+//!   shut down, the process was ended) keeps "(unfinished)" in its name, so it
+//!   can never be taken for a finished one. Leftovers are never deleted; a later
+//!   backup into the same folder mentions them.
 //! - A destination inside PocketMedia's own folder is refused.
 //! - On failure or Cancel, the files and folders this backup made are removed;
 //!   nothing else is touched. Caches are not backed up; they are made again.
@@ -16,6 +25,7 @@
 //!   in any folder. Library paths are relative to Media, so another install
 //!   path works (`How to restore.txt` says so in the backup).
 
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -24,13 +34,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::digest::{Digest, NewDigest};
-use crate::import::{FOLDERS, display_path, media_file};
+use crate::import::{FOLDERS, Publish, display_path, media_file};
 use crate::jobs::{self, Event, Job};
 use crate::store::{FILE_NAME, StoreData};
 
 pub const BUSY: &str = "A backup is running. Try again when it has finished.";
 const CHUNK: usize = 1 << 20;
 const RESTORE_NOTE: &str = "How to restore.txt";
+const NAME: &str = "PocketMedia backup";
+const UNFINISHED: &str = " (unfinished)";
 
 /// Where a running backup is, for the progress panel.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -83,9 +95,26 @@ impl Step {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Progress {
     Copying(Step),
-    Finished { folder: PathBuf, files: usize, bytes: u64, left_out: Vec<String> },
+    Finished(Done),
     Failed(String),
     Cancelled,
+}
+
+/// A finished, checked backup.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Done {
+    pub folder: PathBuf,
+    /// Library items copied (they are in the backup's library file).
+    pub items: usize,
+    /// Other files copied from Media: subfolders, other file types, loose files.
+    pub others: usize,
+    pub bytes: u64,
+    /// Files that left the Media folder during the backup.
+    pub left_out: Vec<String>,
+    /// Junctions and symbolic links in Media, not followed.
+    pub links: usize,
+    /// Unfinished backups from before in the same folder (names), left alone.
+    pub leftovers: Vec<String>,
 }
 
 /// Everything a backup needs, captured on the UI thread.
@@ -99,6 +128,8 @@ pub struct Plan {
     pub dest: PathBuf,
     /// For the new folder's name: `2026-10-13 1620`.
     pub stamp: String,
+    /// Renames a folder, failing with `AlreadyExists` if the new name is taken.
+    pub rename: Publish,
 }
 
 /// True when `child` is `parent` or inside it (letter case ignored, as on Windows).
@@ -190,6 +221,115 @@ pub fn run(plan: &Plan, digest: NewDigest, cancel: &AtomicBool, progress: &mut d
     }
 }
 
+/// `PocketMedia backup 2026-10-13 1620`, or `… (2)` from the second on.
+fn base_name(stamp: &str, n: u32) -> String {
+    if n == 1 { format!("{NAME} {stamp}") } else { format!("{NAME} {stamp} ({n})") }
+}
+
+/// True for a backup folder that never got its final name.
+pub fn is_unfinished(name: &str) -> bool {
+    name.starts_with(NAME) && name.ends_with(UNFINISHED)
+}
+
+/// Temporary files of an import that was interrupted: not worth saving.
+fn is_temporary(name: &str) -> bool {
+    name.to_lowercase().ends_with(".partial")
+}
+
+/// What is under Media: files (relative `/` paths and sizes) and folders,
+/// parents first. Links are counted, never followed.
+#[derive(Default)]
+struct Tree {
+    files: Vec<(String, u64)>,
+    dirs: Vec<String>,
+    links: usize,
+}
+
+fn walk(media: &Path, cancel: &AtomicBool) -> Result<Tree, Stop> {
+    let mut tree = Tree::default();
+    let mut stack = vec![String::new()];
+    while let Some(rel) = stack.pop() {
+        check(cancel)?;
+        let dir = if rel.is_empty() { media.to_path_buf() } else { media_file(media, &rel) };
+        let unreadable = |e: io::Error| Stop::Failed(format!("{} could not be read: {e}", display_path(&dir)));
+        let mut entries: Vec<fs::DirEntry> = fs::read_dir(&dir).map_err(unreadable)?.collect::<Result<_, _>>().map_err(unreadable)?;
+        entries.sort_by_key(|e| e.file_name().to_string_lossy().to_lowercase());
+        let mut subdirs = Vec::new();
+        for e in entries {
+            let name = e.file_name().to_string_lossy().to_string();
+            let child = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
+            // On Windows a junction is a link here too (a name-surrogate reparse point).
+            let kind = e.file_type().map_err(|err| Stop::Failed(format!("{} could not be read: {err}", display_path(&e.path()))))?;
+            if kind.is_symlink() {
+                tree.links += 1;
+            } else if kind.is_dir() {
+                tree.dirs.push(child.clone());
+                subdirs.push(child);
+            } else if kind.is_file() && !is_temporary(&name) {
+                let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+                tree.files.push((child, size));
+            }
+        }
+        // Visited in name order (the stack pops the last one first).
+        stack.extend(subdirs.into_iter().rev());
+    }
+    Ok(tree)
+}
+
+/// Makes `<dest>\PocketMedia backup <stamp> (unfinished)`: the first number
+/// whose finished and unfinished names are both free. Never an existing folder.
+fn make_unfinished(dest: &Path, stamp: &str, made: &mut Made) -> Result<PathBuf, Stop> {
+    for n in 1..100 {
+        let base = base_name(stamp, n);
+        if fs::symlink_metadata(dest.join(&base)).is_ok() {
+            continue;
+        }
+        let folder = dest.join(format!("{base}{UNFINISHED}"));
+        match made.dir(folder.clone()) {
+            Ok(()) => return Ok(folder),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(Stop::Failed(format!("the backup folder could not be made in {}: {e}", display_path(dest)))),
+        }
+    }
+    Err(Stop::Failed(format!("{} already holds 99 backups made in the same minute", display_path(dest))))
+}
+
+/// Gives a checked backup its final name: the first free `PocketMedia backup <stamp>`.
+/// A virus scanner or the search indexer may still hold one of the new files for
+/// a moment, which makes Windows refuse the rename; it is tried again for up to
+/// about 5 seconds before the backup counts as failed.
+fn finish_name(unfinished: &Path, dest: &Path, stamp: &str, rename: Publish, cancel: &AtomicBool) -> Result<PathBuf, Stop> {
+    let mut busy_tries = 0;
+    let mut n = 1;
+    while n < 100 {
+        let target = dest.join(base_name(stamp, n));
+        if fs::symlink_metadata(&target).is_ok() {
+            n += 1;
+            continue;
+        }
+        match rename(unfinished, &target) {
+            Ok(()) => return Ok(target),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => n += 1,
+            Err(_) if busy_tries < 20 => {
+                busy_tries += 1;
+                check(cancel)?;
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            Err(e) => return Err(Stop::Failed(format!("the finished backup could not be given its name: {e}"))),
+        }
+    }
+    Err(Stop::Failed("the finished backup could not be given its name: every name is taken".into()))
+}
+
+/// Unfinished backups from before in `dest` (not this one), by name.
+fn leftovers(dest: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dest)
+        .map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().to_string()).filter(|n| is_unfinished(n)).collect())
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
 fn copy_all(
     plan: &Plan,
     dest: &Path,
@@ -199,39 +339,47 @@ fn copy_all(
     made: &mut Made,
 ) -> Result<Progress, Stop> {
     let failed = |what: &str, e: &dyn std::fmt::Display| Stop::Failed(format!("{what}: {e}"));
-    // A new folder, never one that exists.
-    let mut folder = dest.join(format!("PocketMedia backup {}", plan.stamp));
-    let mut n = 2;
-    loop {
-        match made.dir(folder.clone()) {
-            Ok(()) => break,
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && n < 100 => {
-                folder = dest.join(format!("PocketMedia backup {} ({n})", plan.stamp));
-                n += 1;
-            }
-            Err(e) => return Err(failed(&format!("the backup folder could not be made in {}", display_path(dest)), &e)),
-        }
-    }
+    let mut step = Step::default();
+    progress(&step);
+    let tree = walk(&plan.media, cancel)?;
+    let library: HashSet<String> = plan.data.items.iter().map(|i| i.path.to_lowercase()).collect();
+    let others: Vec<&(String, u64)> = tree.files.iter().filter(|(rel, _)| !library.contains(&rel.to_lowercase())).collect();
+
+    // A new folder, never one that exists. It is named "(unfinished)" until every copy is checked.
+    let folder = make_unfinished(dest, &plan.stamp, made)?;
     let media = folder.join("Media");
     let data = folder.join("Data");
-    for dir in [media.clone()].into_iter().chain(FOLDERS.iter().map(|f| media.join(f))).chain([data.clone()]) {
+    let mut dirs = vec![media.clone()];
+    let mut seen = HashSet::new();
+    for rel in FOLDERS.iter().map(|f| f.to_string()).chain(tree.dirs.iter().cloned()) {
+        if seen.insert(rel.to_lowercase()) {
+            dirs.push(media_file(&media, &rel));
+        }
+    }
+    dirs.push(data.clone());
+    for dir in dirs {
         made.dir(dir).map_err(|e| failed("the backup folders could not be made", &e))?;
     }
 
     let mut kept = plan.data.clone();
-    let total = kept.items.len();
+    let total = plan.data.items.len() + others.len();
     let mut left_out = Vec::new();
     let mut bytes = 0u64;
-    let mut copied = Vec::with_capacity(total);
-    let mut step = Step { total, bytes_total: plan.data.items.iter().map(|i| i.size).sum(), ..Step::default() };
-    for (i, item) in plan.data.items.iter().enumerate() {
+    let mut copied = Vec::with_capacity(plan.data.items.len());
+    let mut others_done = 0;
+    step.total = total;
+    step.bytes_total = plan.data.items.iter().map(|i| i.size).sum::<u64>() + others.iter().map(|(_, size)| size).sum::<u64>();
+    // Library items first (with their records), then everything else in Media.
+    let jobs = plan.data.items.iter().map(|it| (Some(it), it.path.as_str(), it.name.clone()));
+    let jobs = jobs.chain(others.iter().map(|(rel, _)| (None, rel.as_str(), rel.rsplit('/').next().unwrap_or(rel).to_string())));
+    for (i, (item, rel, name)) in jobs.enumerate() {
         check(cancel)?;
         step.done = i;
-        step.current.clone_from(&item.name);
+        step.current = name;
         step.checking = false;
         progress(&step);
-        let src = media_file(&plan.media, &item.path);
-        let dst = media_file(&media, &item.path);
+        let src = media_file(&plan.media, rel);
+        let dst = media_file(&media, rel);
         let delay = TEST_DELAY_MS.load(Ordering::Relaxed);
         if delay > 0 {
             std::thread::sleep(Duration::from_millis(delay));
@@ -245,11 +393,16 @@ fn copy_all(
             step.checking = checking;
             progress(&step);
         };
-        match copy_verified(&src, &dst, digest, cancel, made, &mut on_bytes)? {
-            None => left_out.push(item.name.clone()),
-            Some((size, hash)) => {
+        match (copy_verified(&src, &dst, digest, cancel, made, &mut on_bytes)?, item) {
+            (None, Some(item)) => left_out.push(item.name.clone()),
+            (None, None) => left_out.push(rel.to_string()),
+            (Some((size, hash)), Some(item)) => {
                 bytes += size;
                 copied.push((item.id, size, hash));
+            }
+            (Some((size, _)), None) => {
+                bytes += size;
+                others_done += 1;
             }
         }
     }
@@ -278,7 +431,17 @@ fn copy_all(
     let note = restore_note(&plan.stamp);
     write_new(&folder.join(RESTORE_NOTE), note.as_bytes(), made).map_err(|e| failed("the backup could not be finished", &e))?;
     check(cancel)?;
-    Ok(Progress::Finished { folder, files: copied.len(), bytes, left_out })
+    // Everything is checked: only now does it get the name of a finished backup.
+    let folder = finish_name(&folder, dest, &plan.stamp, plan.rename, cancel)?;
+    Ok(Progress::Finished(Done {
+        folder,
+        items: copied.len(),
+        others: others_done,
+        bytes,
+        left_out,
+        links: tree.links,
+        leftovers: leftovers(dest),
+    }))
 }
 
 fn write_new(path: &Path, bytes: &[u8], made: &mut Made) -> io::Result<()> {
@@ -349,7 +512,9 @@ fn copy_verified(
 fn restore_note(stamp: &str) -> String {
     format!(
         "PocketMedia backup made on {stamp}.\r\n\r\n\
-         It holds your pictures, GIFs and videos (Media) and your library and settings (Data).\r\n\r\n\
+         It holds your pictures, GIFs and videos (Media) and your library and settings (Data).\r\n\
+         Media also holds every other file that was in PocketMedia's Media folder, \
+         such as subfolders you made there yourself.\r\n\r\n\
          To restore it:\r\n\
          1. Exit PocketMedia: right-click its tray icon and choose Exit.\r\n\
          2. Copy the Media and Data folders from here into the folder that holds pocketmedia.exe, \
@@ -371,15 +536,38 @@ pub fn size_text(bytes: u64) -> String {
     if u == 0 { format!("{bytes} bytes") } else { format!("{v:.1} {}", UNITS[u]) }
 }
 
+/// "1 library item", "3 other files".
+fn count(n: usize, word: &str) -> String {
+    format!("{n} {word}{}", if n == 1 { "" } else { "s" })
+}
+
 /// The line Settings shows for a backup event.
 pub fn describe(p: &Progress) -> String {
     match p {
         Progress::Copying(s) => format!("Backing up… {} of {} files", s.done, s.total),
-        Progress::Finished { folder, files, bytes, left_out } => {
-            let name = folder.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-            let mut s = format!("Backup finished and checked: {files} files ({}) in \"{name}\".", size_text(*bytes));
-            if !left_out.is_empty() {
-                s += &format!(" {} file(s) left the Media folder during the backup and are not in it.", left_out.len());
+        Progress::Finished(d) => {
+            let name = d.folder.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let mut s = format!(
+                "Backup finished and checked: {} + {} ({}) in \"{name}\".",
+                count(d.items, "library item"),
+                count(d.others, "other file"),
+                size_text(d.bytes)
+            );
+            if !d.left_out.is_empty() {
+                s += &format!(" {} left the Media folder during the backup and {} not in it.", count(d.left_out.len(), "file"), if d.left_out.len() == 1 { "is" } else { "are" });
+            }
+            if d.links > 0 {
+                s += &format!(
+                    " {} in Media {} not followed (a junction or link points elsewhere, so what it points to is not in the backup).",
+                    count(d.links, "link"),
+                    if d.links == 1 { "was" } else { "were" }
+                );
+            }
+            if let Some(first) = d.leftovers.first() {
+                s += &format!(
+                    " An unfinished backup from before is also in that folder (\"{first}\"{}). It is not complete; delete it when you no longer need it.",
+                    if d.leftovers.len() > 1 { format!(" and {} more", d.leftovers.len() - 1) } else { String::new() }
+                );
             }
             s
         }
@@ -416,7 +604,7 @@ pub fn start(dest: PathBuf) -> Result<(), String> {
     let p = crate::paths::get().ok_or("the PocketMedia folders are not set up")?;
     // The library file's view of the library, as last saved (persist runs after every change).
     let data = crate::store::with(|s| s.data.clone()).ok_or("the library is not loaded")?;
-    let plan = Plan { root: p.root.clone(), media: p.media.clone(), data, dest, stamp: stamp() };
+    let plan = Plan { root: p.root.clone(), media: p.media.clone(), data, dest, stamp: stamp(), rename: crate::fileops::move_no_replace };
     WORKING.store(true, Ordering::SeqCst);
     let job = jobs::spawn("backup", move |job, cancel| {
         let mut last = Instant::now() - Duration::from_secs(1);
@@ -435,7 +623,35 @@ pub fn start(dest: PathBuf) -> Result<(), String> {
     if let Ok(mut j) = JOB.lock() {
         *j = Some(job);
     }
+    block_shutdown(true);
     Ok(())
+}
+
+/// While a backup runs, Windows asks before signing out or shutting down:
+/// the main window answers WM_QUERYENDSESSION with "not yet",
+/// and this is the reason Windows shows beside "Shut down anyway" and Cancel.
+pub const SHUTDOWN_REASON: &str = "A backup is running. Stop it? Choose Cancel to let it finish.";
+
+/// Sets or clears the reason on the hidden main window and on the Manager (the
+/// window the backup runs in, which Windows lists by name), so Windows shows it
+/// whichever window it asks.
+fn block_shutdown(on: bool) {
+    use windows::Win32::System::Shutdown::{ShutdownBlockReasonCreate, ShutdownBlockReasonDestroy};
+    let reason = windows::core::HSTRING::from(SHUTDOWN_REASON);
+    for window in [crate::app(|a| a.main.get()), crate::manager::hwnd()] {
+        if window.is_invalid() {
+            continue;
+        }
+        // SAFETY: our own window, on the thread that made it; the HSTRING outlives the call.
+        let _ = unsafe { if on { ShutdownBlockReasonCreate(window, &reason) } else { ShutdownBlockReasonDestroy(window) } };
+    }
+}
+
+/// WM_QUERYENDSESSION, for the main window and the Manager: while a backup runs
+/// the answer is "not yet" (0), so Windows shows SHUTDOWN_REASON and lets the user
+/// choose; otherwise 1.
+pub fn may_end_session() -> isize {
+    isize::from(!running())
 }
 
 /// Cancel backup (the button while it runs). The result arrives as an event.
@@ -458,15 +674,20 @@ pub fn on_event(ev: &Event) -> bool {
     if done && let Ok(mut j) = JOB.lock() {
         *j = None;
     }
-    if let Progress::Finished { folder, left_out, .. } = progress {
-        crate::selftest::note(&format!("backup folder: {} (left out: {left_out:?})", display_path(folder)));
+    if done {
+        block_shutdown(false);
+    }
+    if let Progress::Finished(d) = progress {
+        crate::selftest::note(&format!("backup folder: {} (left out: {:?})", display_path(&d.folder), d.left_out));
     }
     crate::manager::backup_changed(progress, &describe(progress), !done);
     true
 }
 
-/// Exit: a running backup is cancelled, and its worker gets a moment to remove
-/// the unfinished copy.
+/// Exit (after the user agreed to stop a running backup) or the end of the
+/// Windows session: a running backup is cancelled, and its worker gets a moment
+/// to remove the unfinished copy. If it cannot finish that in time, the folder
+/// keeps its "(unfinished)" name.
 pub fn shutdown() {
     cancel();
     let end = Instant::now() + Duration::from_secs(3);
@@ -515,7 +736,21 @@ mod tests {
         };
         let dest = root.join("dest");
         fs::create_dir_all(&dest).unwrap();
-        Plan { root: root.join("app"), media, data, dest, stamp: "2026-10-13 1620".into() }
+        Plan { root: root.join("app"), media, data, dest, stamp: "2026-10-13 1620".into(), rename: no_replace }
+    }
+
+    /// A folder rename that never replaces (MoveFileEx without replace, on Windows).
+    fn no_replace(from: &Path, to: &Path) -> io::Result<()> {
+        if fs::symlink_metadata(to).is_ok() {
+            return Err(io::ErrorKind::AlreadyExists.into());
+        }
+        fs::rename(from, to)
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut n: Vec<String> = fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into()).collect();
+        n.sort();
+        n
     }
 
     fn run_plan(plan: &Plan) -> (Progress, Vec<Step>) {
@@ -529,9 +764,10 @@ mod tests {
         let root = temp("full");
         let plan = library(&root);
         let (p, seen) = run_plan(&plan);
-        let Progress::Finished { folder, files, bytes, left_out } = p else { panic!("{p:?}") };
+        let Progress::Finished(Done { folder, items, others, bytes, left_out, links, leftovers }) = p else { panic!("{p:?}") };
         assert_eq!(folder, fs::canonicalize(&plan.dest).unwrap().join("PocketMedia backup 2026-10-13 1620"));
-        assert_eq!((files, bytes, left_out.len()), (3, 4 + 3 * CHUNK as u64 + 5 + 2, 0));
+        assert_eq!((items, others, bytes, left_out.len(), links, leftovers.len()), (3, 0, 4 + 3 * CHUNK as u64 + 5 + 2, 0, 0, 0));
+        assert_eq!(names(&plan.dest), vec!["PocketMedia backup 2026-10-13 1620"], "no (unfinished) folder is left");
         let last = seen.last().unwrap();
         assert_eq!((last.done, last.total), (3, 3));
         for rel in ["Pictures/a.png", "GIFs/b.gif", "Videos/c.mp4"] {
@@ -551,8 +787,8 @@ mod tests {
     fn a_second_backup_never_overwrites_the_first() {
         let root = temp("twice");
         let plan = library(&root);
-        let (Progress::Finished { folder: first, .. }, _) = run_plan(&plan) else { panic!() };
-        let (Progress::Finished { folder: second, .. }, _) = run_plan(&plan) else { panic!() };
+        let (Progress::Finished(Done { folder: first, .. }), _) = run_plan(&plan) else { panic!() };
+        let (Progress::Finished(Done { folder: second, .. }), _) = run_plan(&plan) else { panic!() };
         assert_ne!(first, second);
         assert!(second.ends_with("PocketMedia backup 2026-10-13 1620 (2)"));
         assert!(first.join(RESTORE_NOTE).is_file());
@@ -593,8 +829,8 @@ mod tests {
         let root = temp("gone");
         let plan = library(&root);
         fs::remove_file(plan.media.join("Pictures/a.png")).unwrap();
-        let (Progress::Finished { folder, files, left_out, .. }, _) = run_plan(&plan) else { panic!() };
-        assert_eq!((files, left_out), (2, vec!["a.png".to_string()]));
+        let (Progress::Finished(Done { folder, items, left_out, .. }), _) = run_plan(&plan) else { panic!() };
+        assert_eq!((items, left_out), (2, vec!["a.png".to_string()]));
         let data = crate::store::check_text(&fs::read_to_string(folder.join("Data").join(FILE_NAME)).unwrap()).unwrap();
         assert_eq!(data.items.iter().map(|i| i.id).collect::<Vec<_>>(), vec![2, 3]);
         assert_eq!(data.history, vec![3], "history keeps only items in the backup");
@@ -658,7 +894,7 @@ mod tests {
     fn a_backup_restores_onto_another_install_path() {
         let root = temp("restore");
         let plan = library(&root);
-        let (Progress::Finished { folder, .. }, _) = run_plan(&plan) else { panic!() };
+        let (Progress::Finished(Done { folder, .. }), _) = run_plan(&plan) else { panic!() };
         // Another PocketMedia folder: the backup's Media and Data go beside its exe.
         let other = crate::paths::Paths::under(&root.join("elsewhere"));
         copy_tree(&folder.join("Media"), &other.media);
@@ -681,6 +917,179 @@ mod tests {
                 fs::copy(e.path(), to.join(e.file_name())).unwrap();
             }
         }
+    }
+
+    /// The uninstaller deletes everything in Media, so the backup
+    /// holds everything in Media: subfolders, other file types, loose files.
+    #[test]
+    fn the_whole_media_folder_is_backed_up_not_only_library_items() {
+        let root = temp("tree");
+        let plan = library(&root);
+        let extra = [
+            ("Pictures/Trip/day 1/x.png", b"sub".to_vec()),
+            ("Pictures/y.webp", b"webp".to_vec()),
+            ("loose note.txt", b"loose".to_vec()),
+            ("Videos/clip.mov", vec![9u8; CHUNK + 1]),
+        ];
+        for (rel, bytes) in &extra {
+            let path = media_file(&plan.media, rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, bytes).unwrap();
+        }
+        fs::create_dir_all(plan.media.join("Pictures/empty folder")).unwrap();
+        // Temporary files of an interrupted import are not saved.
+        fs::write(plan.media.join("Pictures/.pocketmedia-7-1.partial"), b"half").unwrap();
+        fs::write(plan.media.join("GIFs/download.gif.PARTIAL"), b"half").unwrap();
+        let (p, seen) = run_plan(&plan);
+        let Progress::Finished(d) = p else { panic!("{p:?}") };
+        assert_eq!((d.items, d.others), (3, 4));
+        let backup = d.folder.join("Media");
+        for (rel, bytes) in &extra {
+            assert_eq!(&fs::read(media_file(&backup, rel)).unwrap(), bytes, "{rel}");
+        }
+        assert!(backup.join("Pictures/empty folder").is_dir(), "empty folders come along");
+        assert!(!backup.join("Pictures/.pocketmedia-7-1.partial").exists());
+        assert!(!backup.join("GIFs/download.gif.PARTIAL").exists());
+        // The library file still lists only library items.
+        let data = crate::store::check_text(&fs::read_to_string(d.folder.join("Data").join(FILE_NAME)).unwrap()).unwrap();
+        assert_eq!(data.items.len(), 3);
+        assert_eq!(seen.last().unwrap().total, 7, "progress counts every file");
+        let line = describe(&Progress::Finished(d));
+        assert!(line.starts_with("Backup finished and checked: 3 library items + 4 other files ("), "{line}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_in_media_are_counted_but_never_followed() {
+        let root = temp("links");
+        let plan = library(&root);
+        let outside = root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("not mine.png"), b"x").unwrap();
+        std::os::unix::fs::symlink(&outside, plan.media.join("Pictures/linked folder")).unwrap();
+        std::os::unix::fs::symlink(outside.join("not mine.png"), plan.media.join("linked.png")).unwrap();
+        let (Progress::Finished(d), _) = run_plan(&plan) else { panic!() };
+        assert_eq!((d.items, d.others, d.links), (3, 0, 2));
+        assert!(fs::symlink_metadata(d.folder.join("Media/Pictures/linked folder")).is_err());
+        assert!(fs::symlink_metadata(d.folder.join("Media/linked.png")).is_err());
+        let line = describe(&Progress::Finished(d));
+        assert!(line.contains("2 links in Media were not followed"), "{line}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The same on Windows, with a real junction (`mklink /J`), as File Explorer
+    /// users and the installer test make them.
+    #[cfg(windows)]
+    #[test]
+    fn junctions_in_media_are_never_followed() {
+        let root = temp("junction");
+        let plan = library(&root);
+        let outside = root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("not mine.png"), b"x").unwrap();
+        let link = plan.media.join("Pictures").join("linked folder");
+        let made = std::process::Command::new("cmd").arg("/c").arg("mklink").arg("/J").arg(&link).arg(&outside).output().unwrap();
+        assert!(made.status.success() && fs::symlink_metadata(&link).is_ok(), "mklink /J failed: {made:?}");
+        let (Progress::Finished(d), _) = run_plan(&plan) else { panic!() };
+        assert_eq!((d.items, d.others, d.links), (3, 0, 1));
+        assert!(fs::symlink_metadata(d.folder.join("Media/Pictures/linked folder")).is_err());
+        assert!(outside.join("not mine.png").is_file(), "what it points to is untouched");
+        let _ = fs::remove_dir(&link);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Until every copy is checked the folder says "(unfinished)",
+    /// so a backup cut off half-way (the process ended) never looks finished.
+    #[test]
+    fn an_interrupted_backup_leaves_only_an_unfinished_folder() {
+        let root = temp("interrupted");
+        let plan = library(&root);
+        let dest = fs::canonicalize(&plan.dest).unwrap();
+        let mut during = Vec::new();
+        let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run(&plan, fnv, &AtomicBool::new(false), &mut |s| {
+                if s.done == 1 && during.is_empty() {
+                    during = names(&dest);
+                }
+                if s.done == 2 {
+                    panic!("the process ends here");
+                }
+            })
+        }));
+        assert!(ended.is_err());
+        assert_eq!(during, vec!["PocketMedia backup 2026-10-13 1620 (unfinished)"], "while it runs");
+        assert_eq!(names(&dest), vec!["PocketMedia backup 2026-10-13 1620 (unfinished)"], "after it was cut off");
+        assert!(!dest.join("PocketMedia backup 2026-10-13 1620 (unfinished)").join(RESTORE_NOTE).exists());
+
+        // The next backup leaves the leftover alone, takes a free name and mentions it.
+        let (Progress::Finished(d), _) = run_plan(&plan) else { panic!() };
+        assert_eq!(d.folder, dest.join("PocketMedia backup 2026-10-13 1620"));
+        assert_eq!(d.leftovers, vec!["PocketMedia backup 2026-10-13 1620 (unfinished)"]);
+        assert_eq!(names(&dest), vec!["PocketMedia backup 2026-10-13 1620", "PocketMedia backup 2026-10-13 1620 (unfinished)"]);
+        let line = describe(&Progress::Finished(d));
+        assert!(line.contains("An unfinished backup from before is also in that folder"), "{line}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_finished_name_taken_meanwhile_is_never_replaced() {
+        let root = temp("taken");
+        let plan = library(&root);
+        let dest = fs::canonicalize(&plan.dest).unwrap();
+        // Someone makes "PocketMedia backup … " while this backup runs.
+        let p = run(&plan, fnv, &AtomicBool::new(false), &mut |s| {
+            if s.done == 1 {
+                let _ = fs::create_dir(dest.join("PocketMedia backup 2026-10-13 1620"));
+                let _ = fs::write(dest.join("PocketMedia backup 2026-10-13 1620").join("theirs.txt"), b"keep");
+            }
+        });
+        let Progress::Finished(d) = p else { panic!("{p:?}") };
+        assert_eq!(d.folder, dest.join("PocketMedia backup 2026-10-13 1620 (2)"));
+        assert_eq!(names(&dest.join("PocketMedia backup 2026-10-13 1620")), vec!["theirs.txt"]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    static REFUSALS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// Like Windows while a virus scanner still holds a new file: refuses twice.
+    fn busy_then_free(from: &Path, to: &Path) -> io::Result<()> {
+        if REFUSALS.fetch_add(1, Ordering::SeqCst) < 2 {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        no_replace(from, to)
+    }
+
+    #[test]
+    fn a_folder_held_for_a_moment_still_gets_its_final_name() {
+        let root = temp("held");
+        let mut plan = library(&root);
+        plan.rename = busy_then_free;
+        let (p, _) = run_plan(&plan);
+        let Progress::Finished(d) = p else { panic!("{p:?}") };
+        assert!(d.folder.ends_with("PocketMedia backup 2026-10-13 1620"));
+        assert_eq!(REFUSALS.load(Ordering::SeqCst), 3);
+        assert_eq!(names(&plan.dest), vec!["PocketMedia backup 2026-10-13 1620"]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unfinished_names_are_recognised() {
+        assert!(is_unfinished("PocketMedia backup 2026-10-13 1620 (unfinished)"));
+        assert!(is_unfinished("PocketMedia backup 2026-10-13 1620 (2) (unfinished)"));
+        assert!(!is_unfinished("PocketMedia backup 2026-10-13 1620"));
+        assert!(!is_unfinished("Holiday (unfinished)"));
+    }
+
+    #[test]
+    fn result_line_counts_items_and_other_files() {
+        let one = Done { folder: PathBuf::from("x/PocketMedia backup 1"), items: 1, others: 1, bytes: 2048, ..Done::default() };
+        assert_eq!(
+            describe(&Progress::Finished(one)),
+            "Backup finished and checked: 1 library item + 1 other file (2.0 KB) in \"PocketMedia backup 1\"."
+        );
+        let gone = Done { items: 2, left_out: vec!["a.png".into()], ..Done::default() };
+        assert!(describe(&Progress::Finished(gone)).contains("2 library items + 0 other files"));
     }
 
     #[test]

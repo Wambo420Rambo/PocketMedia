@@ -191,15 +191,24 @@ pub fn show_settings() {
 
 /// The uninstaller's Back up library… button (`pocketmedia.exe --backup`): shows
 /// Settings scrolled to Back up library and opens its folder picker, as clicking
-/// the button there does. Unsaved Settings edits and an open Add media panel are
-/// left as they are (the Manager is only shown); a running backup is only shown.
+/// the button there does. A running backup is only shown.
+///
+/// An open Add media panel and unsaved Settings edits are left as they are, so
+/// nothing in progress is lost, and a note says what to finish first.
+/// Before, nothing visible happened and the user could think the backup
+/// had been made.
 pub fn back_up_from_uninstaller() {
     show();
     if hwnd().is_invalid() {
         return;
     }
     let pick = with_view(|v| {
-        if v.add.is_some() || (v.state.page == Page::Settings && v.state.settings.dirty()) {
+        if let Some(panel) = v.add.as_mut() {
+            panel.add.notice = Some(crate::add_media::BACKUP_WAITS.into());
+            return false;
+        }
+        if v.state.page == Page::Settings && v.state.settings.dirty() {
+            v.state.settings.show_note(SETTINGS_WAIT);
             return false;
         }
         library::with(|lib| v.state.navigate(Nav::Settings, lib));
@@ -214,6 +223,10 @@ pub fn back_up_from_uninstaller() {
         run(Effect::PickBackup);
     }
 }
+
+/// The uninstaller asked for Back up library while Settings had unsaved changes.
+/// Short: it shares the line left of Cancel / Save with "Unsaved changes · ".
+pub const SETTINGS_WAIT: &str = "Save or cancel first, then Back up library.";
 
 /// The line under the inspector (copy and drag results). Empty clears it.
 pub fn show_status(text: &str) {
@@ -260,8 +273,8 @@ pub fn backup_changed(progress: &crate::backup::Progress, text: &str, running: b
     use crate::backup::Progress;
     let panel = match progress {
         Progress::Copying(step) => BackupPanel::Running(step.clone()),
-        Progress::Finished { folder, .. } => {
-            BackupPanel::Done { title: "Backup finished".into(), text: text.into(), folder: Some(folder.clone()) }
+        Progress::Finished(d) => {
+            BackupPanel::Done { title: "Backup finished".into(), text: text.into(), folder: Some(d.folder.clone()) }
         }
         Progress::Failed(_) => BackupPanel::Done { title: "Backup failed".into(), text: text.into(), folder: None },
         Progress::Cancelled => BackupPanel::Done { title: "Backup cancelled".into(), text: text.into(), folder: None },
@@ -945,7 +958,12 @@ impl View {
                     // The registry is the truth: the toggle shows what it says.
                     st.saved.autostart = crate::autostart::is_on();
                     st.draft.autostart = st.saved.autostart;
-                    problems.push(format!("Autostart could not be turned {}: {e}.", if on { "on" } else { "off" }));
+                    // A message that already says what happened to Autostart is shown as it is.
+                    problems.push(if e.starts_with("Autostart ") {
+                        e
+                    } else {
+                        format!("Autostart could not be turned {}: {}.", if on { "on" } else { "off" }, e.trim_end_matches('.'))
+                    });
                 }
                 if let Err(e) = crate::store::save_settings(st.saved) {
                     problems.push(format!("Settings could not be saved: {e}"));
@@ -1441,6 +1459,10 @@ extern "system" fn manager_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
         }
         // Alt+F4 or the taskbar's Close: hide, like ×. Only Exit ends the app.
         WM_CLOSE => Effect::Hide,
+        // Signing out or shutting down while a backup runs: Windows
+        // asks first and shows the reason set on this window. The main window
+        // stops the backup if the session ends anyway.
+        WM_QUERYENDSESSION => return LRESULT(crate::backup::may_end_session()),
         // SAFETY: forwarding the unchanged message.
         _ => return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     };

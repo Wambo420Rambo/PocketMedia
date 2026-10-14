@@ -1,17 +1,19 @@
 //! PocketMedia.
 //!
-//! Phase 0 (risk test): tray icon + menu, the global shortcut Win+Alt+., focus
-//! hand-back, paste of a test PNG and dragging it out.
-//! The quick popup drawn with Direct2D/DirectWrite over fake items.
-//! Add media and the Manager over the same fake, in-memory library.
-//! The real library: the Media, Data and Cache folders beside the
-//! program, the library file `Data\pocketmedia.json`, import, names on disk,
-//! search and the Recycle Bin.
-//! Real transfer: paste and drag of the library's original files.
-//! Previews: thumbnails with a disk and a RAM cache, GIFs that loop
-//! while visible and a muted hover video.
-//! The Media folders are watched for changes made in File Explorer,
-//! Back up library, one PocketMedia per user, and Autostart.
+//! - Tray icon and menu, the global shortcut (Win+Alt+. by default), focus
+//!   hand-back to the app that was in front.
+//! - The quick popup, Add media and the Manager, drawn with Direct2D/DirectWrite.
+//! - The library: the Media, Data and Cache folders beside the program, the
+//!   library file `Data\pocketmedia.json`, import, names on disk, search and the
+//!   Recycle Bin.
+//! - Transfer: paste and drag of the library's original files.
+//! - Previews: thumbnails with a disk and a RAM cache, GIFs that loop while
+//!   visible and a muted hover video.
+//! - The Media folders are watched for changes made in File Explorer; Back up
+//!   library and Autostart.
+//! - One PocketMedia at a time, each install with its own identity
+//!   (`instance.rs`); backups of the whole Media folder say "(unfinished)" until
+//!   checked, and Exit or the end of the Windows session ask before stopping one.
 
 #![windows_subsystem = "windows"]
 
@@ -128,9 +130,10 @@ enum Mode {
     /// Self-test only: load the library beside this copy of the program (as a
     /// start does), write what was found to the file, and exit.
     CheckLibrary(PathBuf),
+    /// The uninstaller's question: is this copy running, another one, or none?
+    /// Writes the answer to the file (see `instance::report_running`).
+    WhichRunning(PathBuf),
 }
-
-const MAIN_CLASS: PCWSTR = w!("PocketMediaPhase0Main");
 
 fn parse_mode() -> Mode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -139,6 +142,7 @@ fn parse_mode() -> Mode {
         Some("--self-test") => Mode::SelfTest(path("test-results")),
         Some("--test-target") => Mode::TestTarget(path("test-results")),
         Some("--check-library") => Mode::CheckLibrary(path("check-library.txt")),
+        Some("--which-running") => Mode::WhichRunning(path("which-running.txt")),
         Some("--exit-after-start") => Mode::Normal { exit_after_start: true, autostart: false, backup: false },
         Some(autostart::ARG) => Mode::Normal { exit_after_start: false, autostart: true, backup: false },
         Some("--backup") => Mode::Normal { exit_after_start: false, autostart: false, backup: true },
@@ -152,6 +156,9 @@ fn main() {
         // SAFETY: called once at startup, before any window exists.
         let _ = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
         std::process::exit(test_target::run(out));
+    }
+    if let Mode::WhichRunning(out) = &mode {
+        std::process::exit(instance::report_running(out));
     }
     // The folders come first: without them there is nowhere to keep media.
     let folders = paths::Paths::beside_exe()
@@ -176,10 +183,12 @@ fn main() {
     if let Mode::CheckLibrary(report) = &mode {
         std::process::exit(check_library(paths, report));
     }
-    // One PocketMedia per user: a later launch shows the running one's popup.
-    let Some(_instance) = instance::claim() else {
-        match mode {
-            Mode::Normal { autostart: true, .. } => {}
+    // One PocketMedia at a time. A later launch of this same install hands its
+    // request to the running one; a launch of another install hands nothing over.
+    let _instance = match instance::claim() {
+        instance::Claim::Mine(i) => i,
+        instance::Claim::SameInstall => match mode {
+            Mode::Normal { autostart: true, .. } => std::process::exit(0),
             Mode::SelfTest(_) => {
                 message_box(
                     "Another PocketMedia is running. Exit it from the tray, then run the self-test again.",
@@ -188,14 +197,16 @@ fn main() {
                 );
                 std::process::exit(1);
             }
-            Mode::Normal { backup: true, .. } => {
-                instance::activate_running(MAIN_CLASS, instance::BACK_UP);
+            Mode::Normal { backup: true, .. } => std::process::exit(if instance::activate_running(instance::BACK_UP) { 0 } else { 4 }),
+            _ => std::process::exit(if instance::activate_running(instance::SHOW_POPUP) { 0 } else { 4 }),
+        },
+        instance::Claim::OtherInstall(folder) => {
+            if !matches!(mode, Mode::Normal { autostart: true, .. }) {
+                let backup = matches!(mode, Mode::Normal { backup: true, .. });
+                message_box(&instance::other_copy_message(folder.as_deref(), backup), instance::OTHER_COPY_TITLE, MB_ICONWARNING);
             }
-            _ => {
-                instance::activate_running(MAIN_CLASS, instance::SHOW_POPUP);
-            }
+            std::process::exit(3);
         }
-        std::process::exit(0);
     };
     let outcome = store::init(&paths.data);
     if matches!(mode, Mode::SelfTest(_)) {
@@ -290,7 +301,7 @@ fn run(mode: &Mode) -> Result<(), String> {
         let class = WNDCLASSW {
             lpfnWndProc: Some(main_proc),
             hInstance: instance.into(),
-            lpszClassName: MAIN_CLASS,
+            lpszClassName: instance::main_class(),
             ..Default::default()
         };
         if RegisterClassW(&class) == 0 {
@@ -299,7 +310,7 @@ fn run(mode: &Mode) -> Result<(), String> {
         // Hidden owner window: receives tray, hotkey and timer messages. Never shown.
         let main = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
-            MAIN_CLASS,
+            instance::main_class(),
             w!("PocketMedia"),
             WS_OVERLAPPED,
             0,
@@ -393,7 +404,7 @@ extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
                         tray::MenuChoice::QuickPopup => popup::open(captured),
                         tray::MenuChoice::Manager => manager::show(),
                         tray::MenuChoice::Settings => manager::show_settings(),
-                        tray::MenuChoice::Exit => exit(),
+                        tray::MenuChoice::Exit => request_exit(),
                         tray::MenuChoice::None => {}
                     }
                 }
@@ -418,6 +429,16 @@ extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             }
             WM_TIMER if wparam.0 == TIMER_PASTE => {
                 paste::tick();
+                LRESULT(0)
+            }
+            // Signing out or shutting down while a backup runs: Windows asks first,
+            // showing backup::SHUTDOWN_REASON (set when the backup started).
+            WM_QUERYENDSESSION => LRESULT(backup::may_end_session()),
+            WM_ENDSESSION => {
+                if wparam.0 != 0 {
+                    // The session ends anyway: stop the backup and let it clean up.
+                    backup::shutdown();
+                }
                 LRESULT(0)
             }
             WM_DESTROY => {
@@ -450,6 +471,31 @@ extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
     }
+}
+
+/// The tray menu's Exit. While a backup runs it asks first; No
+/// keeps PocketMedia and the backup running.
+pub fn request_exit() {
+    if backup::running() && !ask_yes_no(STOP_BACKUP_TEXT, STOP_BACKUP_TITLE) {
+        return;
+    }
+    exit();
+}
+
+pub const STOP_BACKUP_TITLE: &str = "PocketMedia - backup running";
+pub const STOP_BACKUP_TEXT: &str = "A backup is running. Stop it?\n\n\
+    Yes stops the backup, removes the unfinished copy and exits PocketMedia.\n\
+    No lets the backup finish; you can exit PocketMedia afterwards.";
+
+/// A Yes/No question with No as the default button. True for Yes.
+fn ask_yes_no(text: &str, caption: &str) -> bool {
+    let text = transfer::to_wide(text);
+    let caption = transfer::to_wide(caption);
+    // SAFETY: both strings are null-terminated UTF-16 that outlive the call.
+    let answer = unsafe {
+        MessageBoxW(None, PCWSTR(text.as_ptr()), PCWSTR(caption.as_ptr()), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_SETFOREGROUND)
+    };
+    answer == IDYES
 }
 
 pub fn exit() {

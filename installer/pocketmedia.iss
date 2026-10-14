@@ -66,8 +66,10 @@ PrivilegesRequired=lowest
 MinVersion=10.0.22000
 ArchitecturesAllowed=x64os
 ArchitecturesInstallIn64BitMode=x64os
-; The app holds this mutex while it runs (instance.rs). Setup and Uninstall wait
-; until it is closed.
+; Every PocketMedia holds this mutex while it runs (instance.rs). Setup and Uninstall
+; wait until it is closed. It is the same for every install, because Setup checks it
+; before it knows the folder; each install also holds its own Local\PocketMedia.<id>,
+; and only one PocketMedia runs at a time anyway.
 AppMutex=Local\PocketMedia.SingleInstance
 CloseApplications=no
 #if VER >= EncodeVer(6,6,0)
@@ -477,10 +479,42 @@ begin
       'PocketMedia will use "Use less memory"; you can change it in Settings.', mbInformation, MB_OK, IDOK);
 end;
 
+{ The program a Run value starts: the quoted path at its start, or its first word
+  (as autostart.rs program_of). }
+function ProgramOf(Value: String): String;
+var
+  P: Integer;
+begin
+  Value := Trim(Value);
+  if Copy(Value, 1, 1) = '"' then begin
+    Delete(Value, 1, 1);
+    P := Pos('"', Value);
+  end
+  else
+    P := Pos(' ', Value);
+  if P > 0 then
+    Result := Copy(Value, 1, P - 1)
+  else
+    Result := Value;
+end;
+
 procedure TurnOnAutostart(const App: String);
 var
-  Stored: String;
+  Stored, Other: String;
 begin
+  { Never take over another PocketMedia's Autostart: only one runs
+    at a time. A value whose program is gone is stale and is replaced. }
+  if RegQueryStringValue(HKEY_CURRENT_USER, RunKey, RunValue, Stored) and
+     (CompareText(Stored, AutostartCommand(App)) <> 0) then begin
+    Other := ProgramOf(Stored);
+    if (Other <> '') and FileExists(Other) then begin
+      Log('Autostart left as it is: it starts another PocketMedia (' + Stored + ').');
+      SuppressibleMsgBox('PocketMedia is installed, but Autostart was not turned on: it already starts another PocketMedia, in ' +
+        ExtractFileDir(Other) + '. Only one PocketMedia runs at a time. To autostart this one, turn Autostart off in that copy, ' +
+        'then turn it on in this one''s Settings.', mbInformation, MB_OK, IDOK);
+      Exit;
+    end;
+  end;
   if RegWriteStringValue(HKEY_CURRENT_USER, RunKey, RunValue, AutostartCommand(App)) and
      RegQueryStringValue(HKEY_CURRENT_USER, RunKey, RunValue, Stored) and
      (CompareText(Stored, AutostartCommand(App)) = 0) then
@@ -506,23 +540,96 @@ end;
 
 { ---------- Uninstall ---------- }
 
-{ Back up library… on the warning: PocketMedia's own backup (checked copies,
-  with the library file), started with --backup. A running PocketMedia does it
-  itself; otherwise this starts one. }
-procedure BackupClick(Sender: TObject);
+{ Asks this copy which PocketMedia is running (pocketmedia.exe --which-running):
+  0 none, 1 this one, 2 a different one (its folder in Other), -1 it could not be asked. }
+function WhichRunning(const App: String; var Other: String): Integer;
 var
   Code: Integer;
-  Exe: String;
+  Info: String;
+  Answer: TArrayOfString;
 begin
-  Exe := AddBackslash(ExpandConstant('{app}')) + ExeName;
-  if Exec(Exe, '--backup', ExpandConstant('{app}'), SW_SHOWNORMAL, ewNoWait, Code) then begin
-    Log('Started Back up library (' + Exe + ' --backup).');
-    BackupNote.Caption := 'PocketMedia is open at Back up library. When the backup has finished, exit PocketMedia ' +
-      '(right-click its tray icon, then Exit), then come back here.';
+  Other := '';
+  Info := ExpandConstant('{tmp}\pocketmedia-running.txt');
+  DeleteFile(Info);
+  if not Exec(AddBackslash(App) + ExeName, '--which-running "' + Info + '"', App, SW_HIDE, ewWaitUntilTerminated, Code) then begin
+    Result := -1;
+    Exit;
+  end;
+  Result := Code;
+  if Result = 2 then begin
+    { UTF-8 with a BOM, so a folder name in any language reads back right. }
+    if LoadStringsFromFile(Info, Answer) and (GetArrayLength(Answer) > 0) and (Pos(#9, Answer[0]) > 0) then
+      Other := Trim(Copy(Answer[0], Pos(#9, Answer[0]) + 1, MaxInt));
+    if Other = '' then
+      Other := 'another folder';
   end
+  else if (Result < 0) or (Result > 2) then
+    Result := -1;
+end;
+
+{ Back up library… on the warning: PocketMedia's own backup (checked copies of
+  the whole Media folder, with the library file), started with --backup.
+  The note says which PocketMedia the request reached: this copy (already
+  running, or started now), a different copy (then nothing is handed over and
+  nothing is backed up), or none. It never says the backup
+  happened: only PocketMedia knows when it has. }
+procedure BackupClick(Sender: TObject);
+var
+  Code, Running, I: Integer;
+  App, Exe, Other, Finished: String;
+begin
+  Finished := 'Your media is backed up only when PocketMedia shows "Backup finished". ' +
+    'Then exit PocketMedia (right-click its tray icon, then Exit) and come back here.';
+  App := RemoveBackslashUnlessRoot(ExpandConstant('{app}'));
+  Exe := AddBackslash(App) + ExeName;
+  Running := WhichRunning(App, Other);
+  Log('Which PocketMedia is running: ' + IntToStr(Running) + ' (0 none, 1 this one, 2 a different one, -1 could not ask).');
+  if Running = -1 then begin
+    BackupNote.Caption := 'Nothing was backed up: PocketMedia could not be started. ' +
+      'Copy the Media folder somewhere safe yourself before uninstalling.';
+    Exit;
+  end;
+  if Running = 2 then begin
+    Log('Back up library not started: a different PocketMedia is running, from ' + Other + '.');
+    BackupNote.Caption := 'Nothing was backed up. A different PocketMedia is running, from ' + Other +
+      ', and it cannot back up this one. Exit it (right-click its tray icon, then Exit), then click Back up library… again.';
+    Exit;
+  end;
+  if Running = 1 then begin
+    { The running copy is asked; the launch ends as soon as it has handed the request over. }
+    if Exec(Exe, '--backup', App, SW_SHOWNORMAL, ewWaitUntilTerminated, Code) and (Code = 0) then begin
+      Log('Back up library handed to the running PocketMedia.');
+      BackupNote.Caption := 'PocketMedia was running and was asked to open Back up library. ' + Finished;
+    end
+    else begin
+      Log('The running PocketMedia did not take the request (exit code ' + IntToStr(Code) + ').');
+      BackupNote.Caption := 'Nothing was backed up: the running PocketMedia did not answer. ' +
+        'Open it from its tray icon and choose Settings, then Back up library.';
+    end;
+    Exit;
+  end;
+  if not Exec(Exe, '--backup', App, SW_SHOWNORMAL, ewNoWait, Code) then begin
+    BackupNote.Caption := 'Nothing was backed up: PocketMedia could not be started (' + SysErrorMessage(Code) + '). ' +
+      'Copy the Media folder somewhere safe yourself before uninstalling.';
+    Exit;
+  end;
+  Log('Started Back up library (' + Exe + ' --backup).');
+  { Check that it was this copy that started (another one may have started meanwhile). }
+  for I := 1 to 40 do begin
+    Running := WhichRunning(App, Other);
+    if Running <> 0 then
+      Break;
+    Sleep(250);
+  end;
+  Log('After starting: ' + IntToStr(Running) + '.');
+  case Running of
+    1: BackupNote.Caption := 'PocketMedia started and opened Back up library. ' + Finished;
+    2: BackupNote.Caption := 'Nothing was backed up. A different PocketMedia is running, from ' + Other +
+         ', so this one did not start. Exit that one (right-click its tray icon, then Exit), then click Back up library… again.';
   else
-    MsgBox('PocketMedia could not be started (' + SysErrorMessage(Code) + '). ' +
-      'Copy the Media folder somewhere safe yourself before uninstalling.', mbError, MB_OK);
+    BackupNote.Caption := 'Nothing was backed up: PocketMedia did not start. ' +
+      'Copy the Media folder somewhere safe yourself before uninstalling.';
+  end;
 end;
 
 procedure ConfirmChange(Sender: TObject);
@@ -557,11 +664,11 @@ var
   W, X, Y, BoxTop, Res: Integer;
 begin
 #if VER >= EncodeVer(6,6,0)
-  Form := CreateCustomForm(ScaleX(520), ScaleY(420), False, False);
+  Form := CreateCustomForm(ScaleX(520), ScaleY(450), False, False);
 #else
   Form := CreateCustomForm;
   Form.ClientWidth := ScaleX(520);
-  Form.ClientHeight := ScaleY(420);
+  Form.ClientHeight := ScaleY(450);
 #endif
   try
     Form.Caption := 'PocketMedia Uninstall';
@@ -613,10 +720,11 @@ begin
     BackupBtn.SetBounds(X, Frame.Top + Frame.Height + ScaleY(12), ScaleX(140), ScaleY(25));
     BackupBtn.OnClick := @BackupClick;
     BackupNote := UninstText(Form, '', X + ScaleX(150), BackupBtn.Top, W - ScaleX(150));
-    BackupNote.Height := ScaleY(54);
+    { Up to six lines: the note says which PocketMedia was reached, and when the backup counts. }
+    BackupNote.Height := ScaleY(84);
 
     T := UninstText(Form, 'Type CONFIRM to acknowledge that your media will be deleted',
-      X, BackupBtn.Top + ScaleY(60), W);
+      X, BackupBtn.Top + ScaleY(90), W);
     ConfirmEdit := TNewEdit.Create(Form);
     ConfirmEdit.Parent := Form;
     ConfirmEdit.SetBounds(X, T.Top + T.Height + ScaleY(6), W, ScaleY(23));

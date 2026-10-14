@@ -36,7 +36,7 @@ const FOLDER_TITLE: &str = "Media folder";
 const IMPORT_TITLE: &str = "Import your existing media";
 const IMPORT_DESC: &str = "Select a folder. Supported files from it and all subfolders are sorted and copied into Pictures, GIFs and Videos. Original files stay where they are.";
 const BACKUP_TITLE: &str = "Back up library";
-const BACKUP_DESC: &str = "Includes media and settings. Choose a backup location outside PocketMedia.";
+const BACKUP_DESC: &str = "Includes everything in the Media folder, and settings. Choose a location outside PocketMedia.";
 const AUTOSTART_TITLE: &str = "Autostart PocketMedia";
 const AUTOSTART_DESC: &str = "Off unless you choose to enable it.";
 const SECTIONS: [&str; 4] = ["Performance", "Quick popup", "Library", "Startup"];
@@ -568,7 +568,16 @@ pub fn paint(p: &Painter, s: &SettingsPage, l: &SettingsLayout, ui: &SettingsUi)
     p.line(l.bar_x.0, l.bar_y + 0.5, l.bar_x.1, l.bar_y + 0.5, 1.0, LINE);
     let line = s.status_line();
     let note_c = if s.dirty() { widgets::SOFT_TEXT } else { MUTED };
-    p.text(&line, l.note, TextStyle::Small, note_c, Align::Start, true);
+    // One line when it fits; a longer message (an Autostart or save problem)
+    // wraps, centred on the buttons, as long as it stays inside the bar (below
+    // its divider), so its advice is not cut off.
+    let wrapped = p.gfx().wrapped_height(&line, TextStyle::Small, l.note.w);
+    let room = 2.0 * (l.note.y + l.note.h / 2.0 - l.bar_y) - 8.0;
+    if p.gfx().measure(&line, TextStyle::Small) <= l.note.w || wrapped > room {
+        p.text(&line, l.note, TextStyle::Small, note_c, Align::Start, true);
+    } else {
+        p.text_wrapped(&line, l.note.x, l.note.y + (l.note.h - wrapped) / 2.0, l.note.w, TextStyle::Small, note_c);
+    }
     widgets::button(p, l.cancel, &["Cancel"], hover(SHit::Cancel), ring(SFocus::Cancel));
     widgets::primary_button(p, l.save, "Save changes", s.dirty(), hover(SHit::Save), ring(SFocus::Save));
 

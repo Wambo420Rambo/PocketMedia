@@ -44,6 +44,7 @@ mod preview_test;
 mod seed;
 mod settings_test;
 mod shortcut_test;
+mod uninstall_test;
 mod window_test;
 
 const CMD_TARGET: usize = 1;
@@ -72,6 +73,9 @@ const CMD_STORE_REOPEN: usize = 18;
 const CMD_SET_CLOSE_AFTER: usize = 19;
 /// The next paste fails as if focus never came back.
 const CMD_FAIL_NEXT_PASTE: usize = 20;
+/// Posted, never sent: the tray menu's Exit (it may ask first, in a modal box).
+/// 21-24 belong to preview_test, 40-42 to watch_test, 50-51 to shortcut_test.
+const CMD_REQUEST_EXIT: usize = 30;
 
 static EXIT_CODE: AtomicI32 = AtomicI32::new(0);
 static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -166,7 +170,22 @@ impl El {
     }
 }
 
+/// Set when the self-test wrote its RESULT line.
+static FINISHED: AtomicBool = AtomicBool::new(false);
+static OUT: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// The number of failures. A self-test that ended before its RESULT line (the
+/// app exited or was closed early) counts as a failure, and the log says so.
 pub fn exit_code() -> i32 {
+    if ENABLED.load(Ordering::SeqCst) && !FINISHED.load(Ordering::SeqCst) {
+        if let Some(out) = OUT.lock().ok().and_then(|o| o.clone())
+            && let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(out.join("self-test.log"))
+        {
+            let _ = writeln!(f, "FAIL  the self-test ended before it finished (PocketMedia exited early)");
+            let _ = writeln!(f, "RESULT  ended early, 1 failed");
+        }
+        return EXIT_CODE.load(Ordering::SeqCst).max(1);
+    }
     EXIT_CODE.load(Ordering::SeqCst)
 }
 
@@ -184,6 +203,9 @@ pub fn note(text: &str) {
 
 pub fn start(out: PathBuf, main: HWND) {
     ENABLED.store(true, Ordering::SeqCst);
+    if let Ok(mut o) = OUT.lock() {
+        *o = Some(out.clone());
+    }
     let main = main.0 as isize;
     std::thread::spawn(move || {
         let failures = match Report::create(&out) {
@@ -194,6 +216,7 @@ pub fn start(out: PathBuf, main: HWND) {
             Err(_) => 1,
         };
         EXIT_CODE.store(failures as i32, Ordering::SeqCst);
+        FINISHED.store(true, Ordering::SeqCst);
         post(main, WM_SELFTEST, CMD_EXIT, 0);
     });
 }
@@ -298,6 +321,10 @@ pub fn on_ui_command(wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         }
         CMD_EXIT => {
             exit();
+            0
+        }
+        CMD_REQUEST_EXIT => {
+            crate::request_exit();
             0
         }
         cmd @ preview_test::CMD_PREVIEW_DESCRIBE..=preview_test::CMD_MANAGER_SHOW => preview_test::on_ui_command(cmd, lparam.0),
@@ -1215,8 +1242,9 @@ fn blocked_folder_test(r: &mut Report, out: &Path, exe: &Path) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// One PocketMedia per user: a second launch shows this one's popup
-/// and exits; a second launch from autostart exits without showing anything.
+/// One PocketMedia at a time: a second launch of this
+/// install shows this one's popup and exits; a second launch from autostart exits
+/// without showing anything; a copy in another folder hands nothing over.
 fn instance_test(r: &mut Report, t: &Session, exe: &Path) {
     let launch = |args: &[&str]| -> Option<i32> {
         let mut child = Command::new(exe).args(args).spawn().ok()?;
@@ -1279,6 +1307,9 @@ fn instance_test(r: &mut Report, t: &Session, exe: &Path) {
         post(manager, WM_CLOSE, 0, 0);
         wait_until(1500, || !is_visible(manager));
     }
+    // Back up library from the uninstaller, and a second copy of the program.
+    uninstall_test::backup_waits(r, t, exe);
+    uninstall_test::other_copy(r, t, exe);
 }
 
 // ---------------------------------------------------------------- helpers
@@ -1619,5 +1650,71 @@ fn save_capture(r: &mut Report, path: &Path, capture: Result<Capture, String>) {
             }
         }
         Err(e) => r.info(&format!("could not capture {}: {e}", path.display())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Every self-test command has its own number: a shared one runs the wrong
+    /// command (CMD_REQUEST_EXIT once shared 21 with CMD_PREVIEW_DESCRIBE and
+    /// ended the self-test early).
+    #[test]
+    fn self_test_commands_have_distinct_numbers() {
+        use super::*;
+        let all = [
+            CMD_TARGET,
+            CMD_STATUS,
+            CMD_FOCUS,
+            CMD_POPUP,
+            CMD_EXIT,
+            CMD_HOTKEY_OK,
+            CMD_POINT,
+            CMD_DESCRIBE,
+            CMD_RESET,
+            CMD_MANAGER,
+            CMD_MANAGER_POINT,
+            CMD_MANAGER_DESCRIBE,
+            CMD_MANAGER_ADD_POINT,
+            CMD_SETTINGS_POINT,
+            CMD_SETTINGS_SCROLL,
+            CMD_FORGET_TARGET,
+            CMD_STORE_DESCRIBE,
+            CMD_STORE_REOPEN,
+            CMD_SET_CLOSE_AFTER,
+            CMD_FAIL_NEXT_PASTE,
+            CMD_REQUEST_EXIT,
+            preview_test::CMD_PREVIEW_DESCRIBE,
+            preview_test::CMD_THUMBS_RESET,
+            preview_test::CMD_SET_VIDEO_PREVIEW,
+            preview_test::CMD_MANAGER_SHOW,
+            watch_test::CMD_LIB_FIND,
+            watch_test::CMD_WATCH_DESCRIBE,
+            watch_test::CMD_WATCH_RESTART,
+            shortcut_test::CMD_SC_TRY,
+            shortcut_test::CMD_SC_FREE,
+        ];
+        let mut sorted = all.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), all.len(), "two self-test commands share a number: {all:?}");
+        // The ranges the UI thread dispatches on hold only their own module's commands.
+        for c in all {
+            let in_preview = (preview_test::CMD_PREVIEW_DESCRIBE..=preview_test::CMD_MANAGER_SHOW).contains(&c);
+            let in_watch = (watch_test::CMD_LIB_FIND..=watch_test::CMD_WATCH_RESTART).contains(&c);
+            let in_shortcut = (shortcut_test::CMD_SC_TRY..=shortcut_test::CMD_SC_FREE).contains(&c);
+            let own = [
+                preview_test::CMD_PREVIEW_DESCRIBE,
+                preview_test::CMD_THUMBS_RESET,
+                preview_test::CMD_SET_VIDEO_PREVIEW,
+                preview_test::CMD_MANAGER_SHOW,
+                watch_test::CMD_LIB_FIND,
+                watch_test::CMD_WATCH_DESCRIBE,
+                watch_test::CMD_WATCH_RESTART,
+                shortcut_test::CMD_SC_TRY,
+                shortcut_test::CMD_SC_FREE,
+            ]
+            .contains(&c);
+            assert!(own || !(in_preview || in_watch || in_shortcut), "command {c} falls in another module's range");
+        }
     }
 }

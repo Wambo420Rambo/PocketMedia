@@ -100,7 +100,13 @@ pub struct AddMedia {
     pub scroll: f32,
     /// Shown on the start page when choosing failed (e.g. an unreadable folder).
     pub error: Option<String>,
+    /// Shown in the footer on every page, in place of the safety line: something
+    /// waits for this panel to close (the uninstaller's Back up library).
+    pub notice: Option<String>,
 }
+
+/// The uninstaller asked for Back up library while Add media was open.
+pub const BACKUP_WAITS: &str = "Back up library is waiting: finish or cancel Add media first, then choose Back up library in Settings.";
 
 impl Default for AddMedia {
     fn default() -> Self {
@@ -114,7 +120,7 @@ fn plural(n: usize, word: &str) -> String {
 
 impl AddMedia {
     pub fn new() -> Self {
-        Self { rows: Vec::new(), stage: Stage::Start, focus: AddFocus::ChooseFiles, focus_visible: false, scroll: 0.0, error: None }
+        Self { rows: Vec::new(), stage: Stage::Start, focus: AddFocus::ChooseFiles, focus_visible: false, scroll: 0.0, error: None, notice: None }
     }
 
     /// Any page after the start page.
