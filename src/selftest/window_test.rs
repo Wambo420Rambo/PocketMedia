@@ -42,9 +42,9 @@ pub(super) fn run(r: &mut Report, t: &Session) -> bool {
         return false;
     }
 
-    // The popup moves by its title bar.
-    let (Some(before), Some((sx, sy))) = (window_rect(t.popup), t.point(El::Neutral)) else {
-        return r.check("find the popup's title bar", false, "");
+    // The popup moves by its header (the logo is a handle).
+    let (Some(before), Some((sx, sy))) = (window_rect(t.popup), t.point(El::Handle)) else {
+        return r.check("find the popup's handle", false, "");
     };
     if !guard(r, &t.allowed) {
         return false;
@@ -62,7 +62,7 @@ pub(super) fn run(r: &mut Report, t: &Session) -> bool {
     std::thread::sleep(Duration::from_millis(250));
     let after = window_rect(t.popup);
     let moved = after.is_some_and(|a| (a.left - before.left - dx).abs() <= 2 && (a.top - before.top - dy).abs() <= 2);
-    r.check("the popup can be dragged by its title bar", moved && is_visible(t.popup), &format!("{before:?} -> {after:?}"));
+    r.check("the popup can be dragged by its header", moved && is_visible(t.popup), &format!("{before:?} -> {after:?}"));
     r.check("the popup stays in front after the drag", foreground() == t.popup, &super::describe_foreground());
     if guard(r, &t.allowed) {
         press(&[VK_ESCAPE]);

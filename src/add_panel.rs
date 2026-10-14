@@ -170,6 +170,12 @@ impl AddPanel {
         AddLayout::compute(&self.add, area.w, area.h, gfx)
     }
 
+    /// The head between the back button and the ×: drags the window.
+    pub fn is_caption(&self, gfx: &Gfx, area: Area, x: f32, y: f32) -> bool {
+        let l = self.layout(gfx, area);
+        y < add_view::HEAD_H && !l.back.contains(x, y) && !l.close.contains(x, y)
+    }
+
     pub fn paint(&self, gfx: &mut Gfx, hwnd: HWND, dpi: f32, area: Area) {
         let l = self.layout(gfx, area);
         let (caret_x, selection_w) = match self.add.focus {
@@ -218,7 +224,7 @@ impl AddPanel {
         match hit {
             AddHit::RowInput(i) if a.editable() => {
                 a.focus = AddFocus::Row(i);
-                let input_x = l.rows.get(i).and_then(|g| g.input).map_or(0.0, |r| r.x + 9.0);
+                let input_x = l.rows.get(i).and_then(|g| g.input).map_or(0.0, |r| r.x + 10.0);
                 let name = &mut a.rows[i].name;
                 let pos = gfx.position_at(name.text(), TextStyle::Row, x - input_x);
                 name.set_caret_utf16(pos);

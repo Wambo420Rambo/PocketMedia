@@ -13,13 +13,6 @@ pub enum ListKind {
 
 impl ListKind {
     pub const BOTH: [ListKind; 2] = [ListKind::Recent, ListKind::All];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            ListKind::Recent => "Recently used",
-            ListKind::All => "All media",
-        }
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -33,15 +26,6 @@ pub enum TypeFilter {
 impl TypeFilter {
     pub const ORDER: [TypeFilter; 4] = [TypeFilter::All, TypeFilter::Gif, TypeFilter::Picture, TypeFilter::Video];
 
-    pub fn label(self) -> &'static str {
-        match self {
-            TypeFilter::All => "All",
-            TypeFilter::Gif => "GIF",
-            TypeFilter::Picture => "Picture",
-            TypeFilter::Video => "Video",
-        }
-    }
-
     pub fn accepts(self, kind: MediaKind) -> bool {
         match self {
             TypeFilter::All => true,
@@ -52,18 +36,19 @@ impl TypeFilter {
     }
 }
 
-/// Keyboard focus targets, in Tab order.
+/// Keyboard focus targets (Tab order: `PopupState::focus_order`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Focus {
-    Close,
-    OpenManager,
-    AddMedia,
     Search,
+    Close,
     Type(usize),
+    /// The Recent / All media tabs (one stop; arrows switch).
     List,
     Gallery,
     EmptyAction,
     ClearHistory,
+    OpenManager,
+    AddMedia,
 }
 
 /// Why the gallery is empty; each case has its own message and action.
@@ -114,8 +99,6 @@ pub struct PopupState {
     pub focus: Focus,
     /// Show focus rings (keyboard navigation), as CSS :focus-visible does.
     pub focus_visible: bool,
-    /// Highlighted row while the Recently used / All media list is open.
-    pub dropdown: Option<usize>,
     /// Result line shown in the footer after an import, until the popup reopens.
     pub status: Option<String>,
 }
@@ -136,13 +119,17 @@ impl PopupState {
             scroll: 0.0,
             focus: Focus::Search,
             focus_visible: false,
-            dropdown: None,
             status: None,
         }
     }
 
     pub fn visible<'a>(&self, lib: &'a Library) -> Vec<&'a Item> {
-        let base: Vec<&Item> = match self.list {
+        self.visible_in(lib, self.list)
+    }
+
+    /// What `list` would show with the current type and search.
+    fn visible_in<'a>(&self, lib: &'a Library, list: ListKind) -> Vec<&'a Item> {
+        let base: Vec<&Item> = match list {
             ListKind::Recent => lib.recent.iter().filter_map(|id| lib.get(*id)).collect(),
             ListKind::All => lib.items.iter().collect(),
         };
@@ -163,9 +150,9 @@ impl PopupState {
         }
     }
 
-    pub fn count_label(&self, lib: &Library) -> String {
-        let n = self.visible(lib).len();
-        format!("{n} item{}", if n == 1 { "" } else { "s" })
+    /// The number on a list's tab.
+    pub fn count_for(&self, lib: &Library, list: ListKind) -> usize {
+        self.visible_in(lib, list).len()
     }
 
     pub fn selected_index(&self, lib: &Library) -> Option<usize> {
@@ -180,7 +167,6 @@ impl PopupState {
         self.search.clear();
         self.focus = Focus::Search;
         self.focus_visible = false;
-        self.dropdown = None;
         self.reset_view();
     }
 
@@ -196,7 +182,6 @@ impl PopupState {
 
     pub fn set_list(&mut self, list: ListKind) {
         self.list = list;
-        self.dropdown = None;
         self.reset_view();
     }
 
@@ -205,7 +190,6 @@ impl PopupState {
         self.list = ListKind::All;
         self.filter = TypeFilter::All;
         self.search.clear();
-        self.dropdown = None;
         self.focus = Focus::Search;
         self.status = Some(status);
         self.reset_view();
@@ -240,7 +224,8 @@ impl PopupState {
     }
 
     pub fn focus_order(&self, lib: &Library) -> Vec<Focus> {
-        let mut order = vec![Focus::Close, Focus::OpenManager, Focus::AddMedia, Focus::Search];
+        // Visual order: header, type and tabs, gallery, footer.
+        let mut order = vec![Focus::Search, Focus::Close];
         order.extend((0..TypeFilter::ORDER.len()).map(Focus::Type));
         order.push(Focus::List);
         match self.empty(lib) {
@@ -251,16 +236,16 @@ impl PopupState {
         if self.history_enabled(lib) {
             order.push(Focus::ClearHistory);
         }
+        order.extend([Focus::OpenManager, Focus::AddMedia]);
         order
     }
 
     pub fn tab(&mut self, lib: &Library, back: bool) {
         let order = self.focus_order(lib);
-        let current = order.iter().position(|f| *f == self.focus).unwrap_or(3);
+        let current = order.iter().position(|f| *f == self.focus).unwrap_or(0);
         let next = if back { (current + order.len() - 1) % order.len() } else { (current + 1) % order.len() };
         self.focus = order[next];
         self.focus_visible = true;
-        self.dropdown = None;
     }
 
     /// Moves the gallery selection by `delta` tiles, clamped to the list.
@@ -291,7 +276,7 @@ mod tests {
         let (s, lib) = state();
         assert_eq!(names(&s, &lib)[..3], ["Happy dance.gif", "Square.png", "Race clip.mp4"]);
         assert_eq!(names(&s, &lib)[3], "Celebration.mp4");
-        assert_eq!(s.count_label(&lib), "8 items");
+        assert_eq!(s.count_for(&lib, ListKind::Recent), 8);
     }
 
     #[test]
@@ -323,7 +308,7 @@ mod tests {
         s.set_list(ListKind::All);
         s.search.insert("dance happy");
         assert_eq!(names(&s, &lib), ["Happy dance.gif"]);
-        assert_eq!(s.count_label(&lib), "1 item");
+        assert_eq!(s.count_for(&lib, ListKind::All), 1);
         s.search.select_all();
         s.search.insert("celeb");
         assert_eq!(names(&s, &lib), ["Celebration.mp4"]);
@@ -355,8 +340,10 @@ mod tests {
     }
 
     #[test]
-    fn tab_order_wraps_and_skips_missing_controls() {
+    fn tab_order_follows_the_screen_and_skips_missing_controls() {
         let (mut s, mut lib) = state();
+        s.tab(&lib, false);
+        assert_eq!(s.focus, Focus::Close);
         s.tab(&lib, false);
         assert_eq!(s.focus, Focus::Type(0));
         for _ in 0..4 {
@@ -368,15 +355,28 @@ mod tests {
         s.tab(&lib, false);
         assert_eq!(s.focus, Focus::ClearHistory);
         s.tab(&lib, false);
-        assert_eq!(s.focus, Focus::Close);
+        assert_eq!(s.focus, Focus::OpenManager);
+        s.tab(&lib, false);
+        assert_eq!(s.focus, Focus::AddMedia);
+        s.tab(&lib, false);
+        assert_eq!(s.focus, Focus::Search, "wraps");
         s.clear_history(&mut lib);
         s.focus = Focus::List;
         s.tab(&lib, false);
         assert_eq!(s.focus, Focus::EmptyAction);
         s.tab(&lib, false);
-        assert_eq!(s.focus, Focus::Close, "Clear history is disabled, so it is skipped");
+        assert_eq!(s.focus, Focus::OpenManager, "Clear history is disabled, so it is skipped");
         s.tab(&lib, true);
         assert_eq!(s.focus, Focus::EmptyAction);
+    }
+
+    #[test]
+    fn each_tab_counts_its_own_list() {
+        let (mut s, mut lib) = state();
+        s.set_filter(TypeFilter::Gif);
+        assert_eq!(s.count_for(&lib, ListKind::All), 3);
+        lib.recent.truncate(1);
+        assert_eq!(s.count_for(&lib, ListKind::Recent), 1, "Happy dance.gif");
     }
 
     #[test]

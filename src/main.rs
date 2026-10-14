@@ -23,6 +23,7 @@ mod dialogs;
 mod digest;
 mod fileops;
 mod gif;
+mod hotkey;
 mod import;
 mod instance;
 mod jobs;
@@ -60,14 +61,11 @@ mod winutil;
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 
-use windows::Win32::Foundation::{ERROR_HOTKEY_ALREADY_REGISTERED, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Ole::{OleInitialize, OleUninitialize};
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
-};
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    HOT_KEY_MODIFIERS, MOD_ALT, MOD_NOREPEAT, MOD_WIN, RegisterHotKey, UnregisterHotKey, VK_OEM_PERIOD,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
@@ -76,9 +74,7 @@ use crate::target::{NoTarget, Target};
 
 pub const WM_TRAY: u32 = WM_APP + 1;
 pub const WM_SELFTEST: u32 = WM_APP + 2;
-const HOTKEY_ID: i32 = 1;
 pub const TIMER_PASTE: usize = 1;
-pub const SHORTCUT_LABEL: &str = "Win + Alt + .";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum StatusKind {
@@ -91,7 +87,6 @@ pub enum StatusKind {
 /// procedures re-enter each other (message boxes, menus and drag loops pump messages).
 pub struct App {
     pub main: Cell<HWND>,
-    pub hotkey_ok: Cell<bool>,
     /// Self-test mode: report problems in the log instead of message boxes.
     pub quiet: Cell<bool>,
     pub taskbar_created: Cell<u32>,
@@ -104,7 +99,6 @@ pub struct App {
 thread_local! {
     static APP: App = App {
         main: Cell::new(HWND::default()),
-        hotkey_ok: Cell::new(false),
         quiet: Cell::new(false),
         taskbar_created: Cell::new(0),
         activate: Cell::new(0),
@@ -333,18 +327,10 @@ fn run(mode: &Mode) -> Result<(), String> {
         popup::create(instance.into())?;
         tray::add(main);
 
-        let hotkey = RegisterHotKey(
-            Some(main),
-            HOTKEY_ID,
-            HOT_KEY_MODIFIERS(MOD_WIN.0 | MOD_ALT.0 | MOD_NOREPEAT.0),
-            VK_OEM_PERIOD.0 as u32,
-        );
-        match hotkey {
-            Ok(()) => app(|a| a.hotkey_ok.set(true)),
-            Err(e) => {
-                tray::set_tip(main, "PocketMedia - shortcut unavailable");
-                report_hotkey_failure(e);
-            }
+        let shortcut = store::settings().shortcut;
+        if let Err(reason) = hotkey::start(main, shortcut) {
+            tray::set_tip(main, "PocketMedia - shortcut unavailable");
+            report_hotkey_failure(&shortcut.label(), &reason);
         }
 
         match mode {
@@ -359,18 +345,12 @@ fn run(mode: &Mode) -> Result<(), String> {
     Ok(())
 }
 
-fn report_hotkey_failure(e: windows::core::Error) {
-    let reason = if e.code() == ERROR_HOTKEY_ALREADY_REGISTERED.to_hresult() {
-        "Another program (or another copy of PocketMedia) is already using it, \
-         or Windows has reserved it."
-            .to_string()
-    } else {
-        format!("Windows refused the registration: {} (0x{:08X}).", e.message(), e.code().0)
-    };
+fn report_hotkey_failure(label: &str, reason: &str) {
     let text = format!(
-        "PocketMedia could not register the shortcut {SHORTCUT_LABEL}\n\n{reason}\n\n\
+        "PocketMedia could not register the shortcut {label}\n\n{reason}\n\n\
          PocketMedia is still running in the tray. Right-click the tray icon and \
-         choose Open to use the popup without the shortcut."
+         choose Settings to pick another shortcut, or Quick popup to use the popup \
+         without one."
     );
     if app(|a| a.quiet.get()) {
         selftest::note(&format!("hotkey registration failed: {reason}"));
@@ -396,7 +376,7 @@ unsafe fn message_loop() {
 extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         match msg {
-            WM_HOTKEY if wparam.0 as i32 == HOTKEY_ID => {
+            WM_HOTKEY if wparam.0 as i32 == hotkey::ID => {
                 popup::toggle_from_hotkey();
                 LRESULT(0)
             }
@@ -410,7 +390,9 @@ extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
                     // normally the taskbar, which `capture_foreground` rejects.
                     let captured = target::capture_foreground();
                     match tray::show_menu(hwnd) {
-                        tray::MenuChoice::Open => popup::open(captured),
+                        tray::MenuChoice::QuickPopup => popup::open(captured),
+                        tray::MenuChoice::Manager => manager::show(),
+                        tray::MenuChoice::Settings => manager::show_settings(),
                         tray::MenuChoice::Exit => exit(),
                         tray::MenuChoice::None => {}
                     }
@@ -439,9 +421,7 @@ extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
                 LRESULT(0)
             }
             WM_DESTROY => {
-                if app(|a| a.hotkey_ok.replace(false)) {
-                    let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
-                }
+                hotkey::stop();
                 let _ = KillTimer(Some(hwnd), TIMER_PASTE);
                 watch::stop();
                 backup::shutdown();

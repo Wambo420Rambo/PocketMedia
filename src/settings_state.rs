@@ -41,21 +41,6 @@ pub enum VideoPreview {
     Off,
 }
 
-impl VideoPreview {
-    pub const BOTH: [VideoPreview; 2] = [VideoPreview::HoverOnly, VideoPreview::Off];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            VideoPreview::HoverOnly => "Hover only",
-            VideoPreview::Off => "Off",
-        }
-    }
-
-    pub fn index(self) -> usize {
-        Self::BOTH.iter().position(|v| *v == self).unwrap_or(0)
-    }
-}
-
 /// Saved in the store; a missing field takes its default.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -64,12 +49,20 @@ pub struct Settings {
     pub video_preview: VideoPreview,
     pub close_after_insert: bool,
     pub autostart: bool,
+    /// Opens the quick popup from any app.
+    pub shortcut: crate::hotkey::Shortcut,
 }
 
 impl Default for Settings {
     /// Use less memory if missing, Hover only, Close after inserting on, Autostart off.
     fn default() -> Self {
-        Self { profile: Profile::LessMemory, video_preview: VideoPreview::HoverOnly, close_after_insert: true, autostart: false }
+        Self {
+            profile: Profile::LessMemory,
+            video_preview: VideoPreview::HoverOnly,
+            close_after_insert: true,
+            autostart: false,
+            shortcut: crate::hotkey::Shortcut::default(),
+        }
     }
 }
 
@@ -81,6 +74,7 @@ pub enum SFocus {
     Nav(usize),
     /// The resource-usage radio group (one Tab stop; arrows choose).
     Profile,
+    /// The Video preview switch (Hover only when on).
     Video,
     Change,
     CloseAfter,
@@ -94,6 +88,46 @@ pub enum SFocus {
     PanelCancel,
     PanelOpen,
     PanelDone,
+    /// The shortcut chooser's buttons.
+    DialogReset,
+    DialogCancel,
+    DialogUse,
+}
+
+/// What the shortcut chooser thinks of the keys just pressed.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Verdict {
+    /// Nothing pressed yet.
+    Waiting,
+    /// Windows would give PocketMedia this shortcut.
+    Free,
+    /// It cannot be used, and why.
+    Refused(String),
+}
+
+/// The "Change shortcut" dialog over Settings. Keys pressed while it is open
+/// are recorded instead of acting; the draft changes only with Use shortcut.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShortcutDialog {
+    /// Modifiers held right now, shown until a key completes the shortcut.
+    pub held: crate::hotkey::Held,
+    pub candidate: Option<crate::hotkey::Shortcut>,
+    pub verdict: Verdict,
+}
+
+impl ShortcutDialog {
+    pub fn can_use(&self) -> bool {
+        self.candidate.is_some() && self.verdict == Verdict::Free
+    }
+
+    /// The buttons in Tab order; Use shortcut is a stop only when it is enabled.
+    pub fn buttons(&self) -> Vec<SFocus> {
+        let mut b = vec![SFocus::DialogReset, SFocus::DialogCancel];
+        if self.can_use() {
+            b.push(SFocus::DialogUse);
+        }
+        b
+    }
 }
 
 /// The panel over Settings while a backup runs, and its result afterwards
@@ -127,14 +161,14 @@ pub struct SettingsPage {
     pub scroll: f32,
     pub focus: SFocus,
     pub focus_visible: bool,
-    /// Highlighted row while the Video preview list is open.
-    pub video_open: Option<usize>,
     /// Result of the last action ("Settings saved.", a not-built-yet note, backup progress).
     pub note: Option<String>,
     /// Back up library is running: its button reads "Cancel backup".
     pub backup_running: bool,
     /// Shown over the page while it is Some.
     pub backup_panel: Option<BackupPanel>,
+    /// The shortcut chooser, over everything while it is Some.
+    pub shortcut_dialog: Option<ShortcutDialog>,
 }
 
 impl Default for SettingsPage {
@@ -156,10 +190,10 @@ impl SettingsPage {
             scroll: 0.0,
             focus: SFocus::Profile,
             focus_visible: false,
-            video_open: None,
             note: None,
             backup_running: false,
             backup_panel: None,
+            shortcut_dialog: None,
         }
     }
 
@@ -168,7 +202,7 @@ impl SettingsPage {
     pub fn enter(&mut self) {
         self.draft = self.saved;
         self.scroll = 0.0;
-        self.video_open = None;
+        self.shortcut_dialog = None;
         if !self.backup_running {
             self.note = None;
         }
@@ -187,9 +221,13 @@ impl SettingsPage {
         self.edit(|d| d.profile = p);
     }
 
-    pub fn set_video(&mut self, v: VideoPreview) {
-        self.edit(|d| d.video_preview = v);
-        self.video_open = None;
+    pub fn toggle_video(&mut self) {
+        self.edit(|d| {
+            d.video_preview = match d.video_preview {
+                VideoPreview::HoverOnly => VideoPreview::Off,
+                VideoPreview::Off => VideoPreview::HoverOnly,
+            }
+        });
     }
 
     pub fn toggle_close_after(&mut self) {
@@ -215,7 +253,6 @@ impl SettingsPage {
     /// Discards the draft.
     pub fn cancel(&mut self) {
         self.draft = self.saved;
-        self.video_open = None;
         self.note = Some(DISCARDED.into());
         if self.focus == SFocus::Save {
             self.focus = SFocus::Cancel;
@@ -247,7 +284,6 @@ impl SettingsPage {
         if first || !(sidebar || buttons.contains(&self.focus)) {
             self.focus = *buttons.last().unwrap_or(&SFocus::Backup);
         }
-        self.video_open = None;
         self.backup_panel = Some(panel);
     }
 
@@ -257,9 +293,54 @@ impl SettingsPage {
         self.focus = SFocus::Backup;
     }
 
+    // ------------------------------------------------------------ shortcut chooser
+
+    pub fn open_shortcut_dialog(&mut self) {
+        self.shortcut_dialog =
+            Some(ShortcutDialog { held: Default::default(), candidate: None, verdict: Verdict::Waiting });
+        self.focus = SFocus::DialogCancel;
+    }
+
+    /// Escape, Cancel: the draft is unchanged.
+    pub fn close_shortcut_dialog(&mut self) {
+        self.shortcut_dialog = None;
+        self.focus = SFocus::Change;
+    }
+
+    /// Modifiers pressed or released while nothing is chosen yet.
+    pub fn dialog_held(&mut self, held: crate::hotkey::Held) {
+        if let Some(d) = self.shortcut_dialog.as_mut() {
+            d.held = held;
+        }
+    }
+
+    /// A key that completes a shortcut, with Windows' answer for it (or the rules').
+    pub fn dialog_pressed(&mut self, shortcut: crate::hotkey::Shortcut, free: Result<(), String>) {
+        if let Some(d) = self.shortcut_dialog.as_mut() {
+            d.held = Default::default();
+            d.candidate = Some(shortcut);
+            d.verdict = match free {
+                Ok(()) => Verdict::Free,
+                Err(e) => Verdict::Refused(e),
+            };
+            self.focus = if d.can_use() { SFocus::DialogUse } else { SFocus::DialogCancel };
+        }
+    }
+
+    /// Use shortcut: the draft takes it (saved with Save changes).
+    pub fn use_shortcut(&mut self) {
+        let Some(s) = self.shortcut_dialog.as_ref().filter(|d| d.can_use()).and_then(|d| d.candidate) else { return };
+        self.edit(|d| d.shortcut = s);
+        self.close_shortcut_dialog();
+    }
+
     pub fn focus_order(&self) -> Vec<SFocus> {
-        let mut order = vec![SFocus::QuickPopup, SFocus::Close];
-        order.extend((0..5).map(SFocus::Nav));
+        if let Some(d) = &self.shortcut_dialog {
+            return d.buttons();
+        }
+        // Visual order: sidebar (with Quick popup at its foot), ×, then the page.
+        let mut order: Vec<SFocus> = (0..5).map(SFocus::Nav).collect();
+        order.extend([SFocus::QuickPopup, SFocus::Close]);
         // While the backup panel shows, only the sidebar and its buttons can be reached.
         if let Some(panel) = &self.backup_panel {
             order.extend(panel.buttons());
@@ -288,7 +369,6 @@ impl SettingsPage {
         let next = if back { (cur + order.len() - 1) % order.len() } else { (cur + 1) % order.len() };
         self.focus = order[next];
         self.focus_visible = true;
-        self.video_open = None;
     }
 }
 
@@ -343,7 +423,7 @@ mod tests {
     fn cancel_discards_the_draft() {
         let mut p = SettingsPage::new();
         p.set_profile(Profile::OpenFaster);
-        p.set_video(VideoPreview::Off);
+        p.toggle_video();
         p.cancel();
         assert_eq!(p.draft, Settings::default());
         assert_eq!(p.saved, Settings::default());
@@ -371,7 +451,7 @@ mod tests {
         let mut p = SettingsPage::new();
         p.set_profile(Profile::OpenFaster);
         p.save();
-        p.set_video(VideoPreview::Off);
+        p.toggle_video();
         p.enter();
         assert_eq!(p.draft.profile, Profile::OpenFaster, "saved edits stay");
         assert_eq!(p.draft.video_preview, VideoPreview::HoverOnly, "unsaved edits go");
@@ -389,12 +469,66 @@ mod tests {
     }
 
     #[test]
+    fn the_video_switch_flips_between_hover_only_and_off() {
+        let mut p = SettingsPage::new();
+        p.toggle_video();
+        assert_eq!(p.draft.video_preview, VideoPreview::Off);
+        p.toggle_video();
+        assert_eq!(p.draft.video_preview, VideoPreview::HoverOnly);
+        assert!(!p.dirty());
+    }
+
+    #[test]
+    fn a_new_shortcut_is_staged_until_save() {
+        use crate::hotkey::{Held, Shortcut};
+        let mut p = SettingsPage::new();
+        p.open_shortcut_dialog();
+        assert_eq!(p.focus_order(), [SFocus::DialogReset, SFocus::DialogCancel], "Use shortcut waits for keys");
+        p.dialog_held(Held { ctrl: true, ..Default::default() });
+        let wanted = Shortcut { ctrl: true, alt: true, shift: false, win: false, key: 0x50 };
+        p.dialog_pressed(wanted, Ok(()));
+        assert_eq!(p.focus, SFocus::DialogUse);
+        assert!(!p.shortcut_dialog.as_ref().unwrap().held.any(), "the held keys became the shortcut");
+        p.use_shortcut();
+        assert!(p.shortcut_dialog.is_none());
+        assert_eq!(p.focus, SFocus::Change);
+        assert_eq!(p.draft.shortcut, wanted);
+        assert_eq!(p.saved.shortcut, Shortcut::default(), "nothing is saved yet");
+        assert_eq!(p.status_line(), UNSAVED);
+        p.save();
+        assert_eq!(p.saved.shortcut, wanted);
+    }
+
+    #[test]
+    fn a_refused_shortcut_cannot_be_used() {
+        use crate::hotkey::Shortcut;
+        let mut p = SettingsPage::new();
+        p.open_shortcut_dialog();
+        let taken = Shortcut { ctrl: true, alt: true, shift: false, win: false, key: 0x54 };
+        p.dialog_pressed(taken, Err("Another app already uses it.".into()));
+        assert_eq!(p.focus, SFocus::DialogCancel);
+        assert!(!p.focus_order().contains(&SFocus::DialogUse));
+        p.use_shortcut();
+        assert!(p.shortcut_dialog.is_some(), "Use shortcut does nothing");
+        assert!(!p.dirty());
+        p.close_shortcut_dialog();
+        assert!(p.shortcut_dialog.is_none() && !p.dirty());
+    }
+
+    #[test]
+    fn old_library_files_without_a_shortcut_get_the_default() {
+        let s: Settings = serde_json::from_str(r#"{"profile":"open_faster"}"#).unwrap();
+        assert_eq!(s.shortcut, crate::hotkey::Shortcut::default());
+        assert_eq!(s.profile, Profile::OpenFaster);
+    }
+
+    #[test]
     fn save_is_a_tab_stop_only_when_enabled() {
         let mut p = SettingsPage::new();
         assert!(!p.focus_order().contains(&SFocus::Save));
         p.focus = SFocus::Cancel;
         p.tab(false);
-        assert_eq!(p.focus, SFocus::QuickPopup, "wraps past the disabled Save");
+        assert_eq!(p.focus, SFocus::Nav(0), "wraps past the disabled Save");
         p.toggle_autostart();
         p.focus = SFocus::Cancel;
         p.tab(false);

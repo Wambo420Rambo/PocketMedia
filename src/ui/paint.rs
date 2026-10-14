@@ -1,8 +1,8 @@
 //! Draws the quick popup from `PopupState`, the shared `Library` and `Layout`.
 
 use super::d2d::{Align, Painter};
-use super::layout::{Hit, Layout, Rect, TextStyle};
-use super::widgets::{self, ACCENT, BORDER, DANGER, MUTED, ON_ACCENT, RAISED, SearchBox, TEXT, TextMetrics, TileLook};
+use super::layout::{CHIP_LABELS, FOOTER_ADD, FOOTER_MANAGER, Hit, Layout, Rect, TAB_LABELS, TextStyle};
+use super::widgets::{self, ACCENT, BG, BORDER, DANGER, LINE, MUTED, SIDEBAR, SUBTLE, SearchLook, TEXT, TextMetrics, TileLook};
 use crate::library::Library;
 use crate::popup_state::{Focus, ListKind, PopupState, TypeFilter};
 
@@ -11,76 +11,83 @@ pub struct Ui {
     pub hover: Hit,
     pub dpi: f32,
     pub shortcut_ok: bool,
-    pub shortcut_label: &'static str,
+    pub shortcut_label: String,
     pub search: TextMetrics,
-    pub plus_w: f32,
 }
 
-pub fn search_box(l: &Layout) -> SearchBox {
-    SearchBox { outer: l.search, input: l.search_input, clear: l.search_clear }
-}
+pub const HINT: &str = "Enter to paste · Drag to attach";
 
 pub fn paint(p: &Painter, s: &PopupState, lib: &Library, l: &Layout, ui: &Ui) {
-    p.clear(widgets::BG);
+    p.clear(BG);
     let ring = |f: Focus| s.focus_visible && s.focus == f;
 
-    // Title bar
-    widgets::title_bar(p, l.titlebar, l.title, l.close, ui.hover == Hit::Close, ring(Focus::Close));
-    if ui.shortcut_ok {
-        p.text(ui.shortcut_label, l.shortcut, TextStyle::Small, MUTED, Align::Start, true);
-    } else {
-        let r = Rect::new(l.shortcut.x - 40.0, l.shortcut.y, l.shortcut.w + 80.0, l.shortcut.h);
-        p.text("Shortcut unavailable", r, TextStyle::Small, DANGER, Align::Center, true);
-    }
+    // Header: logo, search (with the shortcut while it is empty), ×.
+    let (lx, ly) = l.logo.center();
+    widgets::logo(p, lx, ly, l.logo.w);
+    let hint = if ui.shortcut_ok { (ui.shortcut_label.as_str(), SUBTLE) } else { ("Shortcut unavailable", DANGER) };
+    let look = SearchLook {
+        focused: s.focus == Focus::Search,
+        clear_hovered: ui.hover == Hit::SearchClear,
+        placeholder: "Search your media…",
+        hint: Some(hint),
+        style: TextStyle::Search,
+    };
+    widgets::search_box(p, &l.search_box(), &s.search, ui.search, &look);
+    widgets::close_button(p, l.close, ui.hover == Hit::Close, ring(Focus::Close));
 
-    // Open manager / Add media
-    let om = l.open_manager;
-    if ui.hover == Hit::OpenManager {
-        p.stroke(om, 6.0, 1.0, ACCENT);
-    }
-    // 1px border + 11px padding + empty icon slot + 7px gap.
-    p.text("Open manager", Rect::new(om.x + 19.0, om.y, om.w - 19.0, om.h), TextStyle::Body, TEXT, Align::Start, true);
-    widgets::ring(p, ring(Focus::OpenManager), om, 6.0);
-    widgets::add_media_button(p, l.add_media, ui.plus_w);
-    widgets::ring(p, ring(Focus::AddMedia), l.add_media, 6.0);
+    // Type: a segmented control.
+    let chosen = TypeFilter::ORDER.iter().position(|f| *f == s.filter).unwrap_or(0);
+    let hover = match ui.hover {
+        Hit::Chip(i) => Some(i),
+        _ => None,
+    };
+    let focus = match s.focus {
+        Focus::Type(i) if s.focus_visible => Some(i),
+        _ => None,
+    };
+    widgets::segmented(p, l.chips_track, &l.chips, &CHIP_LABELS, chosen, hover, focus);
 
-    widgets::search_box(p, &search_box(l), &s.search, s.focus == Focus::Search, ui.search, ui.hover == Hit::SearchClear);
-
-    // Type chips
-    p.text("Type", l.type_label, TextStyle::Small, MUTED, Align::Start, true);
-    for (i, (chip, filter)) in l.chips.iter().zip(TypeFilter::ORDER).enumerate() {
-        if s.filter == filter {
-            p.fill(*chip, 6.0, ACCENT);
-            p.text(filter.label(), *chip, TextStyle::Small, ON_ACCENT, Align::Center, true);
-        } else {
-            p.fill(*chip, 6.0, RAISED);
-            p.stroke(*chip, 6.0, 1.0, if ui.hover == Hit::Chip(i) { ACCENT } else { BORDER });
-            p.text(filter.label(), *chip, TextStyle::Small, TEXT, Align::Center, true);
+    // Recent / All media tabs, each with its count.
+    for (i, (tab, kind)) in l.tabs.iter().zip(ListKind::BOTH).enumerate() {
+        let on = s.list == kind;
+        let label_r = Rect::new(tab.x, tab.y, l.tab_label_w[i] + 2.0, tab.h);
+        let hot = ui.hover == Hit::ListTab(i);
+        let c = if on || hot { TEXT } else { MUTED };
+        p.text(TAB_LABELS[i], label_r, TextStyle::Label, c, Align::Start, true);
+        let count = s.count_for(lib, kind).to_string();
+        let count_r = Rect::new(label_r.right() + 4.0, tab.y, tab.w - label_r.w - 4.0, tab.h);
+        p.text(&count, count_r, TextStyle::Small, SUBTLE, Align::Start, true);
+        if on {
+            p.fill(Rect::new(tab.x, tab.bottom() - 4.0, l.tab_label_w[i], 2.0), 1.0, ACCENT);
         }
-        widgets::ring(p, ring(Focus::Type(i)), *chip, 6.0);
+        if s.focus_visible && s.focus == Focus::List && on {
+            widgets::ring(p, true, Rect::new(tab.x - 4.0, tab.y + 3.0, l.tab_label_w[i] + 8.0, tab.h - 6.0), 6.0);
+        }
     }
-
-    // Count and list
-    p.text(&s.count_label(lib), l.count, TextStyle::Medium, TEXT, Align::Start, true);
-    let open = ui.hover == Hit::List || s.dropdown.is_some();
-    widgets::select_box(p, l.list, s.list.label(), open, ring(Focus::List));
 
     gallery(p, s, lib, l, ui);
 
-    // Footer
-    p.line(l.footer.x, l.footer.y + 0.5, l.footer.right(), l.footer.y + 0.5, 1.0, BORDER);
-    let hint = s.status.as_deref().unwrap_or("Click / Enter to paste · Drag to attach · Esc to close");
-    p.text(hint, l.footer_text, TextStyle::Small, MUTED, Align::Start, true);
+    // Footer: hint or result, then Clear history, Manager and Add.
+    p.fill(l.footer, 0.0, SIDEBAR);
+    p.line(l.footer.x, l.footer.y + 0.5, l.footer.right(), l.footer.y + 0.5, 1.0, LINE);
+    match s.status.as_deref() {
+        Some(status) => {
+            let lines = p.gfx().line_count(status, TextStyle::Small, l.footer_text.w).min(2);
+            let h = lines as f32 * TextStyle::Small.line();
+            let y = l.footer_text.y + (l.footer_text.h - h) / 2.0;
+            p.push_clip(l.footer_text);
+            p.text_wrapped(status, l.footer_text.x, y, l.footer_text.w, TextStyle::Small, MUTED);
+            p.pop_clip();
+        }
+        None => p.text(HINT, l.footer_text, TextStyle::Small, SUBTLE, Align::Start, true),
+    }
     let enabled = s.history_enabled(lib);
     widgets::quiet_button(p, l.clear_history, "Clear history", TextStyle::Small, ui.hover == Hit::ClearHistory, enabled);
-    widgets::ring(p, ring(Focus::ClearHistory), l.clear_history, 6.0);
+    widgets::ring(p, ring(Focus::ClearHistory), l.clear_history, widgets::RADIUS);
+    widgets::quiet_button(p, l.open_manager, FOOTER_MANAGER, TextStyle::Small, ui.hover == Hit::OpenManager, true);
+    widgets::ring(p, ring(Focus::OpenManager), l.open_manager, widgets::RADIUS);
+    widgets::add_button(p, l.add_media, FOOTER_ADD, ui.hover == Hit::AddMedia, ring(Focus::AddMedia));
 
-    if let Some(row) = s.dropdown {
-        let menu = widgets::Menu { frame: l.dropdown, rows: l.dropdown_rows.to_vec() };
-        let labels = ListKind::BOTH.map(ListKind::label);
-        let current = ListKind::BOTH.iter().position(|k| *k == s.list).unwrap_or(0);
-        widgets::menu(p, &menu, &labels, row, current);
-    }
     p.stroke(Rect::new(0.0, 0.0, l.width, l.height), 8.0, 1.0, BORDER);
 }
 

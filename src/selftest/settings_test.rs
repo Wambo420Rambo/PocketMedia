@@ -1,10 +1,11 @@
 //! Self-test steps for the Settings page: popup -> Manager -> Settings,
 //! every screen (focused-40 to focused-46), staged edits with Save and
-//! Cancel, the keyboard, and Add media from "Choose folder…".
+//! Cancel, the keyboard, the shortcut chooser (shortcut_test.rs), and Add media
+//! from "Choose folder…".
 
 use std::time::Duration;
 
-use windows::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_LEFT, VK_RETURN, VK_SPACE, VK_TAB};
+use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_LEFT, VK_RETURN, VK_SPACE, VK_TAB};
 
 use super::manager_test;
 use super::{
@@ -16,8 +17,8 @@ use super::{
 use crate::ui::manager_view::MHit;
 use crate::ui::settings_view::SHit;
 
-/// The scroll offset of focused-43 and focused-44 (Quick popup panel at the top).
-const LIBRARY_PANEL_SCROLL: isize = 261;
+/// A scroll offset that puts the Library card near the top (focused-43 and focused-44).
+const LIBRARY_PANEL_SCROLL: isize = 420;
 const END: isize = 100_000;
 
 /// SHit <-> number, for `CMD_SETTINGS_POINT`.
@@ -31,7 +32,6 @@ pub(super) fn code(h: SHit) -> isize {
         SHit::Nav(i) => 10 + i as isize,
         SHit::Profile(i) => 20 + i as isize,
         SHit::Video => 30,
-        SHit::VideoRow(i) => 31 + i as isize,
         SHit::Change => 40,
         SHit::CloseAfter => 41,
         SHit::OpenFolder => 42,
@@ -43,6 +43,9 @@ pub(super) fn code(h: SHit) -> isize {
         SHit::PanelCancel => 60,
         SHit::PanelOpen => 61,
         SHit::PanelDone => 62,
+        SHit::DialogReset => 70,
+        SHit::DialogCancel => 71,
+        SHit::DialogUse => 72,
     }
 }
 
@@ -54,7 +57,6 @@ pub(super) fn decode(c: isize) -> SHit {
         10..=14 => SHit::Nav((c - 10) as usize),
         20..=21 => SHit::Profile((c - 20) as usize),
         30 => SHit::Video,
-        31..=32 => SHit::VideoRow((c - 31) as usize),
         40 => SHit::Change,
         41 => SHit::CloseAfter,
         42 => SHit::OpenFolder,
@@ -66,6 +68,9 @@ pub(super) fn decode(c: isize) -> SHit {
         60 => SHit::PanelCancel,
         61 => SHit::PanelOpen,
         62 => SHit::PanelDone,
+        70 => SHit::DialogReset,
+        71 => SHit::DialogCancel,
+        72 => SHit::DialogUse,
         _ => SHit::None,
     }
 }
@@ -159,7 +164,7 @@ fn store_file(name: &str) -> std::path::PathBuf {
     crate::paths::get().map(|p| p.data.join(name)).unwrap_or_default()
 }
 
-fn read_json(name: &str) -> Option<serde_json::Value> {
+pub(super) fn read_json(name: &str) -> Option<serde_json::Value> {
     std::fs::read_to_string(store_file(name)).ok().and_then(|t| serde_json::from_str(&t).ok())
 }
 
@@ -276,20 +281,20 @@ pub(super) fn run(r: &mut Report, t: &Session) -> bool {
         &["close_after=false autostart=true", "saved=LessMemory/HoverOnly/true/false", "dirty=true", "line=\"Unsaved changes\""],
     );
 
-    // focused-42: profile, video preview, and the shortcut's Change button.
+    // focused-42: profile, the video preview switch, and the shortcut chooser.
     s.scroll_to(0);
     s.click(r, SHit::Profile(1));
     s.click(r, SHit::Video);
-    s.shot(r, "state-settings-video-open");
-    s.has(r, "the Video preview list opens", &["video_open=true"]);
-    s.click(r, SHit::VideoRow(1));
+    s.has(r, "the Video preview switch turns hover video off", &["profile=OpenFaster video=Off", "dirty=true"]);
     s.click(r, SHit::Change);
+    s.park();
     s.shot(r, "focused-42-settings-shortcut-chooser");
-    s.has(
-        r,
-        "profile and video preview are staged; Change says it is not built yet (focused-42)",
-        &["profile=OpenFaster video=Off", "dirty=true", "Unsaved changes · Changing the shortcut is not built yet."],
-    );
+    s.has(r, "Change opens the shortcut chooser over the page (focused-42)", &["dialog=:waiting", "dirty=true"]);
+    if guard(r, &t.allowed) {
+        press(&[VK_ESCAPE]);
+        settle();
+    }
+    s.has(r, "Escape closes the chooser; the other edits stay staged", &["dialog=none", "profile=OpenFaster video=Off", "dirty=true"]);
     s.scroll_to(END);
     s.park();
     s.shot(r, "focused-42-settings-shortcut-chooser-scrolled1");
@@ -364,15 +369,18 @@ pub(super) fn run(r: &mut Report, t: &Session) -> bool {
 
     // Keyboard: Tab through the page; arrows, Space and Enter work the controls.
     if guard(r, &t.allowed) {
-        press(&[VK_TAB]);
+        // Settings, then Quick popup and × (the sidebar's foot and the top right), then the page.
+        for _ in 0..3 {
+            press(&[VK_TAB]);
+        }
         s.park();
         s.shot(r, "state-settings-keyboard-focus");
         s.has(r, "Tab from the sidebar reaches the resource choice", &["focus=Profile", "focus_visible=true"]);
         press(&[VK_LEFT]);
         press(&[VK_TAB]);
-        press(&[VK_DOWN]);
+        press(&[VK_SPACE]);
         settle();
-        s.has(r, "arrow keys change the radio group and the select", &["profile=LessMemory video=Off", "dirty=true"]);
+        s.has(r, "arrow keys change the resource choice; Space flips a switch", &["profile=LessMemory video=Off", "dirty=true"]);
         for _ in 0..6 {
             press(&[VK_TAB]);
         }
@@ -388,6 +396,7 @@ pub(super) fn run(r: &mut Report, t: &Session) -> bool {
         s.has(r, "Enter on Save commits", &["saved=LessMemory/Off/true/true", "dirty=false", "focus=Cancel"]);
     }
     store_checks(r, &s);
+    super::shortcut_test::run(r, &s);
 
     // "Choose folder…" opens Add media at its review step; leaving it returns here.
     s.scroll_to(LIBRARY_PANEL_SCROLL);

@@ -43,6 +43,7 @@ mod watch_test;
 mod preview_test;
 mod seed;
 mod settings_test;
+mod shortcut_test;
 mod window_test;
 
 const CMD_TARGET: usize = 1;
@@ -82,6 +83,8 @@ static DESCRIBE: Mutex<String> = Mutex::new(String::new());
 #[derive(Clone, Copy, Debug)]
 enum El {
     Neutral,
+    /// The popup's logo, which drags it.
+    Handle,
     Search,
     OpenManager,
     AddMediaButton,
@@ -96,8 +99,8 @@ enum El {
     AddBack,
     AddMain,
     Chip(usize),
-    List,
-    Row(usize),
+    /// Recently used (0) or All media (1).
+    Tab(usize),
     GalleryGap,
     ClearHistory,
     EmptyAction,
@@ -108,6 +111,7 @@ impl El {
     fn code(self) -> isize {
         match self {
             El::Neutral => 0,
+            El::Handle => 5,
             El::Search => 2,
             El::OpenManager => 4,
             El::AddMediaButton => 3,
@@ -121,8 +125,7 @@ impl El {
             El::AddBack => 233,
             El::AddMain => 234,
             El::Chip(i) => 10 + i as isize,
-            El::List => 20,
-            El::Row(i) => 30 + i as isize,
+            El::Tab(i) => 30 + i as isize,
             El::GalleryGap => 40,
             El::ClearHistory => 50,
             El::EmptyAction => 60,
@@ -136,6 +139,7 @@ impl El {
             201 => AddHit::ImportExisting,
             210..=229 => AddHit::RowInput((code - 210) as usize),
             240..=259 => AddHit::Remove((code - 240) as usize),
+            5 => return Target::Handle,
             230 => AddHit::ChooseAgain,
             231 => AddHit::Cancel,
             232 => AddHit::Add,
@@ -152,8 +156,7 @@ impl El {
             3 => Hit::AddMedia,
             4 => Hit::OpenManager,
             10..=13 => Hit::Chip((code - 10) as usize),
-            20 => Hit::List,
-            30..=31 => Hit::DropdownRow((code - 30) as usize),
+            30..=31 => Hit::ListTab((code - 30) as usize),
             40 => Hit::Scrollbar,
             50 => Hit::ClearHistory,
             60 => Hit::EmptyAction,
@@ -214,7 +217,7 @@ pub fn on_ui_command(wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         // SAFETY: SetForegroundWindow tolerates any HWND value, including stale ones.
         CMD_FOCUS => unsafe { SetForegroundWindow(hwnd(lparam.0)) }.0 as isize,
         CMD_POPUP => popup::hwnd().0 as isize,
-        CMD_HOTKEY_OK => app(|a| a.hotkey_ok.get()) as isize,
+        CMD_HOTKEY_OK => crate::hotkey::ok() as isize,
         CMD_POINT => pack(popup::element_center(El::target(lparam.0))),
         CMD_MANAGER => manager::hwnd().0 as isize,
         CMD_MANAGER_POINT => pack(manager::element_center(manager_test::decode(lparam.0))),
@@ -254,7 +257,7 @@ pub fn on_ui_command(wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         }
         CMD_MANAGER_ADD_POINT => match El::target(lparam.0) {
             Target::Add(hit) => pack(manager::add_element_center(hit)),
-            Target::Gallery(_) => isize::MIN,
+            Target::Gallery(_) | Target::Handle => isize::MIN,
         },
         CMD_MANAGER_DESCRIBE => {
             if let Ok(mut d) = DESCRIBE.lock() {
@@ -269,6 +272,12 @@ pub fn on_ui_command(wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             crate::autostart::remove_test_key();
             crate::store::reset_for_test();
             crate::autostart::sync_store();
+            // A section that changed the shortcut gives the default back.
+            if crate::hotkey::current() != crate::hotkey::Shortcut::default()
+                && let Err(e) = crate::hotkey::apply(crate::hotkey::Shortcut::default())
+            {
+                note(&format!("could not restore the default shortcut: {e}"));
+            }
             if let Err(e) = seed::reset_library() {
                 note(&format!("could not create the test library: {e}"));
             }
@@ -293,6 +302,7 @@ pub fn on_ui_command(wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         }
         cmd @ preview_test::CMD_PREVIEW_DESCRIBE..=preview_test::CMD_MANAGER_SHOW => preview_test::on_ui_command(cmd, lparam.0),
         cmd @ watch_test::CMD_LIB_FIND..=watch_test::CMD_WATCH_RESTART => watch_test::on_ui_command(cmd, lparam.0),
+        cmd @ shortcut_test::CMD_SC_TRY..=shortcut_test::CMD_SC_FREE => shortcut_test::on_ui_command(cmd, lparam.0),
         _ => 0,
     };
     LRESULT(value)
@@ -642,9 +652,7 @@ fn run_input_tests(r: &mut Report, t: &Session) -> bool {
     t.shot(r, "focused-01-popup-recent-scrolled1");
     r.check("gallery scrolls inside the window", popup_size_unchanged(popup), "window size unchanged after scrolling");
 
-    t.click(r, El::List);
-    t.shot(r, "state-list-open");
-    t.click(r, El::Row(1));
+    t.click(r, El::Tab(1));
     t.park();
     t.shot(r, "focused-02-popup-all-media");
     t.expect(r, "All media list (focused-02)", &ALL);
@@ -717,8 +725,7 @@ fn run_input_tests(r: &mut Report, t: &Session) -> bool {
     if !t.open(r) {
         return false;
     }
-    t.click(r, El::List);
-    t.click(r, El::Row(0));
+    t.click(r, El::Tab(0));
     t.click(r, El::ClearHistory);
     t.park();
     t.shot(r, "state-history-cleared");
@@ -979,8 +986,7 @@ fn drag_test(r: &mut Report, t: &Session) {
     let (kind, text) = status(t.main);
     r.check("app records drag result", kind == 1, &text);
     t.open(r);
-    t.click(r, El::List);
-    t.click(r, El::Row(0));
+    t.click(r, El::Tab(0));
     let d = t.describe();
     r.check("a finished copy-drag goes to the top of Recently used", d.contains(&format!("names={dragged}|")), &d);
 }
@@ -1092,8 +1098,7 @@ fn paste_tests(r: &mut Report, t: &Session) -> bool {
         r.check(&format!("{name}: the app records the paste"), kind == 1, &text);
     }
     t.open(r);
-    t.click(r, El::List);
-    t.click(r, El::Row(0));
+    t.click(r, El::Tab(0));
     t.state_has(
         r,
         "pastes go to the top of Recently used, newest first",

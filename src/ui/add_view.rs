@@ -1,28 +1,27 @@
-//! Add media panel (Focused layout): geometry, hit-testing and drawing.
-//! Numbers come from the wireframe CSS (.pm-import-*, .pm-dropzone, .pm-input)
-//! and were checked against focused-11/12 in screenshots-dark.
+//! Add media panel: geometry, hit-testing and drawing. The same
+//! panel fills the quick popup and the Manager.
 
 use super::d2d::{Align, Color, Gfx, Painter};
 use super::layout::{Rect, TextStyle};
-use super::widgets::{self, ACCENT, BG, BORDER, DISABLED, ERROR, MUTED, ON_ACCENT, RAISED, RING, SOFT_TEXT, SURFACE, TEXT};
+use super::widgets::{self, ACCENT, BG, BORDER, ERROR, FIELD, LINE, MUTED, RAISED, RING, SOFT_TEXT, SUBTLE, SURFACE, TEXT};
 use crate::add_media::{AddFocus, AddMedia, RowStatus};
 
 const PAD: f32 = 20.0;
-const HEAD_PAD_TOP: f32 = 20.0;
-const HEAD_PAD_BOTTOM: f32 = 16.0;
-const BACK_W: f32 = 32.0;
+/// Height of the head (back button, title, subtitle, ×). Between the back button
+/// and the × it drags the window.
+pub const HEAD_H: f32 = 76.0;
+const BACK_W: f32 = 36.0;
+const CLOSE: f32 = 36.0;
 const BUTTON_H: f32 = 36.0;
-const DROP_H: f32 = 136.0;
-const INPUT_H: f32 = 30.0;
-const ROW_PAD: f32 = 13.0;
-const ICON_COL: f32 = 20.0;
+const DROP_H: f32 = 140.0;
+const INPUT_H: f32 = 32.0;
+const ROW_PAD: f32 = 12.0;
 const COL_GAP: f32 = 10.0;
-const ROUTE_W: f32 = 76.0;
+const ROUTE_W: f32 = 70.0;
 /// The × at the end of each review row (leaves a file out).
 const REMOVE_W: f32 = 28.0;
-const DROP_FILL: Color = Color::rgb(0x232434); // --pm-soft 35% over --pm-bg
 /// The panel is at most this wide and centred, so it reads well in the wide
-/// Manager window too (CSS .pm-import-host max-width).
+/// Manager window too.
 const HOST_MAX_W: f32 = 680.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,8 +58,6 @@ pub struct AddLayout {
     /// Right edge of the panel, where its scrollbar goes.
     pub host_right: f32,
     pub close: Rect,
-    pub title_bar: Rect,
-    pub title: Rect,
     pub back: Rect,
     pub heading: Rect,
     pub subtitle: Rect,
@@ -93,67 +90,68 @@ const IMPORT_EXISTING: (&str, &str) = (
 
 impl AddLayout {
     pub fn compute(a: &AddMedia, width: f32, height: f32, gfx: &Gfx) -> Self {
-        let title_bar = Rect::new(1.0, 1.0, width - 2.0, 46.0);
-        let close = Rect::new(width - 1.0 - 14.0 - 32.0, 1.0 + (45.0 - 28.0) / 2.0, 32.0, 28.0);
-        let title = Rect::new(1.0 + 14.0 + 9.0, 1.0, gfx.measure("PocketMedia", TextStyle::Medium), 45.0);
-
         // The panel: full width in the popup, centred at 680 in the Manager.
         let host_w = (width - 2.0).min(HOST_MAX_W);
         let host_x = (width - host_w) / 2.0;
-        // Head: [back 32][12][title / subtitle], padding 20 20 16.
         let x0 = host_x + PAD;
         let inner_w = host_w - 2.0 * PAD;
-        let head_y = 47.0 + HEAD_PAD_TOP;
-        let head_h = TextStyle::Title.line() + 4.0 + TextStyle::Small.line();
-        let back = Rect::new(x0, head_y + (head_h - BUTTON_H) / 2.0, BACK_W, BUTTON_H);
-        let text_x = back.right() + 12.0;
-        let heading = Rect::new(text_x, head_y, inner_w - BACK_W - 12.0, TextStyle::Title.line());
-        let subtitle = Rect::new(text_x, heading.bottom() + 4.0, heading.w, TextStyle::Small.line());
-        let main_y = head_y + head_h + HEAD_PAD_BOTTOM;
+        // Head: [← 36][12][title / subtitle] ... [× 36] at the window's corner.
+        let head_y = 1.0 + 16.0;
+        let head_h = TextStyle::Title.line() + 2.0 + TextStyle::Small.line();
+        let close = Rect::new(width - 1.0 - 14.0 - CLOSE, head_y + (head_h - CLOSE) / 2.0, CLOSE, CLOSE);
+        let back = Rect::new(x0, head_y + (head_h - BACK_W) / 2.0, BACK_W, BACK_W);
+        let text_x = back.right() + 14.0;
+        let heading = Rect::new(text_x, head_y, (close.x - 8.0).min(x0 + inner_w) - text_x, TextStyle::Title.line());
+        let subtitle = Rect::new(text_x, heading.bottom() + 2.0, heading.w, TextStyle::Small.line());
+        let main_y = 1.0 + HEAD_H + 6.0;
 
-        // Footer: padding 14 20, safety line, then actions (review only) after 12px.
+        // Footer: the safety line, then the actions (review only) at its right.
         let review = a.reviewing();
-        let footer_h = 1.0 + 14.0 + TextStyle::Small.line() + 14.0 + if review { 12.0 + BUTTON_H } else { 0.0 };
+        let footer_h = 16.0 + BUTTON_H + 16.0;
         let footer = Rect::new(host_x, height - 1.0 - footer_h, host_w, footer_h);
-        let safety = Rect::new(x0 + 7.0, footer.y + 1.0 + 14.0, inner_w - 7.0, TextStyle::Small.line());
-        let actions_y = safety.bottom() + 12.0;
-        let add_w = 24.0 + gfx.measure(&a.add_label(), TextStyle::Body);
+        let actions_y = footer.y + 16.0;
+        let add_w = widgets::text_button_w(gfx, &a.add_label(), TextStyle::Medium);
         let add = Rect::new(x0 + inner_w - add_w, actions_y, add_w, BUTTON_H);
-        let cancel_w = 24.0 + gfx.measure("Cancel", TextStyle::Body);
+        let cancel_w = widgets::text_button_w(gfx, "Cancel", TextStyle::Body);
         let cancel = Rect::new(add.x - 8.0 - cancel_w, actions_y, cancel_w, BUTTON_H);
+        let safety_w = if review { cancel.x - 12.0 - x0 } else { inner_w };
+        let safety = Rect::new(x0, actions_y, safety_w, BUTTON_H);
 
         let main = Rect::new(x0, main_y, inner_w, (footer.y - main_y).max(0.0));
         let top = main.y - a.scroll;
 
         // Start page.
         let drop = Rect::new(x0, top, inner_w, DROP_H);
-        let chevron_w = gfx.measure("›", TextStyle::Body);
-        let choice_text_w = inner_w - 2.0 - 24.0 - 12.0 - 12.0 - chevron_w;
-        let choice_h = |small: &str| 2.0 + 28.0 + TextStyle::Medium.line() + 4.0 + gfx.wrapped_height(small, TextStyle::Small, choice_text_w);
-        let choose_files = Rect::new(x0, drop.bottom() + 16.0, inner_w, choice_h(CHOOSE_FILES.1));
-        let import_existing = Rect::new(x0, choose_files.bottom() + 8.0, inner_w, choice_h(IMPORT_EXISTING.1));
+        let choice_text_w = inner_w - 18.0 - 18.0 - 12.0 - 10.0;
+        let choice_h = |small: &str| 32.0 + TextStyle::Medium.line() + 4.0 + gfx.wrapped_height(small, TextStyle::Small, choice_text_w);
+        let choose_files = Rect::new(x0, drop.bottom() + 14.0, inner_w, choice_h(CHOOSE_FILES.1));
+        let import_existing = Rect::new(x0, choose_files.bottom() + 10.0, inner_w, choice_h(IMPORT_EXISTING.1));
         let error = a.error.as_deref().map(|e| Rect::new(x0, import_existing.bottom() + 12.0, inner_w, gfx.wrapped_height(e, TextStyle::Small, inner_w)));
 
         // Review page.
         let summary = Rect::new(x0, top, inner_w, TextStyle::Small.line());
-        let name_x = x0 + ICON_COL + COL_GAP;
-        let name_w = inner_w - ICON_COL - COL_GAP - COL_GAP - ROUTE_W - COL_GAP - REMOVE_W;
+        let name_x = x0;
+        let name_w = inner_w - COL_GAP - ROUTE_W - COL_GAP - REMOVE_W;
+        // Every name field is the same width; the extension follows it.
+        let ext_max = gfx.measure(".jpeg", TextStyle::Small);
+        let input_w = name_w - 6.0 - ext_max;
         let route_x = x0 + inner_w - REMOVE_W - COL_GAP - ROUTE_W;
-        let mut y = summary.bottom() + 12.0;
+        let mut y = summary.bottom() + 8.0;
         let mut rows = Vec::new();
         for row in &a.rows {
             let ext_w = gfx.measure(row.ext(), TextStyle::Small);
             let (input, first_h) = match row.status {
-                RowStatus::Copy => (Some(Rect::new(name_x, y + ROW_PAD, name_w - 4.0 - ext_w, INPUT_H)), INPUT_H),
+                RowStatus::Copy => (Some(Rect::new(name_x, y + ROW_PAD, input_w, INPUT_H)), INPUT_H),
                 RowStatus::Skip => (None, TextStyle::Row.line()),
             };
             let msg = row.message();
-            let msg_h = msg.as_deref().map_or(0.0, |m| 3.0 + gfx.wrapped_height(m, TextStyle::Small, name_w));
+            let msg_h = msg.as_deref().map_or(0.0, |m| 4.0 + gfx.wrapped_height(m, TextStyle::Small, name_w));
             let inner_h = first_h + msg_h;
             let r = Rect::new(x0, y, inner_w, ROW_PAD + inner_h + ROW_PAD + 1.0);
-            let ext = Rect::new(name_x + name_w - ext_w, y + ROW_PAD, ext_w, INPUT_H);
-            let message = msg.map(|m| (Rect::new(name_x, y + ROW_PAD + first_h + 3.0, name_w, msg_h - 3.0), m));
-            let route = Rect::new(route_x, y + ROW_PAD, ROUTE_W, inner_h);
+            let ext = Rect::new(name_x + input_w + 6.0, y + ROW_PAD, ext_w, first_h);
+            let message = msg.map(|m| (Rect::new(name_x, y + ROW_PAD + first_h + 4.0, name_w, msg_h - 4.0), m));
+            // The destination lines up with the name, not with the row's middle.
+            let route = Rect::new(route_x, y + ROW_PAD, ROUTE_W, first_h);
             let remove = a
                 .editable()
                 .then(|| Rect::new(x0 + inner_w - REMOVE_W, y + ROW_PAD + (first_h - REMOVE_W) / 2.0, REMOVE_W, REMOVE_W));
@@ -162,8 +160,8 @@ impl AddLayout {
         }
         let note_h = gfx.wrapped_height(NOTE, TextStyle::Small, inner_w);
         let note = Rect::new(x0, y + 12.0, inner_w, note_h);
-        let ca_w = 24.0 + gfx.measure("Choose again", TextStyle::Body);
-        let choose_again = Rect::new(x0, note.bottom(), ca_w, BUTTON_H);
+        let ca_w = widgets::text_button_w(gfx, "Choose again", TextStyle::Body);
+        let choose_again = Rect::new(x0, note.bottom() + 10.0, ca_w, BUTTON_H);
 
         let content_h = if review {
             choose_again.bottom() + 18.0 - top
@@ -176,8 +174,6 @@ impl AddLayout {
             height,
             host_right: host_x + host_w,
             close,
-            title_bar,
-            title,
             back,
             heading,
             subtitle,
@@ -277,23 +273,16 @@ pub struct AddUi {
 
 pub fn paint(p: &Painter, a: &AddMedia, l: &AddLayout, ui: &AddUi) {
     p.clear(BG);
-    widgets::title_bar(p, l.title_bar, l.title, l.close, ui.hover == AddHit::Close, a.focus_visible && a.focus == AddFocus::Close);
-
     let ring = |focus: AddFocus, r: Rect, radius: f32| {
         if a.focus_visible && a.focus == focus {
             p.stroke(r.inset(-2.0), radius + 2.0, 2.0, RING);
         }
     };
-    let quiet = |r: Rect, hit: AddHit| {
-        if ui.hover == hit {
-            p.stroke(r, 6.0, 1.0, ACCENT);
-        }
-    };
+    let focused = |f: AddFocus| a.focus_visible && a.focus == f;
 
     // Head
-    quiet(l.back, AddHit::Back);
-    p.text("←", l.back, TextStyle::Body, TEXT, Align::Center, true);
-    ring(AddFocus::Back, l.back, 6.0);
+    widgets::back_button(p, l.back, ui.hover == AddHit::Back, focused(AddFocus::Back));
+    widgets::close_button(p, l.close, ui.hover == AddHit::Close, focused(AddFocus::Close));
     let (heading, sub) = if a.reviewing() {
         ("Review files", "Check the files before adding them.")
     } else {
@@ -305,82 +294,73 @@ pub fn paint(p: &Painter, a: &AddMedia, l: &AddLayout, ui: &AddUi) {
     // Scrolling area
     p.push_clip(l.main);
     if a.reviewing() {
-        review(p, a, l, ui, &ring, &quiet);
+        review(p, a, l, ui, &ring);
     } else {
         start(p, l, ui, &ring);
         if let (Some(r), Some(e)) = (l.error, a.error.as_deref()) {
             p.text_wrapped(e, r.x, r.y, r.w, TextStyle::Small, ERROR);
         }
     }
+    p.pop_clip();
     if l.max_scroll() > 0.0 {
         let track = l.main.h;
         let h = (track * track / l.content_h).max(24.0);
         let y = l.main.y + (track - h) * (a.scroll / l.max_scroll());
-        p.pop_clip();
-        p.fill(Rect::new(l.host_right - 6.0, y, 4.0, h), 2.0, BORDER);
-    } else {
-        p.pop_clip();
+        widgets::scrollbar(p, Rect::new(l.host_right - 8.0, y, 4.0, h), false);
     }
 
     // Footer
-    p.line(l.footer.x, l.footer.y + 0.5, l.footer.right(), l.footer.y + 0.5, 1.0, BORDER);
-    p.text("Your originals stay where they are.", l.safety, TextStyle::Small, MUTED, Align::Start, true);
+    p.line(l.footer.x + PAD, l.footer.y + 0.5, l.footer.right() - PAD, l.footer.y + 0.5, 1.0, LINE);
+    p.text("Your originals stay where they are.", l.safety, TextStyle::Small, SUBTLE, Align::Start, true);
     if a.reviewing() {
-        quiet(l.cancel, AddHit::Cancel);
-        p.text("Cancel", l.cancel, TextStyle::Body, TEXT, Align::Center, true);
-        ring(AddFocus::Cancel, l.cancel, 6.0);
-        let alpha = if a.can_add() { 1.0 } else { DISABLED };
-        p.fill(l.add, 6.0, ACCENT.alpha(alpha));
-        p.text(&a.add_label(), l.add, TextStyle::Body, ON_ACCENT.alpha(alpha), Align::Center, true);
-        ring(AddFocus::Add, l.add, 6.0);
+        widgets::button(p, l.cancel, &["Cancel"], ui.hover == AddHit::Cancel, focused(AddFocus::Cancel));
+        widgets::primary_button(p, l.add, &a.add_label(), a.can_add(), ui.hover == AddHit::Add, focused(AddFocus::Add));
     }
 
     p.stroke(Rect::new(0.0, 0.0, l.width, l.height), 8.0, 1.0, BORDER);
 }
 
 fn up_arrow(p: &Painter, cx: f32, top: f32, c: Color) {
-    p.line(cx, top + 1.0, cx, top + 14.0, 1.5, c);
-    p.line(cx - 4.5, top + 5.5, cx, top + 1.0, 1.5, c);
-    p.line(cx + 4.5, top + 5.5, cx, top + 1.0, 1.5, c);
+    p.line(cx, top + 1.0, cx, top + 16.0, 2.0, c);
+    p.line(cx - 5.5, top + 6.5, cx, top + 1.0, 2.0, c);
+    p.line(cx + 5.5, top + 6.5, cx, top + 1.0, 2.0, c);
+}
+
+fn chevron_right(p: &Painter, cx: f32, cy: f32, c: Color) {
+    p.line(cx - 2.0, cy - 5.0, cx + 3.0, cy, 1.75, c);
+    p.line(cx + 3.0, cy, cx - 2.0, cy + 5.0, 1.75, c);
 }
 
 fn start(p: &Painter, l: &AddLayout, ui: &AddUi, ring: &dyn Fn(AddFocus, Rect, f32)) {
-    // Drop area: arrow (24) + 7 + label (20.3) + 7 + formats (17.4), centred.
-    p.fill(l.drop, 8.0, DROP_FILL);
-    p.stroke_dashed(l.drop, 8.0, ACCENT);
-    let content_h = 24.0 + 7.0 + TextStyle::Body.line() + 7.0 + TextStyle::Small.line();
+    // Drop area: a circle with an arrow, the label and the formats, centred.
+    p.fill(l.drop, 14.0, ACCENT.alpha(0.06));
+    p.stroke_dashed(l.drop, 14.0, ACCENT.alpha(0.7));
+    let content_h = 40.0 + 10.0 + TextStyle::Medium.line() + 4.0 + TextStyle::Small.line();
     let y = l.drop.y + (l.drop.h - content_h) / 2.0;
-    up_arrow(p, l.drop.x + l.drop.w / 2.0, y + 5.0, ACCENT);
-    let label = Rect::new(l.drop.x, y + 31.0, l.drop.w, TextStyle::Body.line());
+    let cx = l.drop.x + l.drop.w / 2.0;
+    p.fill_circle(cx, y + 20.0, 20.0, widgets::SELECTED);
+    up_arrow(p, cx, y + 11.0, ACCENT);
+    let label = Rect::new(l.drop.x, y + 50.0, l.drop.w, TextStyle::Medium.line());
     p.text("Drop files or a folder here", label, TextStyle::Medium, TEXT, Align::Center, true);
-    let formats = Rect::new(l.drop.x, label.bottom() + 7.0, l.drop.w, TextStyle::Small.line());
-    p.text("JPG · JPEG · PNG · GIF · MP4", formats, TextStyle::Small, MUTED, Align::Center, true);
+    let formats = Rect::new(l.drop.x, label.bottom() + 4.0, l.drop.w, TextStyle::Small.line());
+    p.text("JPG · JPEG · PNG · GIF · MP4", formats, TextStyle::Small, SUBTLE, Align::Center, true);
 
     for (r, (title, small), hit, focus) in [
         (l.choose_files, CHOOSE_FILES, AddHit::ChooseFiles, AddFocus::ChooseFiles),
         (l.import_existing, IMPORT_EXISTING, AddHit::ImportExisting, AddFocus::ImportExisting),
     ] {
         let hovered = ui.hover == hit;
-        p.fill(r, 6.0, if hovered { RAISED } else { SURFACE });
-        p.stroke(r, 6.0, 1.0, if hovered { ACCENT } else { BORDER });
-        let tx = r.x + 1.0 + 12.0 + 12.0;
-        let t = Rect::new(tx, r.y + 1.0 + 14.0, l.choice_text_w, TextStyle::Medium.line());
+        p.fill(r, 12.0, if hovered { RAISED } else { SURFACE });
+        let tx = r.x + 18.0;
+        let t = Rect::new(tx, r.y + 16.0, l.choice_text_w, TextStyle::Medium.line());
         p.text(title, t, TextStyle::Medium, TEXT, Align::Start, true);
         p.text_wrapped(small, tx, t.bottom() + 4.0, l.choice_text_w, TextStyle::Small, MUTED);
-        let chevron = Rect::new(r.right() - 1.0 - 12.0 - 8.0, r.y, 8.0, r.h);
-        p.text("›", chevron, TextStyle::Body, TEXT, Align::Center, true);
-        ring(focus, r, 6.0);
+        chevron_right(p, r.right() - 22.0, r.y + r.h / 2.0, if hovered { TEXT } else { SUBTLE });
+        ring(focus, r, 12.0);
     }
 }
 
-fn review(
-    p: &Painter,
-    a: &AddMedia,
-    l: &AddLayout,
-    ui: &AddUi,
-    ring: &dyn Fn(AddFocus, Rect, f32),
-    quiet: &dyn Fn(Rect, AddHit),
-) {
+fn review(p: &Painter, a: &AddMedia, l: &AddLayout, ui: &AddUi, ring: &dyn Fn(AddFocus, Rect, f32)) {
     p.text(&a.summary(), l.summary, TextStyle::Small, MUTED, Align::Start, true);
     for (i, (row, g)) in a.rows.iter().zip(&l.rows).enumerate() {
         if g.row.bottom() < l.main.y || g.row.y > l.main.bottom() {
@@ -388,10 +368,9 @@ fn review(
         }
         match g.input {
             Some(input) => {
-                p.fill(input, 6.0, SURFACE);
-                p.stroke(input, 6.0, 1.0, BORDER);
+                p.fill(input, widgets::RADIUS, FIELD);
                 let focused = a.focus == AddFocus::Row(i);
-                let text_r = Rect::new(input.x + 1.0 + 8.0, input.y, input.w - 18.0, input.h);
+                let text_r = Rect::new(input.x + 10.0, input.y, input.w - 20.0, input.h);
                 p.push_clip(text_r);
                 if focused && row.name.all_selected() {
                     p.fill(Rect::new(text_r.x, input.y + 7.0, ui.selection_w, input.h - 14.0), 0.0, ACCENT.alpha(0.35));
@@ -399,28 +378,26 @@ fn review(
                 p.text(row.name.text(), Rect::new(text_r.x, text_r.y, 10_000.0, text_r.h), TextStyle::Row, TEXT, Align::Start, true);
                 p.pop_clip();
                 if row.error.is_some() {
-                    // CSS outline: 1px outside the border.
-                    p.stroke(input.inset(-1.0), 7.0, 1.0, ERROR);
+                    p.stroke(input, widgets::RADIUS, 1.5, ERROR);
                 } else if focused {
-                    p.stroke(input, 6.0, 2.0, RING);
+                    p.stroke(input, widgets::RADIUS, 2.0, ACCENT);
                 }
                 if focused {
                     let x = (text_r.x + ui.caret_x).round() + 0.5;
-                    p.line(x, input.y + 7.0, x, input.bottom() - 7.0, 1.0, TEXT);
+                    p.line(x, input.y + 8.0, x, input.bottom() - 8.0, 1.0, TEXT);
                 }
-                p.text(row.ext(), g.ext, TextStyle::Small, MUTED, Align::Start, true);
+                p.text(row.ext(), g.ext, TextStyle::Small, SUBTLE, Align::Start, true);
             }
             None => {
-                let x = l.summary.x + ICON_COL + COL_GAP;
-                let r = Rect::new(x, g.row.y + ROW_PAD, g.route.x - COL_GAP - x, TextStyle::Row.line());
-                p.text(&row.source, r, TextStyle::Row, TEXT, Align::Start, true);
+                let r = Rect::new(l.summary.x, g.row.y + ROW_PAD, g.route.x - COL_GAP - l.summary.x, TextStyle::Row.line());
+                p.text(&row.source, r, TextStyle::Row, MUTED, Align::Start, true);
             }
         }
         if let Some((r, m)) = &g.message {
-            let c = if matches!(row.outcome, Some(Err(_))) { ERROR } else { MUTED };
+            let c = if matches!(row.outcome, Some(Err(_))) { ERROR } else { SUBTLE };
             p.text_wrapped(m, r.x, r.y, r.w, TextStyle::Small, c);
         }
-        let route_c = if row.status == RowStatus::Skip { MUTED } else { SOFT_TEXT };
+        let route_c = if row.status == RowStatus::Skip { SUBTLE } else { SOFT_TEXT };
         let route = match (&row.outcome, row.status) {
             (Some(Ok(_)), _) => "Added",
             (Some(Err(_)), _) => "Not added",
@@ -429,15 +406,14 @@ fn review(
         };
         p.text(route, g.route, TextStyle::Small, route_c, Align::End, true);
         if let Some(r) = g.remove {
-            widgets::quiet_button(p, r, "×", TextStyle::Body, ui.hover == AddHit::Remove(i), true);
-            ring(AddFocus::Remove(i), r, 6.0);
+            widgets::close_button(p, r, ui.hover == AddHit::Remove(i), false);
+            ring(AddFocus::Remove(i), r, widgets::RADIUS);
         }
-        p.line(g.row.x, g.row.bottom() - 0.5, g.row.right(), g.row.bottom() - 0.5, 1.0, BORDER);
+        p.line(g.row.x, g.row.bottom() - 0.5, g.row.right(), g.row.bottom() - 0.5, 1.0, LINE);
     }
-    p.text_wrapped(NOTE, l.note.x, l.note.y, l.note.w, TextStyle::Small, MUTED);
+    p.text_wrapped(NOTE, l.note.x, l.note.y, l.note.w, TextStyle::Small, SUBTLE);
     if a.editable() {
-        quiet(l.choose_again, AddHit::ChooseAgain);
-        p.text("Choose again", l.choose_again, TextStyle::Body, TEXT, Align::Center, true);
-        ring(AddFocus::ChooseAgain, l.choose_again, 6.0);
+        let focus = a.focus_visible && a.focus == AddFocus::ChooseAgain;
+        widgets::button(p, l.choose_again, &["Choose again"], ui.hover == AddHit::ChooseAgain, focus);
     }
 }

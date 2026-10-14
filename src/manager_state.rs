@@ -53,9 +53,9 @@ impl Nav {
     pub fn label(self) -> &'static str {
         match self {
             Nav::All => "All media",
-            Nav::Gif => "GIF",
-            Nav::Picture => "Picture",
-            Nav::Video => "Video",
+            Nav::Gif => "GIFs",
+            Nav::Picture => "Pictures",
+            Nav::Video => "Videos",
             Nav::Settings => "Settings",
         }
     }
@@ -72,7 +72,7 @@ impl Nav {
     }
 }
 
-/// Keyboard focus targets, in Tab order.
+/// Keyboard focus targets (Tab order: `ManagerState::focus_order`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MFocus {
     QuickPopup,
@@ -370,13 +370,12 @@ impl ManagerState {
     }
 
     pub fn focus_order(&self, lib: &Library) -> Vec<MFocus> {
-        let mut order = vec![MFocus::QuickPopup, MFocus::Close];
-        order.extend((0..Nav::ORDER.len()).map(MFocus::Nav));
-        order.extend([MFocus::AddMedia, MFocus::Search]);
+        // Visual order: sidebar, top bar, the line under it, gallery, inspector.
+        let mut order: Vec<MFocus> = (0..Nav::ORDER.len()).map(MFocus::Nav).collect();
+        order.extend([MFocus::QuickPopup, MFocus::Search, MFocus::Sort, MFocus::AddMedia, MFocus::Close]);
         if self.has_filters() {
             order.push(MFocus::ClearFilters);
         }
-        order.push(MFocus::Sort);
         order.push(if self.visible(lib).is_empty() { MFocus::EmptyAction } else { MFocus::Gallery });
         if self.selected.is_some() {
             order.extend([MFocus::RenameInput, MFocus::Rename, MFocus::OpenFolder]);
@@ -587,7 +586,8 @@ mod tests {
     fn tab_order_follows_the_screen() {
         let (mut m, lib) = setup();
         let order = m.focus_order(&lib);
-        assert_eq!(order[..2], [MFocus::QuickPopup, MFocus::Close]);
+        assert_eq!(order[..2], [MFocus::Nav(0), MFocus::Nav(1)]);
+        assert_eq!(order[5..10], [MFocus::QuickPopup, MFocus::Search, MFocus::Sort, MFocus::AddMedia, MFocus::Close]);
         assert!(!order.contains(&MFocus::ClearFilters));
         assert!(order.contains(&MFocus::Recycle));
         m.set_filter(TypeFilter::Gif, &lib);
@@ -597,6 +597,6 @@ mod tests {
         assert!(order.ends_with(&[MFocus::ConfirmMove, MFocus::ConfirmCancel]));
         m.focus = MFocus::ConfirmCancel;
         m.tab(&lib, false);
-        assert_eq!(m.focus, MFocus::QuickPopup);
+        assert_eq!(m.focus, MFocus::Nav(0));
     }
 }

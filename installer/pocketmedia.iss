@@ -75,6 +75,10 @@ WizardStyle=modern dark
 #else
 WizardStyle=modern
 #endif
+; The logo (assets\make-icon.py makes these from the same drawing as the app's icon).
+SetupIconFile=..\assets\pocketmedia.ico
+WizardSmallImageFile=..\assets\wizard-small-100.bmp,..\assets\wizard-small-125.bmp,..\assets\wizard-small-150.bmp,..\assets\wizard-small-200.bmp
+WizardImageAlphaFormat=defined
 UninstallDisplayName={#AppName}
 UninstallDisplayIcon={app}\{#ExeName}
 SetupLogging=yes
@@ -548,6 +552,7 @@ var
   Form: TSetupForm;
   T: TNewStaticText;
   Frame: TBevel;
+  Stripe: TBitmapImage;
   CancelBtn, BackupBtn: TNewButton;
   W, X, Y, BoxTop, Res: Integer;
 begin
@@ -577,7 +582,7 @@ begin
     T := UninstText(Form, 'Your media will be deleted', X + ScaleX(14), Y, W - ScaleX(28));
     T.Font.Size := T.Font.Size + 3;
     T.Font.Style := [fsBold];
-    T.Font.Color := $7F7FF0;
+    T.Font.Color := $6A6AF0;
     T.AdjustHeight;
     T := UninstText(Form, 'Uninstalling PocketMedia permanently deletes your Media folder and every file inside:',
       X + ScaleX(14), T.Top + T.Height + ScaleY(8), W - ScaleX(28));
@@ -590,6 +595,17 @@ begin
     T := UninstText(Form, 'This cannot be undone. Files in the original folders you imported from are kept.',
       X + ScaleX(14), T.Top + T.Height + ScaleY(6), W - ScaleX(28));
     Frame.SetBounds(X, BoxTop, W, T.Top + T.Height + ScaleY(12) - BoxTop);
+    { A red bar down the warning's left edge. Inno's dark style recolours text and
+      frames, but not pictures, so the warning stays red there too. }
+    Stripe := TBitmapImage.Create(Form);
+    Stripe.Parent := Form;
+    Stripe.Bitmap.Width := 4;
+    Stripe.Bitmap.Height := 4;
+    Stripe.Bitmap.Canvas.Brush.Color := $6A6AF0;
+    Stripe.Bitmap.Canvas.Pen.Color := $6A6AF0;
+    Stripe.Bitmap.Canvas.Rectangle(0, 0, 4, 4);
+    Stripe.Stretch := True;
+    Stripe.SetBounds(X, BoxTop, ScaleX(5), Frame.Height);
 
     BackupBtn := TNewButton.Create(Form);
     BackupBtn.Parent := Form;

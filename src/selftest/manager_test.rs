@@ -315,8 +315,7 @@ pub(super) fn run(r: &mut Report, t: &Session) -> bool {
     if !t.open(r) {
         return false;
     }
-    t.click(r, El::List);
-    t.click(r, El::Row(1));
+    t.click(r, El::Tab(1));
     t.state_has(r, "the popup shows the Manager's changes", &["count=12", "names=Hello (2).gif|IMG_4821.png|", "Hello.gif"]);
     let d = t.describe();
     r.check("the removed item is gone from the popup too", !d.contains("Renamed clip") && !d.contains("Race clip"), &d);

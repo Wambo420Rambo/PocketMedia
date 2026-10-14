@@ -1,47 +1,37 @@
-//! The Manager's Settings page: geometry, hit-testing and drawing. Numbers come
-//! from the wireframe CSS (.pm-settings, .pm-panel, .pm-row, .pm-choice, the
-//! pinned action bar) and were measured on focused-40 and focused-41.
+//! The Manager's Settings page: geometry, hit-testing and drawing.
+//! Cards of rows with switches and buttons, a pinned Save / Cancel bar, the
+//! backup panel and the "Change shortcut" dialog over the page.
 //!
 //! Everything inside the scroll area is laid out with the scroll offset applied.
 
 use super::d2d::{Align, Gfx, Painter};
-use super::layout::{Rect, TextStyle, text_button_w};
+use super::layout::{Rect, TextStyle};
 use super::manager_view::{Frame, FrameHit, FrameLook, paint_border, paint_frame};
-use super::widgets::{self, ACCENT, BG, BORDER, MUTED, SOFT, SURFACE, TEXT};
+use super::widgets::{self, ACCENT, BG, DANGER, GOOD, LINE, MUTED, SELECTED, SUBTLE, SURFACE, TEXT};
+use crate::hotkey::Shortcut;
 use crate::manager_state::Nav;
 use crate::paths;
-use crate::settings_state::{BackupPanel, Profile, SFocus, SettingsPage, VideoPreview};
+use crate::settings_state::{BackupPanel, Profile, SFocus, SettingsPage, ShortcutDialog, Verdict};
 
-/// The settings column is at most 700 wide; panels leave 10 for the scrollbar gutter.
+/// The settings column is at most this wide.
 const CONTENT_W: f32 = 700.0;
-const PANEL_W: f32 = 690.0;
-/// Panel border + padding.
-const PANEL_PAD: f32 = 16.0;
+/// Card padding (sides) and row padding (top and bottom).
+const CARD_PAD: f32 = 16.0;
+const ROW_PAD: f32 = 14.0;
 const BUTTON_H: f32 = 36.0;
-const SELECT_W: f32 = 160.0;
-/// Checkbox 16px plus the browser's 3px margins.
-const CHECK: f32 = 16.0;
-const CHECK_BOX_H: f32 = CHECK + 6.0;
-const RADIO: f32 = 13.0;
-/// Small text in settings rows uses line-height 1.5 (18px), measured.
+const SWITCH: (f32, f32) = (40.0, 22.0);
+const KEYCAP_H: f32 = 26.0;
 const SMALL_LH: f32 = 18.0;
 const TITLE_LH: f32 = 14.0 * 1.45;
-/// Gap between a title and its small text (CSS margin 4, plus about 0.5-1 px of
-/// Chrome's pixel rounding, measured on focused-40 and focused-41).
-const DESC_GAP: f32 = 4.5;
-const DESC_GAP_CARD: f32 = 5.5;
-/// "Choose folder…" wraps onto two lines in the wireframe (its button is squeezed
-/// by the long description); it is drawn the same way.
-const CHOOSE_W: f32 = 96.0;
-const CHOOSE_H: f32 = 56.0;
+const DESC_GAP: f32 = 3.0;
 
-pub const LEAD: &str = "Choose how PocketMedia behaves.";
-const VIDEO_TITLE: &str = "Video preview";
-const VIDEO_DESC: &str = "Video playback uses extra CPU and memory. Choose Off to save resources.";
-const GIF_NOTE: &str = "GIFs always loop while visible. Playback stops when the window is hidden.";
+const VIDEO_TITLE: &str = "Video preview on hover";
+const VIDEO_DESC: &str = "Plays a video while the pointer is over it. Uses extra CPU and memory. GIFs always loop while visible.";
 const SHORTCUT_TITLE: &str = "Global shortcut";
-pub const SHORTCUT: &str = "Win + Alt + .";
+const SHORTCUT_DESC: &str = "Opens the quick popup from any app.";
+const SHORTCUT_TAKEN: &str = "Not working: Windows did not give PocketMedia this shortcut. Choose another.";
 const CLOSE_AFTER_TITLE: &str = "Close after inserting";
+const CLOSE_AFTER_DESC: &str = "Hide the quick popup once a file is pasted.";
 const FOLDER_TITLE: &str = "Media folder";
 const IMPORT_TITLE: &str = "Import your existing media";
 const IMPORT_DESC: &str = "Select a folder. Supported files from it and all subfolders are sorted and copied into Pictures, GIFs and Videos. Original files stay where they are.";
@@ -49,7 +39,11 @@ const BACKUP_TITLE: &str = "Back up library";
 const BACKUP_DESC: &str = "Includes media and settings. Choose a backup location outside PocketMedia.";
 const AUTOSTART_TITLE: &str = "Autostart PocketMedia";
 const AUTOSTART_DESC: &str = "Off unless you choose to enable it.";
-const SECTIONS: [&str; 4] = ["RESOURCE USAGE", "QUICK POPUP", "LIBRARY", "STARTUP"];
+const SECTIONS: [&str; 4] = ["Performance", "Quick popup", "Library", "Startup"];
+
+pub const DIALOG_TITLE: &str = "Change shortcut";
+const DIALOG_TEXT: &str = "Press the keys you want to use: Win, or two of Ctrl, Alt and Shift, together with another key.";
+const DIALOG_USE: &str = "Use shortcut";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SHit {
@@ -60,7 +54,6 @@ pub enum SHit {
     Nav(usize),
     Profile(usize),
     Video,
-    VideoRow(usize),
     Change,
     CloseAfter,
     OpenFolder,
@@ -73,66 +66,76 @@ pub enum SHit {
     PanelCancel,
     PanelOpen,
     PanelDone,
+    /// The shortcut dialog's buttons.
+    DialogReset,
+    DialogCancel,
+    DialogUse,
 }
 
-/// The backup panel over the page (owner's request): a card in the middle of the
-/// content area; everything right of the sidebar is covered.
-pub struct PanelLayout {
+/// A card in the middle of `cover` with a title, a body and buttons at the
+/// bottom right (the backup panel and the shortcut dialog).
+pub struct Card {
     pub cover: Rect,
     pub card: Rect,
     pub title: Rect,
-    /// Running: the bar, its percentage, and two lines (counts, current file).
+    /// Top of the body under the title.
+    pub body_y: f32,
+    pub buttons: Vec<(SFocus, Rect)>,
+}
+
+const CARD_PAD_IN: f32 = 24.0;
+
+impl Card {
+    fn compute(cover: Rect, w: f32, body_h: f32, buttons: &[(SFocus, f32)], left_button: Option<(SFocus, f32)>) -> Self {
+        let w = w.min(cover.w - 40.0);
+        let iw = w - 2.0 * CARD_PAD_IN;
+        let title_h = TextStyle::Title.line();
+        let h = CARD_PAD_IN + title_h + 12.0 + body_h + 20.0 + BUTTON_H + CARD_PAD_IN;
+        let card = Rect::new(cover.x + (cover.w - w) / 2.0, cover.y + ((cover.h - h) / 2.0).max(20.0), w, h);
+        let x = card.x + CARD_PAD_IN;
+        let title = Rect::new(x, card.y + CARD_PAD_IN, iw, title_h);
+        let body_y = title.bottom() + 12.0;
+        let buttons_y = body_y + body_h + 20.0;
+        let mut right = x + iw;
+        let mut out = Vec::new();
+        for (f, bw) in buttons.iter().rev() {
+            out.push((*f, Rect::new(right - bw, buttons_y, *bw, BUTTON_H)));
+            right -= bw + 8.0;
+        }
+        out.reverse();
+        if let Some((f, bw)) = left_button {
+            out.insert(0, (f, Rect::new(x - 10.0, buttons_y, bw, BUTTON_H)));
+        }
+        Card { cover, card, title, body_y, buttons: out }
+    }
+
+    fn button(&self, f: SFocus) -> Option<Rect> {
+        self.buttons.iter().find(|(b, _)| *b == f).map(|(_, r)| *r)
+    }
+}
+
+/// The backup panel's body.
+pub struct PanelBody {
     pub bar: Rect,
     pub percent: Rect,
     pub line1: Rect,
     pub line2: Rect,
-    /// Done: the result text.
     pub text: Rect,
-    /// Right to left: the last button is the rightmost.
-    pub buttons: Vec<(SFocus, Rect)>,
 }
 
-const PANEL_CARD_W: f32 = 460.0;
-const PANEL_PAD_IN: f32 = 22.0;
-
-impl PanelLayout {
-    fn compute(panel: &BackupPanel, cover: Rect, gfx: &Gfx) -> Self {
-        let w = PANEL_CARD_W.min(cover.w - 40.0);
-        let iw = w - 2.0 * PANEL_PAD_IN;
-        let title_h = TextStyle::Title.line();
-        let body_h = match panel {
-            BackupPanel::Running(_) => 8.0 + 14.0 + TextStyle::Small.line() + 4.0 + TextStyle::Small.line(),
-            BackupPanel::Done { text, .. } => gfx.wrapped_height(text, TextStyle::Small, iw),
-        };
-        let h = PANEL_PAD_IN + title_h + 16.0 + body_h + 22.0 + BUTTON_H + PANEL_PAD_IN;
-        let card = Rect::new(cover.x + (cover.w - w) / 2.0, cover.y + ((cover.h - h) / 2.0).max(20.0), w, h);
-        let x = card.x + PANEL_PAD_IN;
-        let title = Rect::new(x, card.y + PANEL_PAD_IN, iw, title_h);
-        let body_y = title.bottom() + 16.0;
-        let percent_w = gfx.measure("100 %", TextStyle::Small) + 4.0;
-        let bar = Rect::new(x, body_y, iw - percent_w - 10.0, 8.0);
-        let percent = Rect::new(bar.right() + 10.0, body_y - 5.0, percent_w, 18.0);
-        let line1 = Rect::new(x, bar.bottom() + 14.0, iw, TextStyle::Small.line());
-        let line2 = Rect::new(x, line1.bottom() + 4.0, iw, TextStyle::Small.line());
-        let text = Rect::new(x, body_y, iw, body_h);
-        let buttons_y = body_y + body_h + 22.0;
-        let mut right = x + iw;
-        let mut buttons = Vec::new();
-        for f in panel.buttons().into_iter().rev() {
-            let label = panel_label(f);
-            let bw = text_button_w(gfx.measure(label, TextStyle::Body));
-            buttons.push((f, Rect::new(right - bw, buttons_y, bw, BUTTON_H)));
-            right -= bw + 8.0;
-        }
-        buttons.reverse();
-        PanelLayout { cover, card, title, bar, percent, line1, line2, text, buttons }
-    }
+/// The shortcut dialog's body.
+pub struct DialogBody {
+    pub text: Rect,
+    pub capture: Rect,
+    pub verdict: Rect,
 }
 
 fn panel_label(f: SFocus) -> &'static str {
     match f {
         SFocus::PanelCancel => "Cancel backup",
         SFocus::PanelOpen => "Open folder",
+        SFocus::DialogCancel => "Cancel",
+        SFocus::DialogUse => DIALOG_USE,
         _ => "Done",
     }
 }
@@ -141,43 +144,49 @@ pub fn panel_hit(f: SFocus) -> SHit {
     match f {
         SFocus::PanelCancel => SHit::PanelCancel,
         SFocus::PanelOpen => SHit::PanelOpen,
+        SFocus::DialogReset => SHit::DialogReset,
+        SFocus::DialogCancel => SHit::DialogCancel,
+        SFocus::DialogUse => SHit::DialogUse,
         _ => SHit::PanelDone,
     }
+}
+
+fn reset_label() -> String {
+    format!("Reset to {}", Shortcut::default().label())
 }
 
 /// A resource-usage choice card.
 pub struct Choice {
     pub card: Rect,
-    pub radio: Rect,
     pub title: Rect,
     pub desc: Rect,
 }
 
-/// A settings row: title, optional small text under it, and a control on the right.
+/// A settings row: title, small text under it, and a control on the right.
 pub struct Row {
-    /// Whole row (for clicks on checkbox rows).
+    /// Whole row (switch rows toggle from anywhere on it).
     pub area: Rect,
     /// y of the separator above the row, if any.
     pub border: Option<f32>,
     pub title: Rect,
-    pub desc: Option<Rect>,
+    pub desc: Rect,
     pub control: Rect,
 }
 
 pub struct SettingsLayout {
     pub frame: Frame,
     pub heading: Rect,
-    pub lead: Rect,
     /// The scroll area (clip).
     pub view: Rect,
     pub content_h: f32,
     pub labels: [Rect; 4],
-    pub panels: [Rect; 4],
+    /// Background cards: video, quick popup, library, startup.
+    pub cards: [Rect; 4],
     pub choices: [Choice; 2],
     pub video: Row,
-    pub video_menu: widgets::Menu,
-    pub gif_note: Rect,
     pub shortcut: Row,
+    /// Where the shortcut's keycaps start.
+    pub keycaps_x: f32,
     pub close_after: Row,
     pub folder: Row,
     pub import: Row,
@@ -188,127 +197,128 @@ pub struct SettingsLayout {
     pub note: Rect,
     pub cancel: Rect,
     pub save: Rect,
-    pub panel: Option<PanelLayout>,
+    pub panel: Option<(Card, PanelBody)>,
+    pub dialog: Option<(Card, DialogBody)>,
 }
 
 /// Lays out one row starting at `y` (above its separator, if any).
-fn row(gfx: &Gfx, x: f32, w: f32, y: f32, border: bool, desc: Option<&str>, control: (f32, f32)) -> Row {
+#[allow(clippy::too_many_arguments)]
+fn row(gfx: &Gfx, x: f32, w: f32, y: f32, border: bool, desc: &str, control: (f32, f32), extra_w: f32) -> Row {
     let top = if border { y + 1.0 } else { y };
-    let content_y = top + 10.0;
+    let content_y = top + ROW_PAD;
     let (cw, ch) = control;
-    let box_h = if ch == CHECK { CHECK_BOX_H } else { ch };
-    let control_x = if ch == CHECK { x + w - 3.0 - cw } else { x + w - cw };
-    let text_w = control_x - 14.0 - x;
-    let desc_h = desc.map(|d| gfx.line_count(d, TextStyle::Small, text_w) as f32 * SMALL_LH);
-    let text_h = TITLE_LH + desc_h.map_or(0.0, |h| DESC_GAP + h);
-    let content_h = text_h.max(box_h);
-    let title = Rect::new(x, content_y, text_w, TITLE_LH);
-    let desc = desc_h.map(|h| Rect::new(x, title.bottom() + DESC_GAP, text_w, h));
+    let control_x = x + w - cw;
+    let text_w = control_x - extra_w - 16.0 - x;
+    let desc_h = gfx.line_count(desc, TextStyle::Small, text_w) as f32 * SMALL_LH;
+    let text_h = TITLE_LH + DESC_GAP + desc_h;
+    let content_h = text_h.max(ch);
+    let ty = content_y + (content_h - text_h) / 2.0;
+    let title = Rect::new(x, ty, text_w, TITLE_LH);
+    let desc = Rect::new(x, title.bottom() + DESC_GAP, text_w, desc_h);
     let control = Rect::new(control_x, content_y + (content_h - ch) / 2.0, cw, ch);
-    let bottom = content_y + content_h + 10.0;
-    Row { area: Rect::new(x, y, w, bottom - y), border: border.then_some(y), title, desc, control }
+    let bottom = content_y + content_h + ROW_PAD;
+    Row { area: Rect::new(x - CARD_PAD, y, w + 2.0 * CARD_PAD, bottom - y), border: border.then_some(y), title, desc, control }
 }
 
 impl SettingsLayout {
     pub fn compute(s: &SettingsPage, width: f32, height: f32, gfx: &Gfx) -> Self {
-        let frame = Frame::compute(width, height, "Settings", height - 1.0, gfx);
-        let body_y = Frame::body_y();
-        let x0 = frame.sidebar.right() + 20.0;
-        let inner_w = width - 1.0 - 20.0 - x0;
-        let heading = Rect::new(x0, body_y + 20.0, inner_w, 22.0 * 1.25);
-        let lead = Rect::new(x0, heading.bottom() + 5.0, inner_w, TextStyle::Small.line());
+        let frame = Frame::compute(width, height, gfx);
+        let x0 = frame.content_x();
+        let col_w = CONTENT_W.min(frame.close.x - 16.0 - x0);
+        let heading = Rect::new(x0, frame.close.y, col_w, frame.close.h);
 
-        // Pinned action bar: 1px line, 14 padding, 36px buttons, 20 window padding.
-        let buttons_y = height - 1.0 - 20.0 - BUTTON_H;
+        // Pinned bar: line, 14 padding, buttons, 16 window padding.
+        let buttons_y = height - 1.0 - 16.0 - BUTTON_H;
         let bar_y = buttons_y - 14.0 - 1.0;
-        let bar_x = (x0, x0 + CONTENT_W.min(inner_w));
-        let save_w = text_button_w(gfx.measure("Save changes", TextStyle::Body));
+        let bar_x = (x0, x0 + col_w);
+        let save_w = widgets::text_button_w(gfx, "Save changes", TextStyle::Medium);
         let save = Rect::new(bar_x.1 - save_w, buttons_y, save_w, BUTTON_H);
-        let cancel_w = text_button_w(gfx.measure("Cancel", TextStyle::Body));
+        let cancel_w = widgets::text_button_w(gfx, "Cancel", TextStyle::Body);
         let cancel = Rect::new(save.x - 8.0 - cancel_w, buttons_y, cancel_w, BUTTON_H);
         let note = Rect::new(x0, buttons_y, cancel.x - 12.0 - x0, BUTTON_H);
 
-        // Measured: the scroll area starts 84 below the title bar and ends 12 above the bar line.
-        let view_y = body_y + 84.0;
-        let view = Rect::new(x0, view_y, bar_x.1 - x0, bar_y - 12.0 - view_y);
-        let panel_w = PANEL_W.min(view.w - 10.0);
-        let ix = x0 + PANEL_PAD;
-        let iw = panel_w - 2.0 * PANEL_PAD;
+        let view_y = heading.bottom() + 12.0;
+        let view = Rect::new(x0, view_y, col_w + 8.0, bar_y - 6.0 - view_y);
+        let ix = x0 + CARD_PAD;
+        let iw = col_w - 2.0 * CARD_PAD;
 
         let top = view_y - s.scroll;
         let mut y = top;
         let mut labels = [Rect::default(); 4];
-        let mut panels = [Rect::default(); 4];
-        // Section label (17.4) + 10, then the panel; sections are 16 apart.
+        let mut cards = [Rect::default(); 4];
         let mut section = |i: usize, y: &mut f32| {
             if i > 0 {
-                *y += 16.0;
+                *y += 22.0;
             }
-            labels[i] = Rect::new(x0, *y, panel_w, TextStyle::Label.line());
-            *y += TextStyle::Label.line() + 10.0;
+            labels[i] = Rect::new(x0 + 2.0, *y, col_w, TextStyle::Label.line());
+            *y += TextStyle::Label.line() + 8.0;
             *y
         };
 
-        // Resource usage: two choice cards (gap 10), the video row and a note.
+        // Performance: two choice cards, then the video switch in a card.
         let p0 = section(0, &mut y);
-        let card_w = (iw - 10.0) / 2.0;
-        let text_w = card_w - 2.0 - 24.0 - RADIO - 9.0;
+        let card_w = (col_w - 10.0) / 2.0;
+        let text_w = card_w - 32.0;
         let lines = Profile::BOTH.iter().map(|p| gfx.line_count(p.description(), TextStyle::Small, text_w)).max().unwrap_or(1);
-        let card_h = 1.0 + 12.0 + TITLE_LH + DESC_GAP_CARD + lines as f32 * SMALL_LH + 12.0 + 1.0;
+        let card_h = 16.0 + TITLE_LH + 4.0 + lines as f32 * SMALL_LH + 16.0;
         let choice = |i: usize| {
-            let card = Rect::new(ix + i as f32 * (card_w + 10.0), p0 + PANEL_PAD, card_w, card_h);
-            let title = Rect::new(card.x + 13.0 + RADIO + 9.0, card.y + 13.0, text_w, TITLE_LH);
-            let radio = Rect::new(card.x + 13.0, title.y + (TITLE_LH - RADIO) / 2.0, RADIO, RADIO);
-            let desc = Rect::new(title.x, title.bottom() + DESC_GAP_CARD, text_w, lines as f32 * SMALL_LH);
-            Choice { card, radio, title, desc }
+            let card = Rect::new(x0 + i as f32 * (card_w + 10.0), p0, card_w, card_h);
+            let title = Rect::new(card.x + 16.0, card.y + 16.0, text_w, TITLE_LH);
+            let desc = Rect::new(title.x, title.bottom() + 4.0, text_w, lines as f32 * SMALL_LH);
+            Choice { card, title, desc }
         };
         let choices = [choice(0), choice(1)];
-        let video = row(gfx, ix, iw, p0 + PANEL_PAD + card_h, false, Some(VIDEO_DESC), (SELECT_W, BUTTON_H));
-        let video_menu = widgets::Menu::below(video.control, VideoPreview::BOTH.len());
-        let gif_note = Rect::new(ix, video.area.bottom() + 2.5, iw, SMALL_LH);
-        y = gif_note.bottom() + PANEL_PAD;
-        panels[0] = Rect::new(x0, p0, panel_w, y - p0);
+        let c0 = p0 + card_h + 10.0;
+        let video = row(gfx, ix, iw, c0, false, VIDEO_DESC, SWITCH, 0.0);
+        cards[0] = Rect::new(x0, c0, col_w, video.area.bottom() - c0);
+        y = cards[0].bottom();
 
-        // Quick popup: shortcut with Change, Close after inserting.
+        // Quick popup: shortcut (keycaps and Change), Close after inserting.
         let p1 = section(1, &mut y);
-        let change = (text_button_w(gfx.measure("Change", TextStyle::Body)), BUTTON_H);
-        let shortcut = row(gfx, ix, iw, p1 + PANEL_PAD, false, Some(SHORTCUT), change);
-        let close_after = row(gfx, ix, iw, shortcut.area.bottom(), true, None, (CHECK, CHECK));
-        y = close_after.area.bottom() + PANEL_PAD;
-        panels[1] = Rect::new(x0, p1, panel_w, y - p1);
+        let change_w = widgets::text_button_w(gfx, "Change", TextStyle::Body);
+        let keys = s.draft.shortcut.keys();
+        let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let caps_w = widgets::keycaps_w(gfx, &keys, TextStyle::Label, 4.0);
+        let shortcut = row(gfx, ix, iw, p1, false, SHORTCUT_TAKEN, (change_w, BUTTON_H), caps_w + 12.0);
+        let keycaps_x = shortcut.control.x - 12.0 - caps_w;
+        let close_after = row(gfx, ix, iw, shortcut.area.bottom(), true, CLOSE_AFTER_DESC, SWITCH, 0.0);
+        cards[1] = Rect::new(x0, p1, col_w, close_after.area.bottom() - p1);
+        y = cards[1].bottom();
 
         // Library: media folder, import, backup.
         let p2 = section(2, &mut y);
-        let open = (text_button_w(gfx.measure("Open folder", TextStyle::Body)), BUTTON_H);
-        let folder = row(gfx, ix, iw, p2 + PANEL_PAD, false, Some(&paths::media_text()), open);
-        let import = row(gfx, ix, iw, folder.area.bottom(), true, Some(IMPORT_DESC), (CHOOSE_W, CHOOSE_H));
-        let backup_w = text_button_w(gfx.measure("Back up library", TextStyle::Body));
-        let backup = row(gfx, ix, iw, import.area.bottom(), true, Some(BACKUP_DESC), (backup_w, BUTTON_H));
-        y = backup.area.bottom() + PANEL_PAD;
-        panels[2] = Rect::new(x0, p2, panel_w, y - p2);
+        let button_w = ["Open folder", "Choose folder…", "Back up library", "Cancel backup"]
+            .iter()
+            .map(|l| widgets::text_button_w(gfx, l, TextStyle::Body))
+            .fold(0.0, f32::max);
+        let b = (button_w, BUTTON_H);
+        let folder = row(gfx, ix, iw, p2, false, &paths::media_text(), b, 0.0);
+        let import = row(gfx, ix, iw, folder.area.bottom(), true, IMPORT_DESC, b, 0.0);
+        let backup = row(gfx, ix, iw, import.area.bottom(), true, BACKUP_DESC, b, 0.0);
+        cards[2] = Rect::new(x0, p2, col_w, backup.area.bottom() - p2);
+        y = cards[2].bottom();
 
         // Startup.
         let p3 = section(3, &mut y);
-        let autostart = row(gfx, ix, iw, p3 + PANEL_PAD, false, Some(AUTOSTART_DESC), (CHECK, CHECK));
-        y = autostart.area.bottom() + PANEL_PAD;
-        panels[3] = Rect::new(x0, p3, panel_w, y - p3);
+        let autostart = row(gfx, ix, iw, p3, false, AUTOSTART_DESC, SWITCH, 0.0);
+        cards[3] = Rect::new(x0, p3, col_w, autostart.area.bottom() - p3);
+        y = cards[3].bottom();
 
-        let content_h = y + 18.5 - top;
-        let cover = Rect::new(frame.sidebar.right(), body_y, width - 1.0 - frame.sidebar.right(), height - 1.0 - body_y);
-        let panel = s.backup_panel.as_ref().map(|p| PanelLayout::compute(p, cover, gfx));
+        let content_h = y + 16.0 - top;
+        let cover = Rect::new(frame.sidebar.right(), 1.0, width - 1.0 - frame.sidebar.right(), height - 2.0);
+        let panel = s.backup_panel.as_ref().map(|p| panel_layout(p, cover, gfx));
+        let dialog = s.shortcut_dialog.as_ref().map(|d| dialog_layout(d, Rect::new(1.0, 1.0, width - 2.0, height - 2.0), gfx));
         SettingsLayout {
             frame,
             heading,
-            lead,
             view,
             content_h,
             labels,
-            panels,
+            cards,
             choices,
             video,
-            video_menu,
-            gif_note,
             shortcut,
+            keycaps_x,
             close_after,
             folder,
             import,
@@ -320,6 +330,7 @@ impl SettingsLayout {
             cancel,
             save,
             panel,
+            dialog,
         }
     }
 
@@ -343,18 +354,29 @@ impl SettingsLayout {
             SFocus::Autostart => self.autostart.control,
             SFocus::Cancel => self.cancel,
             SFocus::Save => self.save,
-            SFocus::PanelCancel | SFocus::PanelOpen | SFocus::PanelDone => self.panel.as_ref()?.buttons.iter().find(|(b, _)| *b == f)?.1,
+            SFocus::PanelCancel | SFocus::PanelOpen | SFocus::PanelDone => self.panel.as_ref()?.0.button(f)?,
+            SFocus::DialogReset | SFocus::DialogCancel | SFocus::DialogUse => self.dialog.as_ref()?.0.button(f)?,
         })
     }
 
     /// Scroll offset that brings `f` fully into the scroll area.
     pub fn scroll_to_show(&self, s: &SettingsPage, f: SFocus) -> f32 {
         let Some(r) = self.focus_rect(s, f) else { return s.scroll };
-        let inside = matches!(
+        let pinned = matches!(
             f,
-            SFocus::Close | SFocus::QuickPopup | SFocus::Nav(_) | SFocus::Cancel | SFocus::Save | SFocus::PanelCancel | SFocus::PanelOpen | SFocus::PanelDone
+            SFocus::Close
+                | SFocus::QuickPopup
+                | SFocus::Nav(_)
+                | SFocus::Cancel
+                | SFocus::Save
+                | SFocus::PanelCancel
+                | SFocus::PanelOpen
+                | SFocus::PanelDone
+                | SFocus::DialogReset
+                | SFocus::DialogCancel
+                | SFocus::DialogUse
         );
-        if inside {
+        if pinned {
             return s.scroll;
         }
         let margin = 8.0;
@@ -368,14 +390,10 @@ impl SettingsLayout {
         target.clamp(0.0, self.max_scroll())
     }
 
-    pub fn hit(&self, s: &SettingsPage, x: f32, y: f32) -> SHit {
-        if s.video_open.is_some() {
-            if let Some(i) = self.video_menu.hit(x, y) {
-                return SHit::VideoRow(i);
-            }
-            if self.video_menu.frame.contains(x, y) {
-                return SHit::None;
-            }
+    pub fn hit(&self, _s: &SettingsPage, x: f32, y: f32) -> SHit {
+        // The dialog is modal: only its buttons answer.
+        if let Some((card, _)) = &self.dialog {
+            return card.buttons.iter().find(|(_, r)| r.contains(x, y)).map_or(SHit::None, |(f, _)| panel_hit(*f));
         }
         match self.frame.hit(x, y) {
             Some(FrameHit::Close) => return SHit::Close,
@@ -385,8 +403,8 @@ impl SettingsLayout {
             None => {}
         }
         // The backup panel covers the page: only its buttons answer.
-        if let Some(panel) = &self.panel {
-            return panel.buttons.iter().find(|(_, r)| r.contains(x, y)).map_or(SHit::None, |(f, _)| panel_hit(*f));
+        if let Some((card, _)) = &self.panel {
+            return card.buttons.iter().find(|(_, r)| r.contains(x, y)).map_or(SHit::None, |(f, _)| panel_hit(*f));
         }
         if self.cancel.contains(x, y) {
             return SHit::Cancel;
@@ -401,12 +419,12 @@ impl SettingsLayout {
             return SHit::Profile(i);
         }
         let controls = [
-            (self.video.control, SHit::Video),
             (self.shortcut.control, SHit::Change),
             (self.folder.control, SHit::OpenFolder),
             (self.import.control, SHit::ChooseFolder),
             (self.backup.control, SHit::Backup),
-            // A checkbox row toggles from anywhere on the row.
+            // A switch row toggles from anywhere on the row.
+            (self.video.area, SHit::Video),
             (self.close_after.area, SHit::CloseAfter),
             (self.autostart.area, SHit::Autostart),
         ];
@@ -414,21 +432,62 @@ impl SettingsLayout {
     }
 }
 
+fn panel_layout(panel: &BackupPanel, cover: Rect, gfx: &Gfx) -> (Card, PanelBody) {
+    let w = 460.0f32.min(cover.w - 40.0);
+    let iw = w - 2.0 * CARD_PAD_IN;
+    let body_h = match panel {
+        BackupPanel::Running(_) => 8.0 + 14.0 + TextStyle::Small.line() + 4.0 + TextStyle::Small.line(),
+        BackupPanel::Done { text, .. } => gfx.wrapped_height(text, TextStyle::Small, iw),
+    };
+    let buttons: Vec<(SFocus, f32)> =
+        panel.buttons().into_iter().map(|f| (f, widgets::text_button_w(gfx, panel_label(f), TextStyle::Medium))).collect();
+    let card = Card::compute(cover, w, body_h, &buttons, None);
+    let x = card.card.x + CARD_PAD_IN;
+    let percent_w = gfx.measure("100 %", TextStyle::Small) + 4.0;
+    let bar = Rect::new(x, card.body_y, iw - percent_w - 10.0, 8.0);
+    let percent = Rect::new(bar.right() + 10.0, card.body_y - 5.0, percent_w, 18.0);
+    let line1 = Rect::new(x, bar.bottom() + 14.0, iw, TextStyle::Small.line());
+    let line2 = Rect::new(x, line1.bottom() + 4.0, iw, TextStyle::Small.line());
+    let text = Rect::new(x, card.body_y, iw, body_h);
+    (card, PanelBody { bar, percent, line1, line2, text })
+}
+
+fn dialog_layout(d: &ShortcutDialog, cover: Rect, gfx: &Gfx) -> (Card, DialogBody) {
+    let w = 460.0;
+    let iw = w - 2.0 * CARD_PAD_IN;
+    let text_h = gfx.wrapped_height(DIALOG_TEXT, TextStyle::Small, iw);
+    let verdict_h = match &d.verdict {
+        Verdict::Refused(e) => gfx.wrapped_height(e, TextStyle::Small, iw),
+        _ => TextStyle::Small.line(),
+    };
+    let capture_h = 76.0;
+    let body_h = text_h + 14.0 + capture_h + 10.0 + verdict_h;
+    let mut buttons = vec![(SFocus::DialogCancel, widgets::text_button_w(gfx, "Cancel", TextStyle::Body))];
+    buttons.push((SFocus::DialogUse, widgets::text_button_w(gfx, DIALOG_USE, TextStyle::Medium)));
+    let reset = (SFocus::DialogReset, widgets::text_button_w(gfx, &reset_label(), TextStyle::Small) - 12.0);
+    let card = Card::compute(cover, w, body_h, &buttons, Some(reset));
+    let x = card.card.x + CARD_PAD_IN;
+    let text = Rect::new(x, card.body_y, iw, text_h);
+    let capture = Rect::new(x, text.bottom() + 14.0, iw, capture_h);
+    let verdict = Rect::new(x, capture.bottom() + 10.0, iw, verdict_h);
+    (card, DialogBody { text, capture, verdict })
+}
+
 /// Pointer facts that are not part of `SettingsPage`.
 pub struct SettingsUi {
     pub hover: SHit,
+    /// The saved shortcut is registered (or paused by the chooser).
+    pub shortcut_ok: bool,
 }
 
-fn title_and_desc(p: &Painter, r: &Row, title: &str, desc: Option<&str>) {
+fn title_and_desc(p: &Painter, r: &Row, title: &str, desc: &str, desc_color: super::d2d::Color) {
     p.text(title, r.title, TextStyle::Body, TEXT, Align::Start, true);
-    if let (Some(d), Some(dr)) = (desc, r.desc) {
-        p.text_wrapped_lh(d, dr.x, dr.y, dr.w, TextStyle::Small, MUTED, SMALL_LH);
-    }
+    p.text_wrapped_lh(desc, r.desc.x, r.desc.y, r.desc.w, TextStyle::Small, desc_color, SMALL_LH);
 }
 
 fn separator(p: &Painter, r: &Row) {
     if let Some(y) = r.border {
-        p.line(r.area.x, y + 0.5, r.area.right(), y + 0.5, 1.0, BORDER);
+        p.line(r.area.x + CARD_PAD, y + 0.5, r.area.right() - CARD_PAD, y + 0.5, 1.0, LINE);
     }
 }
 
@@ -449,105 +508,163 @@ pub fn paint(p: &Painter, s: &SettingsPage, l: &SettingsLayout, ui: &SettingsUi)
             _ => None,
         },
     };
-    paint_frame(p, &l.frame, "Settings", &|n| n == Nav::Settings, look);
-
+    paint_frame(p, &l.frame, &|n| n == Nav::Settings, None, look);
     p.text("Settings", l.heading, TextStyle::H1, TEXT, Align::Start, true);
-    p.text(LEAD, l.lead, TextStyle::Small, MUTED, Align::Start, true);
 
     p.push_clip(l.view);
-    // CSS letter-spacing: .04em of 12px.
-    let spacing = TextStyle::Label.size() * 0.04;
     for (r, label) in l.labels.iter().zip(SECTIONS) {
-        p.text_spaced(label, *r, TextStyle::Label, MUTED, spacing);
+        p.text(label, *r, TextStyle::Label, MUTED, Align::Start, true);
     }
-    for r in &l.panels {
-        p.fill(*r, 8.0, SURFACE);
-        p.stroke(*r, 8.0, 1.0, BORDER);
+    for r in &l.cards {
+        p.fill(*r, 12.0, SURFACE);
     }
 
     for (i, (c, profile)) in l.choices.iter().zip(Profile::BOTH).enumerate() {
         let on = s.draft.profile == profile;
-        p.fill(c.card, 6.0, if on { SOFT } else { BG });
-        p.stroke(c.card, 6.0, 1.0, if on || hover(SHit::Profile(i)) { ACCENT } else { BORDER });
-        widgets::radio(p, c.radio, on, hover(SHit::Profile(i)), on && ring(SFocus::Profile));
-        p.text(profile.title(), c.title, TextStyle::Body, TEXT, Align::Start, true);
-        p.text_wrapped_lh(profile.description(), c.desc.x, c.desc.y, c.desc.w, TextStyle::Small, MUTED, SMALL_LH);
+        p.fill(c.card, 12.0, if on { SELECTED } else { SURFACE });
+        if on {
+            p.stroke(c.card, 12.0, 2.0, ACCENT);
+        } else if hover(SHit::Profile(i)) {
+            p.stroke(c.card, 12.0, 1.0, widgets::BORDER);
+        }
+        widgets::ring(p, on && ring(SFocus::Profile), c.card, 12.0);
+        p.text(profile.title(), c.title, TextStyle::Medium, TEXT, Align::Start, true);
+        let dc = if on { widgets::SOFT_TEXT } else { MUTED };
+        p.text_wrapped_lh(profile.description(), c.desc.x, c.desc.y, c.desc.w, TextStyle::Small, dc, SMALL_LH);
     }
 
-    title_and_desc(p, &l.video, VIDEO_TITLE, Some(VIDEO_DESC));
-    let video_hot = hover(SHit::Video) || s.video_open.is_some();
-    widgets::field_select(p, l.video.control, s.draft.video_preview.label(), video_hot, ring(SFocus::Video));
-    p.text_wrapped_lh(GIF_NOTE, l.gif_note.x, l.gif_note.y, l.gif_note.w, TextStyle::Small, MUTED, SMALL_LH);
+    title_and_desc(p, &l.video, VIDEO_TITLE, VIDEO_DESC, MUTED);
+    let video_on = s.draft.video_preview == crate::settings_state::VideoPreview::HoverOnly;
+    widgets::switch(p, l.video.control, video_on, hover(SHit::Video), ring(SFocus::Video));
 
-    title_and_desc(p, &l.shortcut, SHORTCUT_TITLE, Some(SHORTCUT));
+    // The shortcut, as keycaps; red text when Windows refused the saved one.
+    let refused = !ui.shortcut_ok && s.draft.shortcut == s.saved.shortcut;
+    let (desc, dc) = if refused { (SHORTCUT_TAKEN, DANGER) } else { (SHORTCUT_DESC, MUTED) };
+    title_and_desc(p, &l.shortcut, SHORTCUT_TITLE, desc, dc);
+    let keys = s.draft.shortcut.keys();
+    let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+    let cy = l.shortcut.control.y + l.shortcut.control.h / 2.0;
+    widgets::keycaps(p, l.keycaps_x, cy, KEYCAP_H, &keys, TextStyle::Label, 4.0, false);
     widgets::button(p, l.shortcut.control, &["Change"], hover(SHit::Change), ring(SFocus::Change));
     separator(p, &l.close_after);
-    title_and_desc(p, &l.close_after, CLOSE_AFTER_TITLE, None);
-    let hot = hover(SHit::CloseAfter);
-    widgets::checkbox(p, l.close_after.control, s.draft.close_after_insert, hot, ring(SFocus::CloseAfter));
+    title_and_desc(p, &l.close_after, CLOSE_AFTER_TITLE, CLOSE_AFTER_DESC, MUTED);
+    widgets::switch(p, l.close_after.control, s.draft.close_after_insert, hover(SHit::CloseAfter), ring(SFocus::CloseAfter));
 
-    title_and_desc(p, &l.folder, FOLDER_TITLE, Some(&paths::media_text()));
-    widgets::quiet_button(p, l.folder.control, "Open folder", TextStyle::Body, hover(SHit::OpenFolder), true);
-    widgets::ring(p, ring(SFocus::OpenFolder), l.folder.control, 6.0);
+    title_and_desc(p, &l.folder, FOLDER_TITLE, &paths::media_text(), MUTED);
+    widgets::button(p, l.folder.control, &["Open folder"], hover(SHit::OpenFolder), ring(SFocus::OpenFolder));
     separator(p, &l.import);
-    title_and_desc(p, &l.import, IMPORT_TITLE, Some(IMPORT_DESC));
-    widgets::button(p, l.import.control, &["Choose", "folder…"], hover(SHit::ChooseFolder), ring(SFocus::ChooseFolder));
+    title_and_desc(p, &l.import, IMPORT_TITLE, IMPORT_DESC, MUTED);
+    widgets::button(p, l.import.control, &["Choose folder…"], hover(SHit::ChooseFolder), ring(SFocus::ChooseFolder));
     separator(p, &l.backup);
-    title_and_desc(p, &l.backup, BACKUP_TITLE, Some(BACKUP_DESC));
+    title_and_desc(p, &l.backup, BACKUP_TITLE, BACKUP_DESC, MUTED);
     let backup_label = if s.backup_running { "Cancel backup" } else { "Back up library" };
     widgets::button(p, l.backup.control, &[backup_label], hover(SHit::Backup), ring(SFocus::Backup));
 
-    title_and_desc(p, &l.autostart, AUTOSTART_TITLE, Some(AUTOSTART_DESC));
-    let hot = hover(SHit::Autostart);
-    widgets::checkbox(p, l.autostart.control, s.draft.autostart, hot, ring(SFocus::Autostart));
+    title_and_desc(p, &l.autostart, AUTOSTART_TITLE, AUTOSTART_DESC, MUTED);
+    widgets::switch(p, l.autostart.control, s.draft.autostart, hover(SHit::Autostart), ring(SFocus::Autostart));
     p.pop_clip();
 
     // Pinned action bar.
-    p.line(l.bar_x.0, l.bar_y + 0.5, l.bar_x.1, l.bar_y + 0.5, 1.0, BORDER);
-    p.text(&s.status_line(), l.note, TextStyle::Small, MUTED, Align::Start, true);
+    p.line(l.bar_x.0, l.bar_y + 0.5, l.bar_x.1, l.bar_y + 0.5, 1.0, LINE);
+    let line = s.status_line();
+    let note_c = if s.dirty() { widgets::SOFT_TEXT } else { MUTED };
+    p.text(&line, l.note, TextStyle::Small, note_c, Align::Start, true);
     widgets::button(p, l.cancel, &["Cancel"], hover(SHit::Cancel), ring(SFocus::Cancel));
     widgets::primary_button(p, l.save, "Save changes", s.dirty(), hover(SHit::Save), ring(SFocus::Save));
 
-    if let Some(row) = s.video_open {
-        let labels = VideoPreview::BOTH.map(VideoPreview::label);
-        widgets::menu(p, &l.video_menu, &labels, row, s.draft.video_preview.index());
-    }
     if let (Some(panel), Some(pl)) = (&s.backup_panel, &l.panel) {
         paint_panel(p, s, panel, pl, ui);
+    }
+    if let (Some(d), Some(dl)) = (&s.shortcut_dialog, &l.dialog) {
+        paint_dialog(p, s, d, dl, ui);
     }
     paint_border(p, &l.frame);
 }
 
-fn paint_panel(p: &Painter, s: &SettingsPage, panel: &BackupPanel, l: &PanelLayout, ui: &SettingsUi) {
-    p.fill(l.cover, 0.0, BG.alpha(0.82));
-    p.fill(l.card, 8.0, SURFACE);
-    p.stroke(l.card, 8.0, 1.0, BORDER);
-    match panel {
-        BackupPanel::Running(step) => {
-            p.text("Backing up your library", l.title, TextStyle::Title, TEXT, Align::Start, true);
-            p.fill(l.bar, 4.0, BG);
-            p.stroke(l.bar, 4.0, 1.0, BORDER);
-            let f = step.fraction();
-            if f > 0.0 {
-                p.fill(Rect::new(l.bar.x, l.bar.y, (l.bar.w * f).max(8.0), l.bar.h), 4.0, ACCENT);
-            }
-            p.text(&format!("{} %", (f * 100.0).floor() as u32), l.percent, TextStyle::Small, TEXT, Align::End, true);
-            p.text(&step.counts(), l.line1, TextStyle::Small, TEXT, Align::Start, true);
-            p.text(&step.doing(), l.line2, TextStyle::Small, MUTED, Align::Start, true);
-        }
-        BackupPanel::Done { title, text, .. } => {
-            p.text(title, l.title, TextStyle::Title, TEXT, Align::Start, true);
-            p.text_wrapped(text, l.text.x, l.text.y, l.text.w, TextStyle::Small, MUTED);
-        }
-    }
-    let last = l.buttons.len().saturating_sub(1);
-    for (i, (f, r)) in l.buttons.iter().enumerate() {
+fn card_buttons(p: &Painter, s: &SettingsPage, card: &Card, ui: &SettingsUi, primary: SFocus, enabled: &dyn Fn(SFocus) -> bool) {
+    for (f, r) in &card.buttons {
         let ring = s.focus_visible && s.focus == *f;
         let hot = ui.hover == panel_hit(*f);
-        if i == last && *f == SFocus::PanelDone {
-            widgets::primary_button(p, *r, panel_label(*f), true, hot, ring);
+        if *f == primary {
+            widgets::primary_button(p, *r, panel_label(*f), enabled(*f), hot, ring);
+        } else if *f == SFocus::DialogReset {
+            widgets::quiet_button(p, *r, &reset_label(), TextStyle::Small, hot, true);
+            widgets::ring(p, ring, *r, widgets::RADIUS);
         } else {
             widgets::button(p, *r, &[panel_label(*f)], hot, ring);
         }
     }
+}
+
+fn paint_card(p: &Painter, c: &Card, title: &str) {
+    p.fill(c.cover, 0.0, BG.alpha(0.78));
+    p.fill(c.card.inset(-1.0), 17.0, widgets::BORDER);
+    p.fill(c.card, 16.0, SURFACE);
+    p.text(title, c.title, TextStyle::Title, TEXT, Align::Start, true);
+}
+
+fn paint_panel(p: &Painter, s: &SettingsPage, panel: &BackupPanel, l: &(Card, PanelBody), ui: &SettingsUi) {
+    let (card, b) = l;
+    match panel {
+        BackupPanel::Running(step) => {
+            paint_card(p, card, "Backing up your library");
+            p.fill(b.bar, 4.0, widgets::FIELD);
+            let f = step.fraction();
+            if f > 0.0 {
+                p.fill(Rect::new(b.bar.x, b.bar.y, (b.bar.w * f).max(8.0), b.bar.h), 4.0, ACCENT);
+            }
+            p.text(&format!("{} %", (f * 100.0).floor() as u32), b.percent, TextStyle::Small, TEXT, Align::End, true);
+            p.text(&step.counts(), b.line1, TextStyle::Small, TEXT, Align::Start, true);
+            p.text(&step.doing(), b.line2, TextStyle::Small, MUTED, Align::Start, true);
+        }
+        BackupPanel::Done { title, text, .. } => {
+            paint_card(p, card, title);
+            p.text_wrapped(text, b.text.x, b.text.y, b.text.w, TextStyle::Small, MUTED);
+        }
+    }
+    card_buttons(p, s, card, ui, SFocus::PanelDone, &|_| true);
+}
+
+fn paint_dialog(p: &Painter, s: &SettingsPage, d: &ShortcutDialog, l: &(Card, DialogBody), ui: &SettingsUi) {
+    let (card, b) = l;
+    paint_card(p, card, DIALOG_TITLE);
+    p.text_wrapped(DIALOG_TEXT, b.text.x, b.text.y, b.text.w, TextStyle::Small, MUTED);
+
+    // The keys: held modifiers while waiting, then the whole shortcut.
+    p.fill(b.capture, 12.0, BG);
+    let edge = match d.verdict {
+        Verdict::Waiting => ACCENT.alpha(0.55),
+        Verdict::Free => GOOD,
+        Verdict::Refused(_) => DANGER,
+    };
+    p.stroke(b.capture, 12.0, 2.0, edge);
+    let owned: Vec<String> = match d.candidate {
+        Some(c) if !d.held.any() => c.keys(),
+        _ => d.held.keys().iter().map(|k| k.to_string()).collect(),
+    };
+    let keys: Vec<&str> = owned.iter().map(String::as_str).collect();
+    let (_, cy) = b.capture.center();
+    if keys.is_empty() {
+        p.text("Press the keys now…", b.capture, TextStyle::Body, SUBTLE, Align::Center, true);
+    } else {
+        let w = widgets::keycaps_w(p.gfx(), &keys, TextStyle::Heading, 8.0);
+        let x = b.capture.x + (b.capture.w - w) / 2.0;
+        widgets::keycaps(p, x, cy, 36.0, &keys, TextStyle::Heading, 8.0, true);
+    }
+
+    match &d.verdict {
+        Verdict::Waiting => {
+            let now = format!("Now: {}", crate::hotkey::current().label());
+            p.text(&now, b.verdict, TextStyle::Small, SUBTLE, Align::Start, true);
+        }
+        Verdict::Free => {
+            let (x, y) = (b.verdict.x, b.verdict.y + b.verdict.h / 2.0);
+            p.line(x + 1.0, y, x + 4.5, y + 3.5, 2.0, GOOD);
+            p.line(x + 4.5, y + 3.5, x + 11.0, y - 4.0, 2.0, GOOD);
+            let r = Rect::new(x + 18.0, b.verdict.y, b.verdict.w - 18.0, b.verdict.h);
+            p.text("Available on this computer.", r, TextStyle::Small, GOOD, Align::Start, true);
+        }
+        Verdict::Refused(e) => p.text_wrapped(e, b.verdict.x, b.verdict.y, b.verdict.w, TextStyle::Small, DANGER),
+    }
+    card_buttons(p, s, card, ui, SFocus::DialogUse, &|f| f != SFocus::DialogUse || d.can_use());
 }

@@ -15,12 +15,12 @@ use windows::Win32::Graphics::Direct2D::{
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-    DWRITE_FONT_WEIGHT_MEDIUM, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_HIT_TEST_METRICS,
+    DWRITE_FONT_WEIGHT, DWRITE_HIT_TEST_METRICS,
     DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_NEAR, DWRITE_TEXT_ALIGNMENT,
     DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING,
     DWRITE_TEXT_METRICS, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
     DWRITE_LINE_SPACING_METHOD_UNIFORM, DWRITE_WORD_WRAPPING_NO_WRAP, DWRITE_WORD_WRAPPING_WRAP, DWriteCreateFactory, IDWriteFactory, IDWriteInlineObject,
-    DWRITE_FONT_AXIS_TAG_WEIGHT, DWRITE_FONT_AXIS_VALUE, IDWriteTextFormat, IDWriteTextFormat3, IDWriteTextLayout, IDWriteTextLayout1, DWRITE_TEXT_RANGE,
+    DWRITE_FONT_AXIS_TAG_WEIGHT, DWRITE_FONT_AXIS_VALUE, IDWriteTextFormat, IDWriteTextFormat3, IDWriteTextLayout,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_UNKNOWN};
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
@@ -112,11 +112,11 @@ fn font_family(dwrite: &IDWriteFactory) -> HSTRING {
 }
 
 /// Segoe UI Variable has no "Medium" named instance, so DirectWrite rounds weight
-/// 500 up to Semibold. Setting the variable weight axis gives a true 500, like the
-/// wireframe. Older Windows without IDWriteTextFormat3 keeps the rounded weight.
-fn set_true_medium(format: &IDWriteTextFormat) {
+/// 500 up to Semibold. Setting the variable weight axis gives the exact weight.
+/// Older Windows without IDWriteTextFormat3 keeps the rounded weight.
+fn set_true_weight(format: &IDWriteTextFormat, weight: f32) {
     if let Ok(f3) = format.cast::<IDWriteTextFormat3>() {
-        let axis = [DWRITE_FONT_AXIS_VALUE { axisTag: DWRITE_FONT_AXIS_TAG_WEIGHT, value: 500.0 }];
+        let axis = [DWRITE_FONT_AXIS_VALUE { axisTag: DWRITE_FONT_AXIS_TAG_WEIGHT, value: weight }];
         // SAFETY: f3 is the same live format; the slice outlives the call.
         let _ = unsafe { f3.SetFontAxisValues(&axis) };
     }
@@ -131,7 +131,7 @@ impl Gfx {
         let family = font_family(&dwrite);
         let mut formats = Vec::new();
         for style in TextStyle::ALL {
-            let weight = if style.medium() { DWRITE_FONT_WEIGHT_MEDIUM } else { DWRITE_FONT_WEIGHT_NORMAL };
+            let weight = DWRITE_FONT_WEIGHT(style.weight() as i32);
             // SAFETY: valid HSTRINGs; sizes are positive constants.
             let format = unsafe {
                 dwrite.CreateTextFormat(
@@ -146,8 +146,8 @@ impl Gfx {
             };
             // SAFETY: format is a live text format created above.
             unsafe { format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)? };
-            if style.medium() {
-                set_true_medium(&format);
+            if style.weight() != 400.0 {
+                set_true_weight(&format, style.weight());
             }
             // SAFETY: as above.
             let ellipsis = unsafe { dwrite.CreateEllipsisTrimmingSign(&format)? };
@@ -459,26 +459,6 @@ impl Painter<'_> {
         }
     }
 
-    /// One line of left-aligned, vertically centred text with extra space after
-    /// each character (CSS letter-spacing), for the small capitals labels.
-    pub fn text_spaced(&self, s: &str, r: Rect, style: TextStyle, c: Color, spacing: f32) {
-        if !self.touches(r) {
-            return;
-        }
-        let Some(layout) = self.gfx.layout(s, style, r.w, r.h) else { return };
-        let range = DWRITE_TEXT_RANGE { startPosition: 0, length: s.encode_utf16().count() as u32 };
-        self.color(c);
-        // SAFETY: layout is live; the range covers the text; called during a frame.
-        unsafe {
-            let _ = layout.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-            // Windows 7+ always has IDWriteTextLayout1; without it the text is just unspaced.
-            if let Ok(l1) = layout.cast::<IDWriteTextLayout1>() {
-                let _ = l1.SetCharacterSpacing(0.0, spacing, 0.0, range);
-            }
-            self.target.DrawTextLayout(pt(r.x, r.y), &layout, self.brush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
-        }
-    }
-
     /// Word-wrapped text starting at (x, y), `width` wide.
     pub fn text_wrapped(&self, s: &str, x: f32, y: f32, width: f32, style: TextStyle, c: Color) {
         self.text_wrapped_lh(s, x, y, width, style, c, style.size() * LINE_HEIGHT);
@@ -514,6 +494,17 @@ impl Painter<'_> {
         let e = D2D1_ELLIPSE { point: pt(cx, cy), radiusX: r, radiusY: r };
         // SAFETY: called during a frame with a live brush.
         unsafe { self.target.FillEllipse(&e, self.brush) };
+    }
+
+    /// Circle outline, `width` wide, centred on the radius.
+    pub fn stroke_circle(&self, cx: f32, cy: f32, r: f32, width: f32, c: Color) {
+        if !self.touches(Rect::new(cx - r - width, cy - r - width, (r + width) * 2.0, (r + width) * 2.0)) {
+            return;
+        }
+        self.color(c);
+        let e = D2D1_ELLIPSE { point: pt(cx, cy), radiusX: r, radiusY: r };
+        // SAFETY: called during a frame with a live brush.
+        unsafe { self.target.DrawEllipse(&e, self.brush, width, None) };
     }
 
     pub fn push_clip(&self, r: Rect) {

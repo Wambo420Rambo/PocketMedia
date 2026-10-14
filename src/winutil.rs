@@ -16,12 +16,35 @@ use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VIRTUAL_KEY,
 };
-use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetCursorPos, IDC_ARROW, IDC_IBEAM, LoadCursorW, SetCursor};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetClientRect, GetCursorPos, GetSystemMetrics, HICON, IDC_ARROW, IDC_IBEAM, IDI_APPLICATION, IMAGE_ICON, LR_SHARED,
+    LoadCursorW, LoadIconW, LoadImageW, SM_CXICON, SM_CXSMICON, SetCursor,
+};
+use windows::core::PCWSTR;
 
 use crate::ui::layout::Rect;
 
 /// Defined in Win32_UI_Controls; declared here rather than enabling that whole feature.
 pub const WM_MOUSELEAVE: u32 = 0x02A3;
+
+/// The PocketMedia logo from the exe's resources (icon group 1, linked by
+/// build.rs), at the system's large or small icon size. Windows' generic program
+/// icon when the exe was built without it. Shared icons belong to the system,
+/// so nobody destroys them.
+pub fn app_icon(small: bool) -> HICON {
+    // SAFETY: plain metric and resource lookups; MAKEINTRESOURCE(1) is a valid
+    // resource-id pointer value, and LR_SHARED handles are never freed by us.
+    unsafe {
+        let size = GetSystemMetrics(if small { SM_CXSMICON } else { SM_CXICON });
+        let module = GetModuleHandleW(None).ok();
+        let id = PCWSTR(std::ptr::without_provenance(1)); // MAKEINTRESOURCE(1)
+        match LoadImageW(module.map(Into::into), id, IMAGE_ICON, size, size, LR_SHARED) {
+            Ok(h) if !h.is_invalid() => HICON(h.0),
+            _ => LoadIconW(None, IDI_APPLICATION).unwrap_or_default(),
+        }
+    }
+}
 
 /// Rounded Windows 11 corners and no system border (we draw our own).
 pub fn style_frame(hwnd: HWND) {

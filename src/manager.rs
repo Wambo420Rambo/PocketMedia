@@ -22,6 +22,7 @@ use crate::add_panel::{AddOutcome, AddPanel, Area};
 use crate::library::{self, Library, extension};
 use crate::manager_state::{MFocus, ManagerState, Nav, Page, Sort};
 use crate::settings_state::{BackupPanel, Profile, SFocus, VideoPreview};
+use crate::hotkey::{self, Shortcut};
 use crate::text_field::TextField;
 use crate::ui::add_view::AddHit;
 use crate::ui::d2d::Gfx;
@@ -33,7 +34,6 @@ use crate::ui::widgets::TextMetrics;
 use crate::winutil::{self, WM_MOUSELEAVE};
 
 const WHEEL_STEP: f32 = 48.0;
-const SHORTCUT_NOTE: &str = "Changing the shortcut is not built yet.";
 
 struct View {
     state: ManagerState,
@@ -101,14 +101,17 @@ fn create() -> Result<(), String> {
     // SAFETY: standard class registration and window creation; pointers are to statics.
     let hwnd = unsafe {
         let instance: HINSTANCE = GetModuleHandleW(None).map_err(|e| e.to_string())?.into();
-        let class = WNDCLASSW {
+        let class = WNDCLASSEXW {
+            cbSize: size_of::<WNDCLASSEXW>() as u32,
+            hIcon: winutil::app_icon(false),
+            hIconSm: winutil::app_icon(true),
             lpfnWndProc: Some(manager_proc),
             hInstance: instance,
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
             lpszClassName: w!("PocketMediaManager"),
             ..Default::default()
         };
-        if RegisterClassW(&class) == 0 {
+        if RegisterClassExW(&class) == 0 {
             return Err("Could not register the Manager window class.".into());
         }
         CreateWindowExW(
@@ -173,6 +176,19 @@ pub fn show() {
     winutil::invalidate(h);
 }
 
+/// The tray menu's Settings: the Manager at its Settings page. An open Add media
+/// panel stays open (closing it could lose a review in progress).
+pub fn show_settings() {
+    show();
+    with_view(|v| {
+        if v.add.is_none() && v.state.page != Page::Settings {
+            library::with(|lib| v.state.navigate(Nav::Settings, lib));
+            v.s_hover = SHit::None;
+        }
+    });
+    winutil::invalidate(hwnd());
+}
+
 /// The uninstaller's Back up library… button (`pocketmedia.exe --backup`): shows
 /// Settings scrolled to Back up library and opens its folder picker, as clicking
 /// the button there does. Unsaved Settings edits and an open Add media panel are
@@ -208,13 +224,16 @@ pub fn show_status(text: &str) {
 pub fn hide() {
     with_view(|v| {
         v.state.sort_open = None;
-        v.state.settings.video_open = None;
+        if v.state.settings.shortcut_dialog.is_some() {
+            v.state.settings.close_shortcut_dialog();
+        }
         v.hover = MHit::None;
         v.pressed = MHit::None;
         v.s_hover = SHit::None;
         v.s_pressed = SHit::None;
         v.scroll_drag = None;
     });
+    hotkey::set_paused(false);
     release_previews();
     // SAFETY: our own window; a stale HWND only makes it fail.
     let _ = unsafe { ShowWindow(hwnd(), SW_HIDE) };
@@ -341,6 +360,11 @@ impl View {
         self.add.is_none() && self.state.page == Page::Settings
     }
 
+    /// The shortcut chooser is open and takes the keyboard.
+    fn choosing(&self) -> bool {
+        self.on_settings() && self.state.settings.shortcut_dialog.is_some()
+    }
+
     fn settings_layout(&self) -> SettingsLayout {
         let a = self.area();
         SettingsLayout::compute(&self.state.settings, a.w, a.h, &self.gfx)
@@ -353,13 +377,17 @@ impl View {
         self.settings_layout().hit(&self.state.settings, x, y)
     }
 
-    /// Over the × button (which must not drag the window).
-    fn over_close(&self, x: f32, y: f32) -> bool {
-        if self.on_settings() {
-            matches!(self.settings_hit(x, y), SHit::Close | SHit::QuickPopup)
-        } else {
-            matches!(self.hit(x, y), MHit::Close | MHit::QuickPopup)
+    /// Where the window can be dragged: the sidebar's logo area, or the head of
+    /// the Add media panel between its buttons.
+    fn is_caption(&self, x: f32, y: f32) -> bool {
+        if let Some(add) = self.add.as_ref() {
+            return add.is_caption(&self.gfx, self.area(), x, y);
         }
+        if self.state.settings.shortcut_dialog.is_some() && self.on_settings() {
+            return false;
+        }
+        let a = self.area();
+        manager_view::Frame::compute(a.w, a.h, &self.gfx).caption.contains(x, y)
     }
 
     fn hit(&self, x: f32, y: f32) -> MHit {
@@ -370,12 +398,12 @@ impl View {
     }
 
     fn search_metrics(&self, l: &ManagerLayout) -> TextMetrics {
-        TextMetrics::for_search(&self.gfx, &self.state.search, &l.search)
+        TextMetrics::for_search(&self.gfx, &self.state.search, &l.search, TextStyle::Body)
     }
 
     fn rename_metrics(&self, l: &ManagerLayout, lib: &Library) -> TextMetrics {
         let ext = self.state.selected_item(lib).map_or("", |i| extension(&i.name));
-        let width = l.insp.as_ref().map_or(0.0, |i| i.input.w - 22.0) - self.gfx.measure(ext, TextStyle::Body);
+        let width = l.insp.as_ref().map_or(0.0, |i| i.input.w - 24.0) - self.gfx.measure(ext, TextStyle::Body);
         TextMetrics::of(&self.gfx, &self.state.rename, TextStyle::Body, width)
     }
 
@@ -392,7 +420,7 @@ impl View {
             // The button label follows the backup itself, even if an event was missed.
             self.state.settings.backup_running = crate::backup::running();
             let l = self.settings_layout();
-            let ui = SettingsUi { hover: self.s_hover };
+            let ui = SettingsUi { hover: self.s_hover, shortcut_ok: hotkey::ok() };
             let s = &self.state.settings;
             let _ = self.gfx.draw(hwnd(), self.dpi as f32, None, |p| settings_view::paint(p, s, &l, &ui));
         } else {
@@ -558,10 +586,10 @@ impl View {
                     let l = self.layout(lib);
                     if hit == MHit::Search {
                         let m = self.search_metrics(&l);
-                        Self::caret_at(&self.gfx, &mut self.state.search, m, l.search.input.x + 2.0, x);
+                        Self::caret_at(&self.gfx, &mut self.state.search, m, l.search.input.x, x);
                     } else if let Some(i) = &l.insp {
                         let m = self.rename_metrics(&l, lib);
-                        Self::caret_at(&self.gfx, &mut self.state.rename, m, i.input.x + 11.0, x);
+                        Self::caret_at(&self.gfx, &mut self.state.rename, m, i.input.x + 12.0, x);
                     }
                 });
                 Effect::None
@@ -642,7 +670,9 @@ impl View {
         }
         if self.on_settings() {
             let st = &mut self.state.settings;
-            st.video_open = None;
+            if st.shortcut_dialog.is_some() {
+                return;
+            }
             st.scroll -= delta as f32 / 120.0 * WHEEL_STEP;
             return self.clamp_settings_scroll(false);
         }
@@ -802,7 +832,7 @@ impl View {
             SHit::QuickPopup => SFocus::QuickPopup,
             SHit::Nav(i) => SFocus::Nav(i),
             SHit::Profile(_) => SFocus::Profile,
-            SHit::Video | SHit::VideoRow(_) => SFocus::Video,
+            SHit::Video => SFocus::Video,
             SHit::Change => SFocus::Change,
             SHit::CloseAfter => SFocus::CloseAfter,
             SHit::OpenFolder => SFocus::OpenFolder,
@@ -814,6 +844,9 @@ impl View {
             SHit::Autostart => SFocus::Autostart,
             SHit::Cancel => SFocus::Cancel,
             SHit::Save => SFocus::Save,
+            SHit::DialogReset => SFocus::DialogReset,
+            SHit::DialogCancel => SFocus::DialogCancel,
+            SHit::DialogUse => SFocus::DialogUse,
             SHit::None | SHit::Caption => return None,
         })
     }
@@ -821,11 +854,8 @@ impl View {
     fn settings_mouse_down(&mut self, x: f32, y: f32) -> Effect {
         let hit = self.settings_hit(x, y);
         let st = &mut self.state.settings;
-        if st.video_open.is_some() && !matches!(hit, SHit::VideoRow(_) | SHit::Video) {
-            st.video_open = None; // a click outside only closes the list
-            return Effect::None;
-        }
-        if hit == SHit::Save && !st.dirty() {
+        let use_off = hit == SHit::DialogUse && !st.shortcut_dialog.as_ref().is_some_and(|d| d.can_use());
+        if (hit == SHit::Save && !st.dirty()) || use_off {
             return Effect::None; // disabled
         }
         st.focus_visible = false;
@@ -856,12 +886,14 @@ impl View {
                 return Effect::None;
             }
             SHit::Profile(i) => st.set_profile(Profile::BOTH[i]),
-            SHit::Video => st.video_open = if st.video_open.is_some() { None } else { Some(st.draft.video_preview.index()) },
-            SHit::VideoRow(i) => {
-                st.set_video(VideoPreview::BOTH[i]);
-                st.focus = SFocus::Video;
+            SHit::Video => st.toggle_video(),
+            SHit::Change => st.open_shortcut_dialog(),
+            SHit::DialogReset => {
+                let d = Shortcut::default();
+                st.dialog_pressed(d, hotkey::is_free(d));
             }
-            SHit::Change => st.show_note(SHORTCUT_NOTE),
+            SHit::DialogCancel => st.close_shortcut_dialog(),
+            SHit::DialogUse => st.use_shortcut(),
             SHit::CloseAfter => st.toggle_close_after(),
             SHit::OpenFolder => {
                 let note = open_media_folder();
@@ -894,9 +926,19 @@ impl View {
             SHit::Autostart => st.toggle_autostart(),
             SHit::Cancel => st.cancel(),
             SHit::Save => {
+                let mut problems = Vec::new();
+                // A new shortcut is registered first; if Windows refuses it, the old one stays.
+                if st.draft.shortcut != st.saved.shortcut {
+                    match hotkey::apply(st.draft.shortcut) {
+                        Ok(()) => crate::tray::set_tip(crate::app(|a| a.main.get()), "PocketMedia"),
+                        Err(e) => {
+                            problems.push(format!("{} could not be used: {e} The shortcut is unchanged.", st.draft.shortcut.label()));
+                            st.draft.shortcut = st.saved.shortcut;
+                        }
+                    }
+                }
                 let autostart = (st.draft.autostart != st.saved.autostart).then_some(st.draft.autostart);
                 st.save();
-                let mut problems = Vec::new();
                 if let Some(on) = autostart
                     && let Err(e) = crate::autostart::set(on)
                 {
@@ -917,18 +959,37 @@ impl View {
         Effect::None
     }
 
-    fn key_settings(&mut self, vk: VIRTUAL_KEY, shift: bool, alt: bool) -> Effect {
+    /// Keys while the shortcut chooser is open: Tab, Enter, Space and Escape
+    /// (without Ctrl, Alt or Win) work the dialog; anything else is recorded.
+    fn key_dialog(&mut self, vk: VIRTUAL_KEY) -> Effect {
         let st = &mut self.state.settings;
-        if let Some(row) = st.video_open {
-            match vk {
-                VK_UP | VK_DOWN => st.video_open = Some(if vk == VK_UP { 0 } else { 1 }),
-                VK_RETURN | VK_SPACE => st.set_video(VideoPreview::BOTH[row]),
-                VK_ESCAPE => st.video_open = None,
-                VK_TAB => st.tab(shift),
-                _ => {}
-            }
+        let held = hotkey::held_now();
+        if hotkey::is_modifier(vk.0) {
+            st.dialog_held(held);
             return Effect::None;
         }
+        let plain = !held.ctrl && !held.alt && !held.win;
+        st.focus_visible = true;
+        match vk {
+            VK_TAB if plain => st.tab(held.shift),
+            VK_ESCAPE if plain && !held.shift => st.close_shortcut_dialog(),
+            VK_RETURN | VK_SPACE if plain && !held.shift => {
+                let hit = settings_view::panel_hit(st.focus);
+                return self.activate_settings(hit);
+            }
+            _ => {
+                let candidate = held.with(vk.0);
+                st.dialog_pressed(candidate, hotkey::is_free(candidate));
+            }
+        }
+        Effect::None
+    }
+
+    fn key_settings(&mut self, vk: VIRTUAL_KEY, shift: bool, _alt: bool) -> Effect {
+        if self.state.settings.shortcut_dialog.is_some() {
+            return self.key_dialog(vk);
+        }
+        let st = &mut self.state.settings;
         if vk == VK_TAB {
             st.tab(shift);
             return Effect::None;
@@ -958,17 +1019,11 @@ impl View {
                 VK_RIGHT | VK_DOWN => SHit::Profile(1),
                 _ => SHit::None,
             },
-            SFocus::Video => match vk {
-                VK_DOWN if alt => SHit::Video,
-                VK_F4 | VK_RETURN | VK_SPACE => SHit::Video,
-                VK_UP => SHit::VideoRow(0),
-                VK_DOWN => SHit::VideoRow(1),
-                _ => SHit::None,
-            },
-            // Checkboxes toggle with Space only.
-            SFocus::CloseAfter if vk == VK_SPACE => SHit::CloseAfter,
-            SFocus::Autostart if vk == VK_SPACE => SHit::Autostart,
-            SFocus::CloseAfter | SFocus::Autostart => SHit::None,
+            // Switches toggle with Space (and Enter).
+            SFocus::Video if press => SHit::Video,
+            SFocus::CloseAfter if press => SHit::CloseAfter,
+            SFocus::Autostart if press => SHit::Autostart,
+            SFocus::Video | SFocus::CloseAfter | SFocus::Autostart => SHit::None,
             focus if press => match focus {
                 SFocus::Close => SHit::Close,
                 SFocus::QuickPopup => SHit::QuickPopup,
@@ -979,6 +1034,7 @@ impl View {
                 SFocus::Cancel => SHit::Cancel,
                 SFocus::Save => SHit::Save,
                 SFocus::PanelCancel | SFocus::PanelOpen | SFocus::PanelDone => settings_view::panel_hit(focus),
+                SFocus::DialogReset | SFocus::DialogCancel | SFocus::DialogUse => settings_view::panel_hit(focus),
                 _ => SHit::None,
             },
             _ => SHit::None,
@@ -1138,6 +1194,9 @@ fn run(effect: Effect) {
         }
     }
     sync_title(h);
+    // While the shortcut chooser is open, pressing the shortcut records it instead of opening the popup.
+    let choosing = with_view(|v| v.on_settings() && v.state.settings.shortcut_dialog.is_some()).unwrap_or(false);
+    hotkey::set_paused(choosing && is_visible());
     winutil::invalidate(h);
 }
 
@@ -1282,12 +1341,11 @@ extern "system" fn manager_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             return LRESULT(0);
         }
         WM_NCHITTEST => {
-            // The title bar (outside ×) moves the window, like a normal caption.
+            // The logo area moves the window, like a normal caption.
             let pt = screen_to_client(hwnd, lparam);
             let caption = with_view(|v| {
                 let (x, y) = winutil::to_dip(pt, v.dpi);
-                let in_bar = (1.0..47.0).contains(&y);
-                in_bar && !v.over_close(x, y) && !(v.add.is_some() && x > v.area().w - 48.0)
+                v.is_caption(x, y)
             });
             return LRESULT(if caption == Some(true) { HTCAPTION as isize } else { HTCLIENT as isize });
         }
@@ -1335,6 +1393,17 @@ extern "system" fn manager_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                     v.mouse_move(x, y);
                 }
             });
+            Effect::None
+        }
+        // The shortcut chooser records Alt combinations and shows held modifiers.
+        WM_KEYDOWN | WM_SYSKEYDOWN if with_view(|v| v.choosing()).unwrap_or(false) => {
+            let vk = VIRTUAL_KEY(wparam.0 as u16);
+            with_view(|v| v.key_dialog(vk)).unwrap_or(Effect::None)
+        }
+        WM_KEYUP | WM_SYSKEYUP | WM_SYSCHAR if with_view(|v| v.choosing()).unwrap_or(false) => {
+            if msg != WM_SYSCHAR {
+                with_view(|v| v.state.settings.dialog_held(hotkey::held_now()));
+            }
             Effect::None
         }
         WM_KEYDOWN | WM_SYSKEYDOWN => {
@@ -1419,7 +1488,7 @@ pub fn element_center(hit: MHit) -> Option<POINT> {
                 MHit::SortRow(i) => *l.sort_menu.rows.get(i)?,
                 MHit::Tile(i) if i < n => l.grid.tile(i, v.state.scroll),
                 // A point in the gap between the first two columns: over the gallery, not a tile.
-                MHit::Scrollbar => Rect::new(l.grid.tile(0, 0.0).right() + 1.0, l.grid.area.y + 40.0, 10.0, 1.0),
+                MHit::Scrollbar => Rect::new(l.grid.tile(0, 0.0).right(), l.grid.area.y + 40.0, 2.0, 1.0),
                 MHit::EmptyAction if n == 0 => l.empty.2,
                 MHit::RenameInput => insp?.input,
                 MHit::Rename => insp?.rename,
@@ -1427,8 +1496,8 @@ pub fn element_center(hit: MHit) -> Option<POINT> {
                 MHit::Recycle if confirm.is_none() => insp?.recycle,
                 MHit::ConfirmMove => confirm?.move_button,
                 MHit::ConfirmCancel => confirm?.cancel,
-                // A neutral point: the empty middle of the title bar.
-                MHit::None => Rect::new(l.frame.caption.right() + 40.0, l.frame.titlebar.y + 10.0, 1.0, 1.0),
+                // A neutral point: the middle of the line under the top bar (no control there).
+                MHit::None => Rect::new((l.count.x + l.card.x) / 2.0, l.count.y + l.count.h / 2.0, 1.0, 1.0),
                 _ => return None,
             })
         })?;
@@ -1462,7 +1531,6 @@ pub fn settings_element_center(hit: SHit) -> Option<POINT> {
             SHit::Nav(i) => *l.frame.nav.get(i)?,
             SHit::Profile(i) => l.choices.get(i)?.card,
             SHit::Video => l.video.control,
-            SHit::VideoRow(i) => *l.video_menu.rows.get(i)?,
             SHit::Change => l.shortcut.control,
             SHit::CloseAfter => l.close_after.control,
             SHit::OpenFolder => l.folder.control,
@@ -1472,16 +1540,26 @@ pub fn settings_element_center(hit: SHit) -> Option<POINT> {
             SHit::Cancel => l.cancel,
             SHit::Save => l.save,
             SHit::PanelCancel | SHit::PanelOpen | SHit::PanelDone => {
-                l.panel.as_ref()?.buttons.iter().find(|(f, _)| settings_view::panel_hit(*f) == hit)?.1
+                l.panel.as_ref()?.0.buttons.iter().find(|(f, _)| settings_view::panel_hit(*f) == hit)?.1
             }
-            // The empty title bar.
-            SHit::None => Rect::new(l.frame.caption.right() + 40.0, l.frame.titlebar.y + 10.0, 1.0, 1.0),
+            SHit::DialogReset | SHit::DialogCancel | SHit::DialogUse => {
+                l.dialog.as_ref()?.0.buttons.iter().find(|(f, _)| settings_view::panel_hit(*f) == hit)?.1
+            }
+            // A neutral point: the right end of the page heading.
+            SHit::None => Rect::new(l.heading.right() - 20.0, l.heading.y + l.heading.h / 2.0, 1.0, 1.0),
             // Test-only: a spot inside the scroll area but beside every control (for the wheel).
-            SHit::Caption => Rect::new(l.view.x + 4.0, l.view.y + l.view.h / 2.0, 1.0, 1.0),
+            SHit::Caption => Rect::new(l.view.right() - 4.0, l.view.y + l.view.h / 2.0, 1.0, 1.0),
         };
         Some(winutil::rect_center_on_screen(h, v.dpi, r))
     })
     .flatten()
+}
+
+/// Self-test only: the chooser checks `sc` as if it had been pressed (for a
+/// shortcut another program holds, whose key presses never reach this window).
+pub fn test_dialog_press(sc: Shortcut) {
+    with_view(|v| v.state.settings.dialog_pressed(sc, hotkey::is_free(sc)));
+    winutil::invalidate(hwnd());
 }
 
 /// Self-test only: takes the saved settings from the store again (after it was re-read).
@@ -1516,8 +1594,9 @@ pub fn describe() -> String {
             let visible = |r: Rect| r.y >= l.view.y - 0.5 && r.bottom() <= l.view.bottom() + 0.5;
             return format!(
                 "screen=settings profile={:?} video={:?} close_after={} autostart={} saved={:?}/{:?}/{}/{} dirty={} \
-                 focus={:?} focus_visible={} video_open={} scroll={:.0} max_scroll={:.0} autostart_visible={} \
-                 line={:?} opened={:?} media={:?} nav_selected={} backup_running={} panel={}",
+                 focus={:?} focus_visible={} dialog={} scroll={:.0} max_scroll={:.0} autostart_visible={} \
+                 line={:?} opened={:?} media={:?} nav_selected={} backup_running={} panel={} shortcut={:?} \
+                 saved_shortcut={:?} registered={:?} hotkey_ok={}",
                 d.profile,
                 d.video_preview,
                 d.close_after_insert,
@@ -1529,7 +1608,18 @@ pub fn describe() -> String {
                 st.dirty(),
                 st.focus,
                 st.focus_visible,
-                st.video_open.is_some(),
+                match &st.shortcut_dialog {
+                    None => "none".to_string(),
+                    Some(d) => format!(
+                        "{}:{}",
+                        d.candidate.map(|c| c.label()).unwrap_or_default(),
+                        match &d.verdict {
+                            crate::settings_state::Verdict::Waiting => "waiting".to_string(),
+                            crate::settings_state::Verdict::Free => "free".to_string(),
+                            crate::settings_state::Verdict::Refused(e) => format!("refused({e})"),
+                        }
+                    ),
+                },
                 st.scroll,
                 l.max_scroll(),
                 visible(l.autostart.control),
@@ -1543,6 +1633,10 @@ pub fn describe() -> String {
                     Some(BackupPanel::Running(step)) => format!("running:{}:{}", step.counts(), step.doing()),
                     Some(BackupPanel::Done { title, .. }) => format!("done:{title}"),
                 },
+                d.shortcut.label(),
+                saved.shortcut.label(),
+                hotkey::current().label(),
+                hotkey::ok(),
             );
         }
         let s = &v.state;

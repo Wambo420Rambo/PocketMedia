@@ -108,12 +108,15 @@ fn primary(c: (u8, u8, u8)) -> Option<char> {
     }
 }
 
-/// The centre of the media area of a tile whose centre is `tile`: the thumbnail
-/// box sits 12 DIPs above the tile's centre (Layout::thumb).
+/// The centre of the media area of a tile whose centre is `tile`: the well's
+/// centre is above the tile's, by the difference between them (Layout::thumb).
 fn media_point(window: isize, tile: (i32, i32)) -> (i32, i32) {
+    use crate::ui::layout::{Layout, Rect};
     // SAFETY: GetDpiForWindow tolerates any HWND.
     let dpi = unsafe { GetDpiForWindow(hwnd(window)) }.max(96);
-    (tile.0, tile.1 - (12.2 * dpi as f32 / 96.0).round() as i32)
+    let probe = crate::ui::layout::Grid::new(Rect::new(0.0, 0.0, 500.0, 500.0)).tile(0, 0.0);
+    let up = probe.center().1 - Layout::thumb(probe).center().1;
+    (tile.0, tile.1 - (up * dpi as f32 / 96.0).round() as i32)
 }
 
 fn popup_media(t: &Session, i: usize) -> Option<(i32, i32)> {
@@ -176,8 +179,7 @@ pub(super) fn open_all_media(r: &mut Report, t: &Session) -> bool {
         return false;
     }
     t.click(r, El::Chip(0));
-    t.click(r, El::List);
-    t.click(r, El::Row(1));
+    t.click(r, El::Tab(1));
     t.park();
     t.describe().contains("list=All")
 }
