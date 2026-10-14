@@ -94,7 +94,8 @@ pub fn reset_library() -> Result<(), String> {
     for item in &mut lib.items {
         let bytes = seed_bytes(item, &seed_dir);
         item.size = bytes.len() as u64;
-        std::fs::write(crate::import::media_file(&p.media, &item.path), bytes).map_err(|e| e.to_string())?;
+        let file = crate::import::media_file(&p.media, &item.path).ok_or("a seed path is not plain")?;
+        std::fs::write(file, bytes).map_err(|e| e.to_string())?;
     }
     library::set(lib);
     library::persist()

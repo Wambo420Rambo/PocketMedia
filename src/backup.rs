@@ -250,7 +250,8 @@ fn walk(media: &Path, cancel: &AtomicBool) -> Result<Tree, Stop> {
     let mut stack = vec![String::new()];
     while let Some(rel) = stack.pop() {
         check(cancel)?;
-        let dir = if rel.is_empty() { media.to_path_buf() } else { media_file(media, &rel) };
+        let dir = if rel.is_empty() { Some(media.to_path_buf()) } else { media_file(media, &rel) };
+        let dir = dir.ok_or_else(|| Stop::Failed(format!("\"{rel}\" in the Media folder is not a plain folder name")))?;
         let unreadable = |e: io::Error| Stop::Failed(format!("{} could not be read: {e}", display_path(&dir)));
         let mut entries: Vec<fs::DirEntry> = fs::read_dir(&dir).map_err(unreadable)?.collect::<Result<_, _>>().map_err(unreadable)?;
         entries.sort_by_key(|e| e.file_name().to_string_lossy().to_lowercase());
@@ -353,7 +354,7 @@ fn copy_all(
     let mut seen = HashSet::new();
     for rel in FOLDERS.iter().map(|f| f.to_string()).chain(tree.dirs.iter().cloned()) {
         if seen.insert(rel.to_lowercase()) {
-            dirs.push(media_file(&media, &rel));
+            dirs.push(media_file(&media, &rel).ok_or_else(|| Stop::Failed(format!("\"{rel}\" is not a plain folder name")))?);
         }
     }
     dirs.push(data.clone());
@@ -378,8 +379,10 @@ fn copy_all(
         step.current = name;
         step.checking = false;
         progress(&step);
-        let src = media_file(&plan.media, rel);
-        let dst = media_file(&media, rel);
+        // Library paths were checked on load; a walked path is a plain name.
+        let (Some(src), Some(dst)) = (media_file(&plan.media, rel), media_file(&media, rel)) else {
+            return Err(Stop::Failed(format!("\"{rel}\" is not a plain path inside the Media folder")));
+        };
         let delay = TEST_DELAY_MS.load(Ordering::Relaxed);
         if delay > 0 {
             std::thread::sleep(Duration::from_millis(delay));
@@ -771,7 +774,7 @@ mod tests {
         let last = seen.last().unwrap();
         assert_eq!((last.done, last.total), (3, 3));
         for rel in ["Pictures/a.png", "GIFs/b.gif", "Videos/c.mp4"] {
-            assert_eq!(fs::read(media_file(&folder.join("Media"), rel)).unwrap(), fs::read(media_file(&plan.media, rel)).unwrap(), "{rel}");
+            assert_eq!(fs::read(media_file(&folder.join("Media"), rel).unwrap()).unwrap(), fs::read(media_file(&plan.media, rel).unwrap()).unwrap(), "{rel}");
         }
         let data = crate::store::check_text(&fs::read_to_string(folder.join("Data").join(FILE_NAME)).unwrap()).unwrap();
         assert_eq!(data.items.len(), 3);
@@ -842,7 +845,7 @@ mod tests {
         let root = temp("progress");
         let mut plan = library(&root);
         for it in &mut plan.data.items {
-            it.size = fs::metadata(media_file(&plan.media, &it.path)).unwrap().len();
+            it.size = fs::metadata(media_file(&plan.media, &it.path).unwrap()).unwrap().len();
         }
         let total: u64 = plan.data.items.iter().map(|i| i.size).sum();
         let (p, seen) = run_plan(&plan);
@@ -932,7 +935,7 @@ mod tests {
             ("Videos/clip.mov", vec![9u8; CHUNK + 1]),
         ];
         for (rel, bytes) in &extra {
-            let path = media_file(&plan.media, rel);
+            let path = media_file(&plan.media, rel).unwrap();
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(path, bytes).unwrap();
         }
@@ -945,7 +948,7 @@ mod tests {
         assert_eq!((d.items, d.others), (3, 4));
         let backup = d.folder.join("Media");
         for (rel, bytes) in &extra {
-            assert_eq!(&fs::read(media_file(&backup, rel)).unwrap(), bytes, "{rel}");
+            assert_eq!(&fs::read(media_file(&backup, rel).unwrap()).unwrap(), bytes, "{rel}");
         }
         assert!(backup.join("Pictures/empty folder").is_dir(), "empty folders come along");
         assert!(!backup.join("Pictures/.pocketmedia-7-1.partial").exists());

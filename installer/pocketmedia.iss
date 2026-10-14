@@ -9,8 +9,9 @@
 ; Decisions:
 ; - No elevation (PrivilegesRequired=lowest). PocketMedia writes its Media, Data and
 ;   Cache beside its exe, so it must live in a folder the user can write to anyway.
-;   Running Setup as the user also means Autostart and the profile can never land on
-;   another account (no "run as administrator with other credentials").
+; - Setup refuses to run as an account other than the one signed in at the screen
+;   ("Run as administrator" with an administrator's password would
+;   otherwise give that account the folder, the profile and Autostart).
 ; - The installer hands its choices to the app with the smallest possible step: on a
 ;   first install with no library yet, it writes Data\pocketmedia.json holding only
 ;   the chosen profile; Autostart is the HKCU Run value the app already treats as the
@@ -331,11 +332,84 @@ begin
   PathText := AddText(ChoicePage.Surface, WizardForm.DirEdit.Text, 0, Y + ScaleY(4), W - ScaleX(100));
 end;
 
+{ ---------- Setup: the right account ---------- }
+
+{ The account signed in at the screen (Win32_ComputerSystem.UserName, "DOMAIN\user"),
+  or '' when Windows does not say (for example over Remote Desktop). The test build
+  can pretend another account is signed in, to check the refusal. }
+function ScreenUser: String;
+var
+  Locator, Service, Systems, Item: Variant;
+  I: Integer;
+begin
+  Result := '';
+#ifdef TestBuild
+  Result := ExpandConstant('{param:TESTSCREENUSER|}');
+  if Result <> '' then
+    Exit;
+#endif
+  try
+    Locator := CreateOleObject('WbemScripting.SWbemLocator');
+    Service := Locator.ConnectServer('.', 'root\CIMV2');
+    Systems := Service.ExecQuery('SELECT UserName FROM Win32_ComputerSystem');
+    for I := 0 to Systems.Count - 1 do begin
+      Item := Systems.ItemIndex(I);
+      if not VarIsNull(Item.UserName) then
+        Result := Item.UserName;
+    end;
+  except
+    Log('Could not ask Windows who is signed in: ' + GetExceptionMessage);
+    Result := '';
+  end;
+end;
+
+{ The part after the backslash: "PC\Anna" -> "Anna". }
+function AccountName(const User: String): String;
+var
+  P: Integer;
+begin
+  Result := User;
+  P := Pos('\', Result);
+  while P > 0 do begin
+    Delete(Result, 1, P);
+    P := Pos('\', Result);
+  end;
+end;
+
+{ '' when Setup runs as the account at the screen (or Windows does not say who that
+  is); otherwise the message that refuses. }
+function WrongAccount: String;
+var
+  Screen: String;
+begin
+  Result := '';
+  Screen := ScreenUser;
+  if Screen = '' then begin
+    Log('Windows did not say who is signed in at the screen; the account was not compared.');
+    Exit;
+  end;
+  if CompareText(AccountName(Screen), GetUserNameString) = 0 then
+    Log('Setup runs as ' + GetUserNameString + ', the account signed in at the screen (' + Screen + ').')
+  else
+    Result := 'Setup is running as ' + GetUserNameString + ', but ' + AccountName(Screen) + ' is signed in. ' +
+      'PocketMedia installs for one account, and its media, settings and Autostart belong to that account.' + #13#10#13#10 +
+      'Start Setup again as ' + AccountName(Screen) + ', without "Run as administrator". It needs no administrator rights.';
+end;
+
 { ---------- Setup: event functions ---------- }
 
 function InitializeSetup: Boolean;
+var
+  Problem: String;
 begin
   Result := True;
+  Problem := WrongAccount;
+  if Problem <> '' then begin
+    Log('Refused: ' + Problem);
+    SuppressibleMsgBox(Problem, mbError, MB_OK, IDOK);
+    Result := False;
+    Exit;
+  end;
   PrevDir := '';
   if RegQueryStringValue(HKEY_CURRENT_USER, UninstallKey, 'Inno Setup: App Path', PrevDir) then
     PrevDir := RemoveBackslashUnlessRoot(PrevDir);
@@ -433,7 +507,8 @@ end;
 
 { Only for a folder Setup made itself: drop the permissions inherited from the
   drive (on C:\ these let every signed-in user change files, including
-  pocketmedia.exe) and give this user Modify, other users read-only access. }
+  pocketmedia.exe) and give this user Modify. Other users get no access at all:
+  the media is personal. SYSTEM and Administrators keep full control. }
 procedure LimitFolderAccess(const App: String);
 var
   Code: Integer;
@@ -446,11 +521,11 @@ begin
   Code := -1;
   { First grant, and only when that worked drop the inherited entries, so a
     failure never leaves the folder without access for this user. }
-  if Exec(Icacls, '"' + App + '" /grant "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-32-545:(OI)(CI)RX" "' +
+  if Exec(Icacls, '"' + App + '" /grant "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "' +
           User + ':(OI)(CI)M"', '', SW_HIDE, ewWaitUntilTerminated, Code) and (Code = 0) then begin
     Code := -1;
     if Exec(Icacls, '"' + App + '" /inheritance:r', '', SW_HIDE, ewWaitUntilTerminated, Code) and (Code = 0) then begin
-      Log('Folder access limited to ' + User + ' (modify) and other users (read).');
+      Log('Folder access limited to ' + User + ' (modify); other users have none.');
       Exit;
     end;
   end;

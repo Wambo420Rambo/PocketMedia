@@ -118,14 +118,31 @@ fn watch_tests(r: &mut Report, t: &Session) -> bool {
     let w = watch(t);
     r.check("the Media folders are watched", w.contains("running=true"), &w);
 
-    // Idle means idle: the watcher sleeps until Windows reports a change.
-    let (wakes, rescans) = (number(&w, "wakes"), number(&w, "rescans"));
+    // Idle means idle: the watcher sleeps until Windows reports a change. Let the
+    // notifications from the test's own library reset arrive first (Windows may
+    // deliver them late), then watch for 2.5 s. Every wake must have a cause:
+    // either Windows reported a change, or a batch's quiet time was over. A wake
+    // without one would be polling; a comparison of the folders would be a scan.
+    let mut w = watch(t);
+    for _ in 0..10 {
+        std::thread::sleep(Duration::from_millis(500));
+        let now = watch(t);
+        let settled = number(&now, "wakes") == number(&w, "wakes");
+        w = now;
+        if settled {
+            break;
+        }
+    }
+    let keys = ["wakes", "notices", "due", "events", "rescans"];
+    let before: Vec<i64> = keys.iter().map(|k| number(&w, k)).collect();
     std::thread::sleep(Duration::from_millis(2500));
     let w = watch(t);
+    let delta: Vec<i64> = keys.iter().zip(&before).map(|(k, b)| number(&w, k) - b).collect();
+    let (wakes, notices, due, events, rescans) = (delta[0], delta[1], delta[2], delta[3], delta[4]);
     r.check(
         "while nothing changes, watching does no work (no polling, no scans)",
-        number(&w, "wakes") == wakes && number(&w, "rescans") == rescans,
-        &format!("wakes {wakes} -> {}, rescans {rescans} -> {}", number(&w, "wakes"), number(&w, "rescans")),
+        before.iter().all(|v| *v >= 0) && wakes == notices + due && rescans == 0,
+        &format!("in 2.5 s: {wakes} wakes ({notices} from changes Windows reported, {due} batch ends, {events} file events), {rescans} folder comparisons"),
     );
 
     // 1. A file copied in from outside joins the library, and the popup shows it.
@@ -500,8 +517,8 @@ fn backup_contents(r: &mut Report, t: &Session, dest: &Path, finished_line: &str
         .items
         .iter()
         .filter(|i| {
-            let a = std::fs::read(crate::import::media_file(&app_media, &i.path)).ok();
-            let b = std::fs::read(crate::import::media_file(&folder.join("Media"), &i.path)).ok();
+            let a = read_in(&app_media, &i.path);
+            let b = read_in(&folder.join("Media"), &i.path);
             a.is_none() || a != b
         })
         .map(|i| i.name.as_str())
@@ -516,8 +533,8 @@ fn backup_contents(r: &mut Report, t: &Session, dest: &Path, finished_line: &str
     let missing: Vec<&&String> = wanted
         .iter()
         .filter(|f| {
-            let a = std::fs::read(crate::import::media_file(&app_media, f)).ok();
-            a.is_none() || a != std::fs::read(crate::import::media_file(&folder.join("Media"), f)).ok()
+            let a = read_in(&app_media, f);
+            a.is_none() || a != read_in(&folder.join("Media"), f)
         })
         .collect();
     r.check(
@@ -648,4 +665,9 @@ fn autostart_tests(r: &mut Report, t: &Session) -> bool {
     send(t.main, CMD_SETTINGS_SCROLL, 0);
     close_windows(r, t);
     true
+}
+
+/// The bytes of `rel` in a Media folder, or None (also for a path that is not plain).
+fn read_in(media: &std::path::Path, rel: &str) -> Option<Vec<u8>> {
+    std::fs::read(crate::import::media_file(media, rel)?).ok()
 }

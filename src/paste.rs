@@ -44,7 +44,7 @@ pub const COPIED_IN_MANAGER: &str = "Copied to clipboard. Paste it with Ctrl+V."
 /// Item `id`'s file in the Media folder.
 fn media_file(id: u32) -> Option<PathBuf> {
     library::with(|lib| lib.get(id).map(|i| i.path.clone()))
-        .and_then(|rel| crate::paths::get().map(|p| crate::import::media_file(&p.media, &rel)))
+        .and_then(|rel| crate::paths::get().and_then(|p| crate::import::media_file(&p.media, &rel)))
 }
 
 /// Ctrl+C in the Manager: puts item `id` on the clipboard with the same formats

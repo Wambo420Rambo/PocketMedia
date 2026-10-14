@@ -469,7 +469,8 @@ impl View {
             let key = crate::ui::widgets::thumb_key(item.id, crate::ui::layout::Layout::thumb(tile), dpi);
             Some((key, item.path.clone()))
         })?;
-        (!thumbs::is_no_preview(&key)).then(|| (key, crate::import::media_file(&media, &rel)))
+        let path = crate::import::media_file(&media, &rel)?;
+        (!thumbs::is_no_preview(&key)).then_some((key, path))
     }
 
     fn clamp_scroll(&mut self, show_selection: bool) {
@@ -1236,7 +1237,7 @@ pub fn on_job(ev: &crate::jobs::Event) -> bool {
 }
 
 fn media_path(rel: &str) -> Option<std::path::PathBuf> {
-    crate::paths::get().map(|p| crate::import::media_file(&p.media, rel))
+    crate::paths::get().and_then(|p| crate::import::media_file(&p.media, rel))
 }
 
 /// Rename: the file first, then the record. A failure changes nothing.

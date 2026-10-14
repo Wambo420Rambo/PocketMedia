@@ -390,15 +390,19 @@ pub fn end_frame(win: Win) {
         let (ram, none) = (&u.ram, &u.none);
         let mut wanted: Vec<Req> = Vec::new();
         for s in seen {
-            if !ram.contains(&s.key) && !none.contains(&s.key) && !wanted.iter().any(|r| r.key == s.key) {
-                wanted.push(Req { key: s.key, path: crate::import::media_file(&media, &s.rel), kind: s.kind });
+            if !ram.contains(&s.key)
+                && !none.contains(&s.key)
+                && !wanted.iter().any(|r| r.key == s.key)
+                && let Some(path) = crate::import::media_file(&media, &s.rel)
+            {
+                wanted.push(Req { key: s.key, path, kind: s.kind });
             }
         }
         let gifs = f
             .seen
             .iter()
             .filter(|s| s.kind == MediaKind::Gif && s.rect.is_some() && ram.contains(&s.key))
-            .map(|s| (s.key, crate::import::media_file(&media, &s.rel)))
+            .filter_map(|s| Some((s.key, crate::import::media_file(&media, &s.rel)?)))
             .collect();
         (Some(wanted), gifs)
     });

@@ -177,6 +177,10 @@ fn due(first: Instant, last: Instant) -> Instant {
 
 static EVENTS: AtomicU64 = AtomicU64::new(0);
 static WAKES: AtomicU64 = AtomicU64::new(0);
+/// Wakes because Windows reported a change (the read completed).
+static NOTICES: AtomicU64 = AtomicU64::new(0);
+/// Wakes because a waiting batch's quiet time was over.
+static DUE: AtomicU64 = AtomicU64::new(0);
 static BATCHES: AtomicU64 = AtomicU64::new(0);
 static OVERFLOWS: AtomicU64 = AtomicU64::new(0);
 static RESCANS: AtomicU64 = AtomicU64::new(0);
@@ -234,7 +238,7 @@ fn flush(media: &Path, pending: &mut Pending) {
         }
     }
     let files = p.touched.into_iter().map(|rel| {
-        let info = file_info(&crate::import::media_file(media, &rel));
+        let info = crate::import::media_file(media, &rel).and_then(|f| file_info(&f));
         (rel, info)
     });
     let batch = Batch { renames: p.renames, files: files.collect(), written: p.written, rescan: p.rescan };
@@ -339,6 +343,7 @@ mod win {
                 break;
             }
             if woke.0 == WAIT_OBJECT_0.0 + 1 {
+                NOTICES.fetch_add(1, Ordering::Relaxed);
                 reading = false;
                 let mut n = 0u32;
                 // SAFETY: the read on `ov` has completed: its event is signalled.
@@ -371,6 +376,7 @@ mod win {
             }
             // The quiet time is over.
             if times.take().is_some() {
+                DUE.fetch_add(1, Ordering::Relaxed);
                 flush(media, &mut pending);
             }
         }
@@ -462,10 +468,12 @@ fn after(applied: crate::library::Applied) {
 pub fn describe() -> String {
     let a = APPLIED.with(|a| a.borrow().clone());
     format!(
-        "watch running={} events={} wakes={} batches={} overflows={} rescans={} added={} renamed={} replaced={} removed={}",
+        "watch running={} events={} wakes={} notices={} due={} batches={} overflows={} rescans={} added={} renamed={} replaced={} removed={}",
         RUNNING.load(Ordering::SeqCst),
         EVENTS.load(Ordering::Relaxed),
         WAKES.load(Ordering::Relaxed),
+        NOTICES.load(Ordering::Relaxed),
+        DUE.load(Ordering::Relaxed),
         BATCHES.load(Ordering::Relaxed),
         OVERFLOWS.load(Ordering::Relaxed),
         RESCANS.load(Ordering::Relaxed),

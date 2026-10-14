@@ -193,6 +193,22 @@ fn migrate(value: serde_json::Value, _from: u32) -> Result<StoreData, ParseError
 /// Fixes what can be fixed without losing anything, and lists each fix.
 fn validate(mut data: StoreData) -> (StoreData, Vec<String>) {
     let mut fixes = Vec::new();
+    // A record whose path could lead outside the Media folders is
+    // left out (the file on disk is not touched; the loaded file is kept as the
+    // backup at the next save). A real file in Media is found again at startup.
+    data.items.retain(|item| match crate::import::item_path_problem(&item.path) {
+        None => true,
+        Some(why) => {
+            fixes.push(format!("{} was left out of the library: its path \"{}\" is not allowed ({why}). No file was changed", item.name, item.path));
+            false
+        }
+    });
+    // Ids stay far below u32::MAX, so handing out new ones can never wrap around.
+    let max_id = data.items.iter().map(|i| i.id).max().unwrap_or(0);
+    if max_id >= ID_LIMIT || data.next_id >= ID_LIMIT {
+        renumber(&mut data);
+        fixes.push(format!("the item ids were too large and were numbered again from 1 (next id {})", data.next_id));
+    }
     let max_id = data.items.iter().map(|i| i.id).max().unwrap_or(0);
     if data.next_id <= max_id {
         fixes.push(format!("the next id was {} but id {max_id} is in use; it is now {}", data.next_id, max_id + 1));
@@ -202,7 +218,7 @@ fn validate(mut data: StoreData) -> (StoreData, Vec<String>) {
     for item in &mut data.items {
         if !seen.insert(item.id) {
             let new_id = data.next_id;
-            data.next_id += 1;
+            data.next_id += 1; // below ID_LIMIT + number of items: no overflow
             fixes.push(format!("{} shared id {} with another item; it now has id {new_id}", item.name, item.id));
             item.id = new_id;
             seen.insert(new_id);
@@ -216,6 +232,22 @@ fn validate(mut data: StoreData) -> (StoreData, Vec<String>) {
         fixes.push(format!("{} recent-history entries pointed to missing or repeated items and were dropped", before - data.history.len()));
     }
     (data, fixes)
+}
+
+/// Ids at or above this are renumbered on load (`next_id` must never wrap).
+const ID_LIMIT: u32 = u32::MAX / 2;
+
+/// Gives the items ids 1, 2, 3… in their current order. History follows the
+/// first item that had each old id.
+fn renumber(data: &mut StoreData) {
+    let mut map = std::collections::HashMap::new();
+    for (n, item) in data.items.iter_mut().enumerate() {
+        let new_id = n as u32 + 1; // fewer than ID_LIMIT items
+        map.entry(item.id).or_insert(new_id);
+        item.id = new_id;
+    }
+    data.history = data.history.iter().filter_map(|id| map.get(id).copied()).collect();
+    data.next_id = data.items.len() as u32 + 1;
 }
 
 impl Store {
@@ -556,6 +588,53 @@ mod tests {
         assert!(s.data.next_id > s.data.items.iter().map(|i| i.id).max().unwrap());
         assert_eq!(s.data.history, vec![1]);
         assert_eq!(fixes.len(), 3, "{fixes:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A record whose path could lead outside the Media folders never
+    /// gets into the library; each one is reported, and the file as it was becomes
+    /// the backup at the next save.
+    #[test]
+    fn paths_outside_the_media_folders_are_left_out_and_reported() {
+        let dir = temp("paths");
+        let text = r#"{"version":1,"next_id":9,"items":[
+            {"id":1,"name":"ok.png","kind":"picture","path":"Pictures/ok.png"},
+            {"id":2,"name":"x.png","kind":"picture","path":"../x.png"},
+            {"id":3,"name":"x.png","kind":"picture","path":"C:/x.png"},
+            {"id":4,"name":"x.png","kind":"picture","path":"Pictures\\..\\..\\x.png"},
+            {"id":5,"name":"b.png","kind":"picture","path":"Pictures/a/b.png"},
+            {"id":6,"name":"x.png","kind":"picture","path":"/x.png"},
+            {"id":7,"name":"x.png","kind":"picture","path":"Pictures/.."},
+            {"id":8,"name":"x.png","kind":"picture","path":"Pictures/C:x.png"}],
+            "history":[2,1,5]}"#;
+        fs::write(dir.join(FILE_NAME), text).unwrap();
+        let (mut s, outcome) = Store::open(&dir);
+        let LoadOutcome::Repaired(fixes) = &outcome else { panic!("{outcome:?}") };
+        assert_eq!(s.data.items.iter().map(|i| i.id).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(s.data.history, vec![1]);
+        assert_eq!(fixes.iter().filter(|f| f.contains("was left out of the library")).count(), 7, "{fixes:?}");
+        // The next save keeps the file as it was as the backup: nothing is lost for good.
+        s.data.settings.close_after_insert = !s.data.settings.close_after_insert;
+        assert!(s.save().unwrap());
+        assert_eq!(fs::read_to_string(dir.join("pocketmedia.json.bak")).unwrap(), text);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Ids near u32::MAX are numbered again, so a new id can never wrap
+    /// around to one already in use.
+    #[test]
+    fn huge_ids_are_numbered_again_and_never_wrap() {
+        let dir = temp("ids");
+        let text = r#"{"version":1,"next_id":4294967295,"items":[
+            {"id":4294967295,"name":"A.png","kind":"picture","path":"Pictures/A.png"},
+            {"id":7,"name":"B.png","kind":"picture","path":"Pictures/B.png"}],
+            "history":[4294967295]}"#;
+        fs::write(dir.join(FILE_NAME), text).unwrap();
+        let (s, outcome) = Store::open(&dir);
+        assert!(matches!(outcome, LoadOutcome::Repaired(_)), "{outcome:?}");
+        assert_eq!(s.data.items.iter().map(|i| i.id).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(s.data.history, vec![1], "history follows its item");
+        assert_eq!(s.data.next_id, 3);
         let _ = fs::remove_dir_all(&dir);
     }
 

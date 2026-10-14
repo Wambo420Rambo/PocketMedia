@@ -405,7 +405,8 @@ impl View {
             (item.kind == crate::sample::MediaKind::Video).then(|| (item.id, item.path.clone()))
         })?;
         let key = crate::ui::widgets::thumb_key(id, Layout::thumb(tile), dpi);
-        (!thumbs::is_no_preview(&key)).then(|| (key, crate::import::media_file(&media, &rel)))
+        let path = crate::import::media_file(&media, &rel)?;
+        (!thumbs::is_no_preview(&key)).then_some((key, path))
     }
 
     /// Click or Enter/Space on a control.

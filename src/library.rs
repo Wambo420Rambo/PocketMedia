@@ -133,7 +133,10 @@ impl Library {
     pub fn known_files(&self, media: &std::path::Path) -> Vec<KnownFile> {
         self.items
             .iter()
-            .map(|i| KnownFile { id: i.id, name: i.name.clone(), size: i.size, hash: i.hash.clone(), abs: crate::import::media_file(media, &i.path) })
+            .filter_map(|i| {
+                let abs = crate::import::media_file(media, &i.path)?;
+                Some(KnownFile { id: i.id, name: i.name.clone(), size: i.size, hash: i.hash.clone(), abs })
+            })
             .collect()
     }
 
@@ -160,7 +163,7 @@ impl Library {
             return id;
         }
         let id = self.next_id.max(1);
-        self.next_id = id + 1;
+        self.next_id = id.saturating_add(1);
         self.items.insert(
             0,
             Item {
@@ -186,7 +189,7 @@ impl Library {
             return self.items[i].id;
         }
         let id = self.next_id.max(1);
-        self.next_id = id + 1;
+        self.next_id = id.saturating_add(1);
         let mut item = Item::new(id, &o.name, o.kind, o.width, o.height);
         item.path = o.rel_path.clone();
         item.size = o.size;

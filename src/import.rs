@@ -336,9 +336,41 @@ pub fn copy_one(req: &CopyRequest, media: &Path, digest: NewDigest, publish: Pub
     result
 }
 
-/// The full path of a library file from its `/`-separated relative path.
-pub fn media_file(media: &Path, rel: &str) -> PathBuf {
-    rel.split('/').fold(media.to_path_buf(), |p, part| p.join(part))
+/// The full path of a file in the Media folder from its `/`-separated relative
+/// path, or None when the path could lead outside Media: an empty
+/// part, `.` or `..`, a `\`, a drive (`C:`) or a control character.
+pub fn media_file(media: &Path, rel: &str) -> Option<PathBuf> {
+    let mut path = media.to_path_buf();
+    for part in rel.split('/') {
+        if !safe_part(part) {
+            return None;
+        }
+        path.push(part);
+    }
+    Some(path)
+}
+
+/// One plain file or folder name: nothing that `Path::push` could turn into a
+/// parent, a root, a drive or another separator.
+fn safe_part(part: &str) -> bool {
+    !part.is_empty() && part != "." && part != ".." && !part.chars().any(|c| matches!(c, '\\' | '/' | ':') || c.is_control())
+}
+
+/// Why a library record's path is not `<Pictures|GIFs|Videos>/<file name>`, or
+/// None when it is. Checked when the library file is loaded, so a
+/// damaged or foreign file can never point Rename, the Recycle Bin, paste or a
+/// backup at a file outside the Media folders.
+pub fn item_path_problem(rel: &str) -> Option<&'static str> {
+    let Some((folder, file)) = rel.split_once('/') else {
+        return Some("it is not in the Pictures, GIFs or Videos folder");
+    };
+    if !["Pictures", "GIFs", "Videos"].iter().any(|f| f.eq_ignore_ascii_case(folder)) {
+        return Some("it is not in the Pictures, GIFs or Videos folder");
+    }
+    if !safe_part(file) {
+        return Some("it points outside PocketMedia's Media folder");
+    }
+    None
 }
 
 /// A path for people: without the `\\?\` prefix that canonical Windows paths carry.
@@ -425,7 +457,7 @@ pub fn reconcile(media: &Path, records: &[(u32, String)]) -> (Vec<Orphan>, Vec<u
             }
         }
     }
-    let missing = records.iter().filter(|(_, p)| !media_file(media, p).is_file()).map(|(id, _)| *id).collect();
+    let missing = records.iter().filter(|(_, p)| !media_file(media, p).is_some_and(|f| f.is_file())).map(|(id, _)| *id).collect();
     (orphans, missing)
 }
 
@@ -466,6 +498,22 @@ pub mod tests {
 
     fn no_cancel() -> AtomicBool {
         AtomicBool::new(false)
+    }
+
+    /// Only plain names inside Media make a path.
+    #[test]
+    fn media_paths_never_leave_the_media_folder() {
+        let media = Path::new("/pm/Media");
+        assert_eq!(media_file(media, "Pictures/Cat.png"), Some(media.join("Pictures").join("Cat.png")));
+        assert_eq!(media_file(media, "Pictures/Trip/day 1/a.png"), Some(media.join("Pictures").join("Trip").join("day 1").join("a.png")));
+        for bad in ["../x.png", "Pictures/../../x.png", "/x.png", "C:/x.png", "Pictures\\..\\x.png", "Pictures//x.png", "", "Pictures/.", "Pictures/a\u{0}b"] {
+            assert_eq!(media_file(media, bad), None, "{bad:?}");
+        }
+        assert_eq!(item_path_problem("GIFs/Hello.gif"), None);
+        assert_eq!(item_path_problem("pictures/Cat.png"), None, "letter case as Windows ignores it");
+        for bad in ["Cat.png", "Other/Cat.png", "Pictures/a/b.png", "Pictures/..", "../Pictures/x.png", "Videos/C:x.mp4"] {
+            assert!(item_path_problem(bad).is_some(), "{bad:?}");
+        }
     }
 
     #[test]
