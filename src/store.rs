@@ -384,6 +384,10 @@ pub fn init(dir: &Path) -> LoadOutcome {
 }
 
 /// Runs `f` with the store, if it is open.
+/// Saving when the store is not open (or is in use) is a failure, never a
+/// silent success.
+pub const NOT_OPEN: &str = "the library file is not open";
+
 pub fn with<R>(f: impl FnOnce(&mut Store) -> R) -> Option<R> {
     STORE.with(|s| s.try_borrow_mut().ok().and_then(|mut s| s.as_mut().map(f)))
 }
@@ -402,7 +406,7 @@ pub fn save_settings(settings: Settings) -> Result<(), String> {
         }
         s.save().map(|_| ()).map_err(|e| e.to_string())
     })
-    .unwrap_or(Ok(()))
+    .unwrap_or_else(|| Err(NOT_OPEN.into()))
 }
 
 /// For the self-test: "outcome=… version=… items=… path=…".
@@ -460,6 +464,14 @@ mod tests {
             added: 1,
             source: None,
         }
+    }
+
+    /// With no library file open, saving reports a failure.
+    /// (Each test runs on its own thread, so the store is not open here.)
+    #[test]
+    fn saving_without_an_open_store_is_an_error() {
+        assert_eq!(save_settings(Settings::default()), Err(NOT_OPEN.to_string()));
+        assert_eq!(crate::library::persist(), Err(NOT_OPEN.to_string()));
     }
 
     #[test]

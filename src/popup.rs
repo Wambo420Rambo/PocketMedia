@@ -45,6 +45,10 @@ struct View {
     scroll_drag: Option<(f32, f32)>,
     high_surrogate: Option<u16>,
     tracking_leave: bool,
+    /// The tile whose full name shows as a tooltip (the pointer rested on it).
+    tip: Option<usize>,
+    /// Files and folders dropped here start an import (revoked when dropped).
+    _drop: Option<crate::drop_target::Registration>,
 }
 
 /// Work to do after the view borrow is released (these can re-enter the window procedure).
@@ -72,6 +76,8 @@ thread_local! {
     /// the popup stays on screen.
     static KEEP_OPEN: Cell<bool> = const { Cell::new(false) };
     static POSITIONING: Cell<bool> = const { Cell::new(false) };
+    /// Where the popup last opened: at the target's text caret (true) or at the pointer.
+    static PLACED: Cell<Option<(bool, POINT)>> = const { Cell::new(None) };
 }
 
 /// Runs `f` with the view. Returns None if the view is missing or already in use
@@ -119,6 +125,13 @@ pub fn create(instance: HINSTANCE) -> Result<(), String> {
     };
     POPUP.with(|c| c.set(hwnd));
     winutil::style_frame(hwnd);
+    let drop = match crate::drop_target::Registration::new(hwnd, accepts_drop) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            crate::selftest::note(&format!("popup: {e}"));
+            None
+        }
+    };
     VIEW.with(|v| {
         *v.borrow_mut() = Some(View {
             state: PopupState::new(),
@@ -131,9 +144,37 @@ pub fn create(instance: HINSTANCE) -> Result<(), String> {
             scroll_drag: None,
             high_surrogate: None,
             tracking_leave: false,
+            tip: None,
+            _drop: drop,
         })
     });
     Ok(())
+}
+
+/// A drag of files may drop here unless an import is already running.
+fn accepts_drop() -> bool {
+    with_view(|v| !v.add.as_ref().is_some_and(AddPanel::busy)).unwrap_or(false)
+}
+
+/// Files or a folder were dropped on the popup: Add media checks them, as if they
+/// had been chosen in its picker.
+fn on_drop(hwnd: HWND) -> Effect {
+    let Some(paths) = crate::drop_target::take(hwnd) else { return Effect::None };
+    let source = crate::drop_target::source_for(paths);
+    let effect = with_view(|v| {
+        v.tip = None;
+        let outcome = v.add.get_or_insert_with(AddPanel::new).dropped(source);
+        v.add_outcome(outcome)
+    })
+    .unwrap_or(Effect::None);
+    // SAFETY: our own window: back in front so the review can be used with the keyboard.
+    let _ = unsafe { SetForegroundWindow(hwnd) };
+    effect
+}
+
+/// Self-test only: whether the popup last opened at a text caret, and the point.
+pub fn placed() -> Option<(bool, POINT)> {
+    PLACED.with(|p| p.get())
 }
 
 pub fn destroy() {
@@ -167,8 +208,10 @@ pub fn toggle_from_hotkey() {
 
 pub fn open(captured: Result<Target, NoTarget>) {
     paste::cancel();
+    let caret = captured.as_ref().ok().and_then(|t| t.caret);
     app(|a| *a.target.borrow_mut() = captured);
     with_view(|v| {
+        v.tip = None;
         v.state.reset_for_open();
         // The shortcut always opens the quick picker, never a half-finished
         // review; an import that is still copying stays on screen.
@@ -176,7 +219,7 @@ pub fn open(captured: Result<Target, NoTarget>) {
             v.add = None;
         }
     });
-    position_near_cursor();
+    position_near(caret);
     let h = hwnd();
     // SAFETY: our own window.
     unsafe {
@@ -292,8 +335,11 @@ pub fn reset() {
     });
 }
 
-fn position_near_cursor() {
-    let at = winutil::monitor_at_cursor();
+/// Near the target's text caret when it shows one, otherwise near
+/// the pointer; always fully inside that monitor's work area.
+fn position_near(caret: Option<POINT>) {
+    let at = caret.map_or_else(winutil::monitor_at_cursor, winutil::monitor_at);
+    PLACED.with(|p| p.set(Some((caret.is_some(), at.cursor))));
     POSITIONING.with(|p| p.set(true));
     place(at.cursor, at.work, at.dpi);
     // SAFETY: our own window.
@@ -376,6 +422,7 @@ impl View {
             return;
         }
         let ui = Ui {
+            tip: self.tip,
             hover: self.hover,
             dpi: self.dpi as f32,
             shortcut_ok: crate::hotkey::ok(),
@@ -482,6 +529,7 @@ impl View {
     }
 
     fn mouse_down(&mut self, x: f32, y: f32, screen: POINT) -> Effect {
+        self.tip = None;
         let area = self.area();
         if let Some(add) = self.add.as_mut() {
             let outcome = add.mouse_down(&self.gfx, area, x, y);
@@ -546,7 +594,15 @@ impl View {
             self.state.scroll = start_scroll + (y - start_y) * ratio;
             self.clamp_scroll();
         }
-        self.hover = self.hit(x, y);
+        let hover = self.hit(x, y);
+        if hover != self.hover {
+            // A new tile: its name shows once the pointer rests (Windows times it).
+            self.tip = None;
+            if matches!(hover, Hit::Tile(_)) {
+                self.tracking_leave = winutil::track_mouse_hover(hwnd());
+            }
+        }
+        self.hover = hover;
         let video = self.hover_video();
         crate::preview::hover(Win::Popup, video);
     }
@@ -774,6 +830,10 @@ extern "system" fn popup_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
             });
             // SAFETY: our own window; marks it painted.
             let _ = unsafe { ValidateRect(Some(hwnd), None) };
+            // A frame that lost its drawing target was not shown: draw again.
+            if with_view(|v| v.gfx.take_lost()) == Some(true) {
+                winutil::invalidate(hwnd);
+            }
             return LRESULT(0);
         }
         WM_SIZE => {
@@ -811,6 +871,7 @@ extern "system" fn popup_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
             with_view(|v| {
                 v.tracking_leave = false;
                 v.hover = Hit::None;
+                v.tip = None;
                 if let Some(add) = v.add.as_mut() {
                     add.hover = AddHit::None;
                 }
@@ -832,8 +893,19 @@ extern "system" fn popup_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
             v.mouse_up(x, y)
         })
         .unwrap_or(Effect::None),
+        winutil::WM_MOUSEHOVER => {
+            with_view(|v| {
+                v.tracking_leave = false;
+                if let (Hit::Tile(i), None) = (v.hover, v.add.as_ref()) {
+                    v.tip = Some(i);
+                }
+            });
+            Effect::None
+        }
+        crate::drop_target::WM_DROPPED => on_drop(hwnd),
         WM_MOUSEWHEEL => {
             with_view(|v| {
+                v.tip = None;
                 v.wheel(((wparam.0 >> 16) & 0xFFFF) as i16);
                 if let Some((x, y)) = winutil::cursor_dip(hwnd, v.dpi) {
                     v.mouse_move(x, y);
@@ -864,9 +936,12 @@ extern "system" fn popup_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
             return LRESULT(1);
         }
         WM_ACTIVATE => {
-            // Clicking outside closes the popup, except while dragging out of it.
+            // Clicking outside closes the popup, except while dragging out of it,
+            // and while Add media is open: then files can be dragged in from File
+            // Explorer (Escape or × close it).
             let inactive = (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE;
-            let held = DRAGGING.with(|d| d.get()) || MODAL.with(|m| m.get()) || KEEP_OPEN.with(|k| k.get());
+            let adding = with_view(|v| v.add.is_some()).unwrap_or(false);
+            let held = DRAGGING.with(|d| d.get()) || MODAL.with(|m| m.get()) || KEEP_OPEN.with(|k| k.get()) || adding;
             if inactive && is_visible() && !held {
                 Effect::Close(false)
             } else {
@@ -961,12 +1036,13 @@ pub fn describe_state() -> String {
         library::with(|lib| {
             let names: Vec<&str> = s.visible(lib).iter().map(|i| i.name.as_str()).collect();
             format!(
-                "screen=gallery status={:?} list={:?} filter={:?} query={:?} focus={:?} count={} names={}",
+                "screen=gallery status={:?} list={:?} filter={:?} query={:?} focus={:?} tip={:?} count={} names={}",
                 s.status.as_deref().unwrap_or(""),
                 s.list,
                 s.filter,
                 s.search.text(),
                 s.focus,
+                v.tip.and_then(|i| names.get(i).copied()).unwrap_or(""),
                 names.len(),
                 names.join("|")
             )

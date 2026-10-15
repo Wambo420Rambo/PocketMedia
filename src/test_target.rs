@@ -24,6 +24,9 @@ use windows::core::w;
 
 pub const CLASS: &str = "PocketMediaTestTarget";
 
+/// Where the test target's text caret sits (client pixels), for the self-test.
+pub const CARET: (i32, i32) = (40, 60);
+
 static OUT: OnceLock<PathBuf> = OnceLock::new();
 thread_local! {
     static LAST: std::cell::RefCell<String> = std::cell::RefCell::new("Waiting for a paste or a drop.".into());
@@ -35,6 +38,11 @@ pub fn run(out: &Path) -> i32 {
         return 2;
     }
     let _ = OUT.set(out.to_path_buf());
+    // SAFETY: once, on this thread, before any window: dragging files out of the
+    // target (into PocketMedia) needs OLE.
+    if unsafe { windows::Win32::System::Ole::OleInitialize(None) }.is_err() {
+        return 4;
+    }
     match create_window() {
         Ok(()) => {
             pump();
@@ -255,6 +263,37 @@ extern "system" fn proc_(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
         }
         WM_DROPFILES => {
             on_drop(hwnd, HDROP(wparam.0 as *mut _));
+            LRESULT(0)
+        }
+        // A text caret, as an editor shows one, so the self-test can check that
+        // the quick popup opens next to it.
+        WM_SETFOCUS if OUT.get().is_some_and(|o| o.join("caret.txt").exists()) => {
+            // SAFETY: our own window, which now has the keyboard focus.
+            unsafe {
+                let _ = CreateCaret(hwnd, None, 2, 18 * GetDpiForSystem() as i32 / 96);
+                let _ = SetCaretPos(CARET.0, CARET.1);
+                let _ = ShowCaret(Some(hwnd));
+            }
+            LRESULT(0)
+        }
+        WM_KILLFOCUS => {
+            // SAFETY: the caret this window made when it got the focus.
+            let _ = unsafe { DestroyCaret() };
+            LRESULT(0)
+        }
+        // The self-test drags a file from here into PocketMedia: it names the file in
+        // `drag-from.txt`, then presses the mouse button here. Copy only.
+        WM_LBUTTONDOWN => {
+            let Some(out) = OUT.get() else { return LRESULT(0) };
+            let order = out.join("drag-from.txt");
+            if let Ok(path) = std::fs::read_to_string(&order) {
+                let _ = std::fs::remove_file(&order);
+                let result = match crate::transfer::drag_file_out(hwnd, std::path::Path::new(path.trim())) {
+                    Ok(effect) => format!("effect {}", effect.0),
+                    Err(e) => format!("failed: {e}"),
+                };
+                write_result("drag-from-result.txt", result.as_bytes());
+            }
             LRESULT(0)
         }
         WM_PAINT => {

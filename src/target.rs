@@ -1,16 +1,19 @@
 //! The app that was focused before the popup opened ("the target").
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, POINT};
+use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
 use windows::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentProcessId, OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32,
     PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GA_ROOTOWNER, GetAncestor, GetClassNameW, GetForegroundWindow, GetWindowTextW,
+    GA_ROOTOWNER, GUITHREADINFO, GetAncestor, GetClassNameW, GetForegroundWindow, GetGUIThreadInfo, GetWindowTextW,
     GetWindowThreadProcessId, IsWindow,
 };
 use windows::core::PWSTR;
+
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
 pub struct Target {
@@ -18,6 +21,25 @@ pub struct Target {
     pub pid: u32,
     pub title: String,
     pub exe: String,
+    /// Where the app's text caret was (screen pixels, its bottom-left corner),
+    /// when the app shows a standard caret (the popup opens near it).
+    pub caret: Option<POINT>,
+    /// When it was captured.
+    pub captured: Instant,
+}
+
+/// How long the Manager's Quick popup still pastes into the app remembered from
+/// the last time the popup opened. After that it only copies: the
+/// user may have moved on to another chat, and input must not land where they
+/// no longer expect it.
+pub const FRESH_FOR: Duration = Duration::from_secs(120);
+
+/// The remembered target, if it was captured less than `FRESH_FOR` before `now`.
+pub fn fresh(t: Result<Target, NoTarget>, now: Instant) -> Result<Target, NoTarget> {
+    match t {
+        Ok(t) if now.saturating_duration_since(t.captured) >= FRESH_FOR => Err(NoTarget::Expired),
+        other => other,
+    }
 }
 
 /// Why no usable target was captured.
@@ -28,6 +50,8 @@ pub enum NoTarget {
     Shell,
     /// One of our own windows had focus.
     Ourselves,
+    /// The app was remembered too long ago (see `FRESH_FOR`).
+    Expired,
 }
 
 impl NoTarget {
@@ -36,6 +60,7 @@ impl NoTarget {
             NoTarget::NothingFocused => "no window was focused",
             NoTarget::Shell => "opened from the tray, so the taskbar had focus",
             NoTarget::Ourselves => "PocketMedia itself had focus",
+            NoTarget::Expired => "the app from before was remembered more than 2 minutes ago",
         }
     }
 }
@@ -59,7 +84,30 @@ pub fn capture_foreground() -> Result<Target, NoTarget> {
         pid,
         title: window_title(hwnd),
         exe: process_exe_name(pid).unwrap_or_else(|| "unknown process".into()),
+        caret: caret_of(hwnd),
+        captured: Instant::now(),
     })
+}
+
+/// The text caret of the thread that owns `hwnd`, as a screen point at its
+/// bottom-left corner. None when that thread shows no standard caret (many apps
+/// draw their own, for example browsers); the popup then opens at the pointer.
+pub fn caret_of(hwnd: HWND) -> Option<POINT> {
+    // SAFETY: a stale HWND only yields thread 0, which fails below.
+    let thread = unsafe { GetWindowThreadProcessId(hwnd, None) };
+    if thread == 0 {
+        return None;
+    }
+    let mut info = GUITHREADINFO { cbSize: size_of::<GUITHREADINFO>() as u32, ..Default::default() };
+    // SAFETY: `info` is a local with cbSize set, as the call requires.
+    unsafe { GetGUIThreadInfo(thread, &mut info) }.ok()?;
+    let r = info.rcCaret;
+    if info.hwndCaret.is_invalid() || r.bottom <= r.top {
+        return None;
+    }
+    let mut pt = POINT { x: r.left, y: r.bottom };
+    // SAFETY: hwndCaret came from Windows just now; pt is a local.
+    unsafe { ClientToScreen(info.hwndCaret, &mut pt) }.as_bool().then_some(pt)
 }
 
 impl Target {
@@ -179,5 +227,28 @@ fn process_exe_name(pid: u32) -> Option<String> {
         ok.ok()?;
         let full = String::from_utf16_lossy(&buf[..len as usize]);
         Some(full.rsplit('\\').next().unwrap_or(&full).to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn captured(ago: Duration, now: Instant) -> Result<Target, NoTarget> {
+        Ok(Target { hwnd: HWND::default(), pid: 1, title: String::new(), exe: "chat.exe".into(), caret: None, captured: now - ago })
+    }
+
+    /// The Manager's Quick popup pastes only into an app remembered
+    /// a short while ago; after that it copies.
+    #[test]
+    fn a_remembered_app_expires() {
+        // Ahead of the clock, so `now - ago` never goes before the clock's start.
+        let now = Instant::now() + Duration::from_secs(7200);
+        assert!(fresh(captured(Duration::from_secs(5), now), now).is_ok());
+        assert!(fresh(captured(FRESH_FOR - Duration::from_secs(1), now), now).is_ok());
+        assert!(matches!(fresh(captured(FRESH_FOR, now), now), Err(NoTarget::Expired)));
+        assert!(matches!(fresh(captured(Duration::from_secs(3600), now), now), Err(NoTarget::Expired)));
+        assert!(matches!(fresh(Err(NoTarget::Shell), now), Err(NoTarget::Shell)), "no app stays no app");
+        assert_eq!(FRESH_FOR.as_secs(), 120, "the message says 2 minutes");
     }
 }

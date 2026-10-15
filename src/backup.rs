@@ -115,6 +115,9 @@ pub struct Done {
     pub links: usize,
     /// Unfinished backups from before in the same folder (names), left alone.
     pub leftovers: Vec<String>,
+    /// Files the drive would not let PocketMedia read back past Windows' file
+    /// cache: checked against the copy in memory only.
+    pub cached: usize,
 }
 
 /// Everything a backup needs, captured on the UI thread.
@@ -368,6 +371,7 @@ fn copy_all(
     let mut bytes = 0u64;
     let mut copied = Vec::with_capacity(plan.data.items.len());
     let mut others_done = 0;
+    let mut cached = 0;
     step.total = total;
     step.bytes_total = plan.data.items.iter().map(|i| i.size).sum::<u64>() + others.iter().map(|(_, size)| size).sum::<u64>();
     // Library items first (with their records), then everything else in Media.
@@ -396,7 +400,7 @@ fn copy_all(
             step.checking = checking;
             progress(&step);
         };
-        match (copy_verified(&src, &dst, digest, cancel, made, &mut on_bytes)?, item) {
+        match (copy_verified(&src, &dst, digest, cancel, made, &mut cached, &mut on_bytes)?, item) {
             (None, Some(item)) => left_out.push(item.name.clone()),
             (None, None) => left_out.push(rel.to_string()),
             (Some((size, hash)), Some(item)) => {
@@ -425,7 +429,18 @@ fn copy_all(
     let text = serde_json::to_string_pretty(&kept).map_err(|e| failed("the library file could not be written", &e))?;
     let json = data.join(FILE_NAME);
     write_new(&json, text.as_bytes(), made).map_err(|e| failed("the library file could not be written", &e))?;
-    let back = fs::read_to_string(&json).map_err(|e| failed("the library file could not be read back", &e))?;
+    let mut back = Vec::new();
+    let from_drive = read_back(&json, cancel, &mut |chunk: &[u8], restart: bool| {
+        if restart {
+            back.clear();
+        }
+        back.extend_from_slice(chunk);
+        Ok(())
+    })?;
+    if !from_drive {
+        cached += 1;
+    }
+    let back = String::from_utf8(back).map_err(|e| failed("the library file could not be read back", &e))?;
     match crate::store::check_text(&back) {
         Ok(read) if read == kept => {}
         Ok(_) => return Err(Stop::Failed("the library file read back differently".into())),
@@ -444,6 +459,7 @@ fn copy_all(
         left_out,
         links: tree.links,
         leftovers: leftovers(dest),
+        cached,
     }))
 }
 
@@ -454,19 +470,84 @@ fn write_new(path: &Path, bytes: &[u8], made: &mut Made) -> io::Result<()> {
     f.sync_all()
 }
 
-fn hash_of(path: &Path, digest: NewDigest, cancel: &AtomicBool, on_bytes: &mut dyn FnMut(u64, bool)) -> Result<String, Stop> {
-    let mut f = File::open(path).map_err(|e| Stop::Failed(format!("{} could not be read back: {e}", display_path(path))))?;
+/// The hash of a copy, read back from the drive (see `read_back`), and whether
+/// it came from the drive itself.
+fn hash_of(path: &Path, digest: NewDigest, cancel: &AtomicBool, on_bytes: &mut dyn FnMut(u64, bool)) -> Result<(String, bool), Stop> {
     let mut d: Box<dyn Digest> = digest().map_err(Stop::Failed)?;
-    let mut buf = vec![0u8; CHUNK];
-    loop {
-        check(cancel)?;
-        let n = f.read(&mut buf).map_err(|e| Stop::Failed(format!("{} could not be read back: {e}", display_path(path))))?;
-        if n == 0 {
-            return Ok(d.finish());
+    let from_drive = read_back(path, cancel, &mut |chunk: &[u8], restart: bool| {
+        if restart {
+            d = digest().map_err(Stop::Failed)?;
+            return Ok(());
         }
-        d.update(&buf[..n]);
-        on_bytes(n as u64, true);
+        d.update(chunk);
+        on_bytes(chunk.len() as u64, true);
+        Ok(())
+    })?;
+    Ok((d.finish(), from_drive))
+}
+
+/// Takes each chunk read back; `(&[], true)` means "start again" (see `read_back`).
+type ReadChunk<'a> = dyn FnMut(&[u8], bool) -> Result<(), Stop> + 'a;
+
+/// Sector alignment for reads that bypass the file cache. 4096 is a multiple of
+/// every sector size in common use (512 and 4096 bytes).
+const ALIGN: usize = 4096;
+
+/// Reads a copy back in chunks to check it. Right after writing,
+/// a plain read is served from Windows' file cache in memory, which proves the
+/// copy loop but not the drive. So the copy is opened without that cache
+/// (FILE_FLAG_NO_BUFFERING), which reads what the drive holds. A drive that does
+/// not allow it (some network and virtual drives) is read the plain way: then
+/// `chunk(&[], true)` restarts the reader, and the result is false.
+fn read_back(path: &Path, cancel: &AtomicBool, chunk: &mut ReadChunk) -> Result<bool, Stop> {
+    let failed = |e: io::Error| Stop::Failed(format!("{} could not be read back: {e}", display_path(path)));
+    let mut buf = vec![0u8; CHUNK + ALIGN];
+    // A Vec<u8> of this size is never so misaligned that the offset exceeds ALIGN.
+    let start = buf.as_ptr().align_offset(ALIGN).min(ALIGN);
+    let buf = &mut buf[start..start + CHUNK];
+    match open_from_drive(path) {
+        Ok(mut f) => match read_all(&mut f, buf, cancel, chunk) {
+            Ok(()) => return Ok(true),
+            Err(Err(e)) if e.kind() == io::ErrorKind::InvalidInput => chunk(&[], true)?,
+            Err(Err(e)) => return Err(failed(e)),
+            Err(Ok(stop)) => return Err(stop),
+        },
+        Err(e) if e.kind() == io::ErrorKind::InvalidInput => {}
+        Err(e) => return Err(failed(e)),
     }
+    let mut f = File::open(path).map_err(failed)?;
+    match read_all(&mut f, buf, cancel, chunk) {
+        Ok(()) => Ok(false),
+        Err(Err(e)) => Err(failed(e)),
+        Err(Ok(stop)) => Err(stop),
+    }
+}
+
+/// Reads `f` to its end, chunk by chunk. Err(Ok) stops the backup; Err(Err) is a read error.
+fn read_all(f: &mut File, buf: &mut [u8], cancel: &AtomicBool, chunk: &mut ReadChunk) -> Result<(), Result<Stop, io::Error>> {
+    loop {
+        check(cancel).map_err(Ok)?;
+        let n = f.read(buf).map_err(Err)?;
+        if n == 0 {
+            return Ok(());
+        }
+        chunk(&buf[..n], false).map_err(Ok)?;
+    }
+}
+
+/// Opens `path` for reading past Windows' file cache (reads must use a sector-aligned
+/// buffer whose length is a multiple of the sector size; `read_back` does).
+#[cfg(windows)]
+fn open_from_drive(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows::Win32::Storage::FileSystem::FILE_FLAG_NO_BUFFERING;
+    OpenOptions::new().read(true).custom_flags(FILE_FLAG_NO_BUFFERING.0).open(path)
+}
+
+/// PocketMedia runs on Windows only; this exists for the unit tests on other systems.
+#[cfg(not(windows))]
+fn open_from_drive(path: &Path) -> io::Result<File> {
+    File::open(path)
 }
 
 /// Copies one file and checks the copy. None: the source is gone (removed
@@ -478,6 +559,7 @@ fn copy_verified(
     digest: NewDigest,
     cancel: &AtomicBool,
     made: &mut Made,
+    cached: &mut usize,
     on_bytes: &mut dyn FnMut(u64, bool),
 ) -> Result<Option<(u64, String)>, Stop> {
     let name = display_path(src);
@@ -506,8 +588,12 @@ fn copy_verified(
     to.sync_all().map_err(write_err)?;
     drop(to);
     let hash = d.finish();
-    if hash_of(dst, digest, cancel, on_bytes)? != hash {
+    let (back, from_drive) = hash_of(dst, digest, cancel, on_bytes)?;
+    if back != hash {
         return Err(Stop::Failed(format!("the copy of {name} does not match the original")));
+    }
+    if !from_drive {
+        *cached += 1;
     }
     Ok(Some((size, hash)))
 }
@@ -550,12 +636,21 @@ pub fn describe(p: &Progress) -> String {
         Progress::Copying(s) => format!("Backing up… {} of {} files", s.done, s.total),
         Progress::Finished(d) => {
             let name = d.folder.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            // "Checked" only when every file was read back from the drive itself.
+            let how = if d.cached == 0 { "finished and checked" } else { "finished, copied and flushed" };
             let mut s = format!(
-                "Backup finished and checked: {} + {} ({}) in \"{name}\".",
+                "Backup {how}: {} + {} ({}) in \"{name}\".",
                 count(d.items, "library item"),
                 count(d.others, "other file"),
                 size_text(d.bytes)
             );
+            if d.cached > 0 {
+                s += &format!(
+                    " The drive did not allow reading {} back from the drive itself, so {} checked only against Windows' copy in memory.",
+                    count(d.cached, "file"),
+                    if d.cached == 1 { "it was" } else { "they were" }
+                );
+            }
             if !d.left_out.is_empty() {
                 s += &format!(" {} left the Media folder during the backup and {} not in it.", count(d.left_out.len(), "file"), if d.left_out.len() == 1 { "is" } else { "are" });
             }
@@ -770,9 +865,9 @@ mod tests {
         let root = temp("full");
         let plan = library(&root);
         let (p, seen) = run_plan(&plan);
-        let Progress::Finished(Done { folder, items, others, bytes, left_out, links, leftovers }) = p else { panic!("{p:?}") };
+        let Progress::Finished(Done { folder, items, others, bytes, left_out, links, leftovers, cached }) = p else { panic!("{p:?}") };
         assert_eq!(folder, fs::canonicalize(&plan.dest).unwrap().join("PocketMedia backup 2026-10-13 1620"));
-        assert_eq!((items, others, bytes, left_out.len(), links, leftovers.len()), (3, 0, 4 + 3 * CHUNK as u64 + 5 + 2, 0, 0, 0));
+        assert_eq!((items, others, bytes, left_out.len(), links, leftovers.len(), cached), (3, 0, 4 + 3 * CHUNK as u64 + 5 + 2, 0, 0, 0, 0));
         assert_eq!(names(&plan.dest), vec!["PocketMedia backup 2026-10-13 1620"], "no (unfinished) folder is left");
         let last = seen.last().unwrap();
         assert_eq!((last.done, last.total), (3, 3));
@@ -1096,6 +1191,12 @@ mod tests {
         );
         let gone = Done { items: 2, left_out: vec!["a.png".into()], ..Done::default() };
         assert!(describe(&Progress::Finished(gone)).contains("2 library items + 0 other files"));
+        // "checked" only when every copy was read back from the drive itself.
+        let cache = Done { folder: PathBuf::from("PocketMedia backup 1"), items: 1, cached: 2, ..Done::default() };
+        let line = describe(&Progress::Finished(cache));
+        assert!(line.starts_with("Backup finished, copied and flushed: 1 library item"), "{line}");
+        assert!(line.contains("did not allow reading 2 files back from the drive itself, so they were checked only against"), "{line}");
+        assert!(!line.contains("checked:"), "{line}");
     }
 
     #[test]

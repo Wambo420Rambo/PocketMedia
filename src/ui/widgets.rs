@@ -527,3 +527,28 @@ pub fn icon(p: &Painter, which: Icon, r: Rect, c: Color) {
         }
     }
 }
+
+/// The full file name over a tile ("with the full name as a
+/// tooltip"). Drawn last, inside `bounds`: under the tile, or above it when there
+/// is no room below. Long names wrap (at most 4 lines).
+pub fn tooltip(p: &Painter, text: &str, tile: Rect, bounds: Rect) {
+    const PAD_X: f32 = 8.0;
+    const PAD_Y: f32 = 6.0;
+    let style = TextStyle::Small;
+    let max_text = (bounds.w - 16.0).min(320.0) - 2.0 * PAD_X;
+    if max_text <= 0.0 {
+        return;
+    }
+    let text_w = (p.gfx().measure(text, style) + 1.0).min(max_text);
+    let lines = p.gfx().line_count(text, style, text_w).clamp(1, 4);
+    let (w, h) = (text_w + 2.0 * PAD_X, lines as f32 * style.line() + 2.0 * PAD_Y);
+    let x = (tile.x + (tile.w - w) / 2.0).clamp(bounds.x + 8.0, (bounds.right() - w - 8.0).max(bounds.x + 8.0));
+    let below = tile.bottom() + 4.0;
+    let y = if below + h <= bounds.bottom() - 4.0 { below } else { (tile.y - h - 4.0).max(bounds.y + 4.0) };
+    let r = Rect::new(x, y, w, h);
+    p.fill(r, 8.0, RAISED);
+    p.stroke(r, 8.0, 1.0, BORDER);
+    p.push_clip(r);
+    p.text_wrapped(text, x + PAD_X, y + PAD_Y, text_w, style, TEXT);
+    p.pop_clip();
+}

@@ -54,7 +54,7 @@ pub fn persist() -> Result<(), String> {
         }
         s.save().map(|_| ()).map_err(|e| format!("the library file could not be saved: {e}"))
     })
-    .unwrap_or(Ok(()))
+    .unwrap_or_else(|| Err(crate::store::NOT_OPEN.into()))
 }
 
 fn kind_to_stored(k: MediaKind) -> StoredKind {

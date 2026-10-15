@@ -92,6 +92,18 @@ impl AddPanel {
         self.add.busy()
     }
 
+    /// Files or a folder were dropped on the window: they are checked as if they
+    /// had been chosen in a picker. A drop that cannot be used says why.
+    pub fn dropped(&mut self, source: Result<Source, String>) -> AddOutcome {
+        match source {
+            Ok(s) => self.picked(Some(s)),
+            Err(why) => {
+                self.add.scan_failed(why);
+                AddOutcome::None
+            }
+        }
+    }
+
     /// The picker closed: start checking the chosen files, or stay (or leave).
     pub fn picked(&mut self, source: Option<Source>) -> AddOutcome {
         let leave = std::mem::take(&mut self.leave_if_no_pick);

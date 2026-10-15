@@ -306,6 +306,17 @@ struct Ui {
     frames: HashMap<Key, (Rc<Pixels>, u64)>,
     gif_tx: Option<Sender<GifCmd>>,
     video_tx: Option<Sender<VideoCmd>>,
+    /// Other windows cover all of this window, per `Win`.
+    covered: [bool; 2],
+    /// The session is locked.
+    locked: bool,
+}
+
+impl Ui {
+    /// Nothing of window `i` can be seen although it is open: it animates nothing.
+    fn paused(&self, i: usize) -> bool {
+        self.locked || self.covered[i]
+    }
 }
 
 thread_local! {
@@ -340,7 +351,9 @@ pub fn set_gifs(win: Win, list: Vec<(Key, PathBuf)>) {
 /// Sends the GIF thread the GIFs to animate when the set changed. Returns the
 /// keys whose moving frame is no longer shown.
 fn send_gifs(u: &mut Ui) -> Vec<Key> {
-    let mut all: Vec<(Key, PathBuf)> = u.gifs.iter().flatten().cloned().collect();
+    // A paused window keeps its list, so its GIFs start again as soon as it can be seen.
+    let mut all: Vec<(Key, PathBuf)> =
+        u.gifs.iter().enumerate().filter(|(i, _)| !u.paused(*i)).flat_map(|(_, list)| list.iter().cloned()).collect();
     all.sort_by_key(|(k, _)| *k);
     all.dedup_by_key(|(k, _)| *k);
     let keys: Vec<Key> = all.iter().map(|(k, _)| *k).collect();
@@ -378,8 +391,40 @@ pub fn forget(id: u32) {
     }
 }
 
+/// Other windows now cover all of `win` (true), or it can be seen again (false).
+/// While covered its GIFs and hover video stop.
+pub fn set_covered(win: Win, on: bool) {
+    set_pause(|u| u.covered[win as usize] = on);
+}
+
+/// The session was locked (true) or unlocked: nothing animates while locked.
+pub fn set_locked(on: bool) {
+    set_pause(|u| u.locked = on);
+}
+
+fn set_pause(change: impl FnOnce(&mut Ui)) {
+    let (dropped, stop) = ui(|u| {
+        change(u);
+        let stop = u.hover.filter(|(w, _)| u.paused(*w as usize)).map(|(w, _)| w);
+        (send_gifs(u), stop)
+    });
+    if let Some(win) = stop {
+        hover(win, None);
+    }
+    for k in &dropped {
+        thumbs::invalidate(k);
+    }
+}
+
+/// True when `win` has GIFs to animate or a hover video (whether or not paused).
+pub fn has_motion(win: Win) -> bool {
+    ui(|u| !u.gifs[win as usize].is_empty() || u.hover.is_some_and(|(w, _)| w == win))
+}
+
 /// The pointer is over a video tile of `win` (Some), or not over one (None).
 pub fn hover(win: Win, target: Option<(Key, PathBuf)>) {
+    // Nothing plays in a window that cannot be seen.
+    let target = target.filter(|_| !ui(|u| u.paused(win as usize)));
     let stopped = ui(|u| {
         let wanted = target.as_ref().map(|(k, _)| (win, *k));
         if u.hover == wanted || (target.is_none() && u.hover.is_some_and(|(w, _)| w != win)) {
@@ -465,9 +510,10 @@ pub fn shutdown() {
 
 /// For the self-test log.
 pub fn describe() -> String {
-    let (gifs_wanted, hover, frames) = ui(|u| (u.sent.len(), u.hover.map(|(_, k)| k.id), u.frames.len()));
+    let (gifs_wanted, hover, frames, locked, covered) =
+        ui(|u| (u.sent.len(), u.hover.map(|(_, k)| k.id), u.frames.len(), u.locked, u.covered[Win::Manager as usize]));
     format!(
-        "preview gifs_wanted={} gifs_playing={} gif_frames={} hover={:?} video_playing={} video_frames={} frames_held={}",
+        "preview gifs_wanted={} gifs_playing={} gif_frames={} hover={:?} video_playing={} video_frames={} frames_held={} locked={} manager_covered={}",
         gifs_wanted,
         GIFS_PLAYING.load(Ordering::Relaxed),
         GIF_FRAMES.load(Ordering::Relaxed),
@@ -475,6 +521,8 @@ pub fn describe() -> String {
         VIDEO_PLAYING.load(Ordering::Relaxed),
         VIDEO_FRAMES.load(Ordering::Relaxed),
         frames,
+        locked as u8,
+        covered as u8,
     )
 }
 

@@ -360,6 +360,19 @@ pub(super) fn run(r: &mut Report, t: &Session) -> bool {
 /// Like the quick popup: Ctrl+C on the selected item puts its
 /// file on the clipboard, and a tile drags out to another app as a copy.
 fn transfer_tests(r: &mut Report, t: &Session, m: &Mgr) {
+    // The Manager's tiles show the full name when the pointer rests on them.
+    send(t.main, super::CMD_FOCUS, m.hwnd);
+    wait_until(1500, || foreground() == m.hwnd);
+    if let Some((x, y)) = unpack(send(t.main, CMD_MANAGER_POINT, code(MHit::Tile(1)))) {
+        mouse_to(x, y);
+        let want = m.describe().split("names=").nth(1).and_then(|n| n.split('|').nth(1)).unwrap_or("").to_string();
+        let shown = wait_until(3000, || m.describe().contains(&format!("tip={want:?}")));
+        m.shot(r, "state-manager-tile-tooltip");
+        r.check(&format!("resting the pointer on a Manager tile shows its full name ({want})"), shown && !want.is_empty(), &m.describe());
+        m.park();
+        let gone = wait_until(1500, || m.describe().contains("tip=\"\""));
+        r.check("…and moving off the tile hides it (Manager)", gone, &m.describe());
+    }
     let d = m.describe();
     let name = d.split("names=").nth(1).and_then(|n| n.split('|').next()).unwrap_or("").to_string();
     let file = media_file(&t.out, &name);
@@ -414,4 +427,38 @@ fn transfer_tests(r: &mut Report, t: &Session, m: &Mgr) {
     send(t.main, CMD_FOCUS, m.hwnd);
     wait_until(1500, || foreground() == m.hwnd);
     m.has(r, "…and the Manager says a copy was dropped", &["Dropped a copy"]);
+
+    // Files dropped on the Manager (its line says "Drop files or a
+    // folder to add") go to Add media's review, like chosen files.
+    let src = t.out.join("drop-in");
+    let file = src.join("Dropped on the Manager.png");
+    let _ = std::fs::create_dir_all(&src);
+    if std::fs::write(&file, super::seed::png(40, 40, 222)).is_err() {
+        r.check("drop test file made", false, &file.display().to_string());
+        return;
+    }
+    let Some(w) = window_rect(m.hwnd) else { return };
+    let to = (w.left + (w.right - w.left) / 2, w.top + (w.bottom - w.top) / 2);
+    if super::drag_from_target(r, t, &file, to, m.hwnd) {
+        let reviewed = wait_until(8000, || m.describe().contains("Dropped on the Manager.png:ok"));
+        let result = std::fs::read_to_string(t.out.join("drag-from-result.txt")).unwrap_or_default();
+        let d = m.describe();
+        r.check(
+            "files dropped on the Manager are checked for adding in its Add media, like chosen files",
+            reviewed && d.contains("host=manager") && d.contains("stage=review"),
+            &format!("drag: {result}; {d}"),
+        );
+        r.check("…the dropped file is still where it was (a copy is made only on Add)", file.is_file(), &file.display().to_string());
+        m.shot(r, "state-manager-dropped");
+    }
+    // Back to the library without adding, so the counts after this stay as expected.
+    send(t.main, super::CMD_FOCUS, m.hwnd);
+    wait_until(1500, || foreground() == m.hwnd);
+    for _ in 0..3 {
+        if !m.describe().starts_with("host=manager") || !guard(r, &t.allowed) {
+            break;
+        }
+        press(&[VK_ESCAPE]);
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }

@@ -8,6 +8,8 @@ use crate::popup_state::{Focus, ListKind, PopupState, TypeFilter};
 
 /// Pointer and window facts that are not part of `PopupState`.
 pub struct Ui {
+    /// The tile whose full name shows as a tooltip.
+    pub tip: Option<usize>,
     pub hover: Hit,
     pub dpi: f32,
     pub shortcut_ok: bool,
@@ -87,6 +89,16 @@ pub fn paint(p: &Painter, s: &PopupState, lib: &Library, l: &Layout, ui: &Ui) {
     widgets::quiet_button(p, l.open_manager, FOOTER_MANAGER, TextStyle::Small, ui.hover == Hit::OpenManager, true);
     widgets::ring(p, ring(Focus::OpenManager), l.open_manager, widgets::RADIUS);
     widgets::add_button(p, l.add_media, FOOTER_ADD, ui.hover == Hit::AddMedia, ring(Focus::AddMedia));
+
+    // The full name of the tile the pointer rests on, over everything else.
+    if let Some(i) = ui.tip
+        && let Some(item) = s.visible(lib).get(i).copied()
+    {
+        let tile = l.grid().tile(i, s.scroll);
+        if tile.bottom() > l.gallery.y && tile.y < l.gallery.bottom() {
+            widgets::tooltip(p, &item.name, tile, l.gallery);
+        }
+    }
 
     p.stroke(Rect::new(0.0, 0.0, l.width, l.height), 8.0, 1.0, BORDER);
 }

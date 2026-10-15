@@ -79,6 +79,17 @@ const CMD_REQUEST_EXIT: usize = 30;
 /// Starts Back up library into the self-test's backup folder without a click,
 /// so the quick popup keeps its review open meanwhile.
 const CMD_BACKUP_START: usize = 31;
+/// Where the popup last opened, packed, if it opened at a text caret (else not on screen).
+const CMD_POPUP_PLACED: usize = 32;
+/// Makes the remembered app older than `target::FRESH_FOR`. 1 if done.
+const CMD_AGE_TARGET: usize = 33;
+/// The next paste reads the target's elevation as unknown.
+const CMD_UNKNOWN_ELEVATION: usize = 34;
+/// The popup's next frame reports a lost drawing target; the popup
+/// is asked to repaint once. Returns the drawing targets made so far.
+const CMD_LOSE_TARGET: usize = 35;
+/// The drawing targets made so far (`d2d::TARGETS_MADE`).
+const CMD_D2D_TARGETS: usize = 36;
 
 static EXIT_CODE: AtomicI32 = AtomicI32::new(0);
 static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -330,6 +341,31 @@ pub fn on_ui_command(wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             crate::request_exit();
             0
         }
+        CMD_POPUP_PLACED => pack(popup::placed().filter(|(caret, _)| *caret).map(|(_, pt)| pt)),
+        CMD_AGE_TARGET => {
+            let aged = app(|a| match a.target.borrow_mut().as_mut() {
+                Ok(t) => match t.captured.checked_sub(crate::target::FRESH_FOR + Duration::from_secs(1)) {
+                    Some(earlier) => {
+                        t.captured = earlier;
+                        true
+                    }
+                    None => false,
+                },
+                Err(_) => false,
+            });
+            aged as isize
+        }
+        CMD_UNKNOWN_ELEVATION => {
+            crate::paste::UNKNOWN_NEXT.store(true, Ordering::Relaxed);
+            0
+        }
+        CMD_LOSE_TARGET => {
+            let made = crate::ui::d2d::TARGETS_MADE.load(Ordering::Relaxed);
+            crate::ui::d2d::LOSE_NEXT.store(true, Ordering::Relaxed);
+            crate::winutil::invalidate(popup::hwnd());
+            made as isize
+        }
+        CMD_D2D_TARGETS => crate::ui::d2d::TARGETS_MADE.load(Ordering::Relaxed) as isize,
         CMD_BACKUP_START => {
             manager::start_backup(crate::dialogs::pick_backup_folder(manager::hwnd()));
             crate::backup::running() as isize
@@ -634,6 +670,7 @@ fn run_input_tests(r: &mut Report, t: &Session) -> bool {
 
     // 3. Tray menu (opened the way a right-click on the icon does).
     tray_menu_test(r);
+    tray_click_test(r, t);
 
     // Put the pointer on the left so the popup opens away from the target window.
     let work = primary_work_area();
@@ -673,6 +710,7 @@ fn run_input_tests(r: &mut Report, t: &Session) -> bool {
     press_hotkey();
     r.check("shortcut toggles popup closed", wait_until(1500, || !is_visible(popup)), "");
     r.check("focus returns to previous app after toggle", wait_until(1500, || foreground() == target), &describe_foreground());
+    caret_test(r, t);
 
     // 7. Popup screens, captured with the names the screenshots have always had.
     if !t.open(r) {
@@ -743,6 +781,14 @@ fn run_input_tests(r: &mut Report, t: &Session) -> bool {
     if let Some((x, y)) = t.point(El::Tile(1)) {
         mouse_to(x, y);
         t.shot(r, "state-hover-tile");
+        // Resting on a tile shows its full name (Windows times the rest).
+        let shown = t.wait_state("tip=\"Square.png\"", 3000);
+        t.shot(r, "state-tile-tooltip");
+        r.check("resting the pointer on a tile shows its full name", shown, &t.describe());
+        // Off the tiles (moving within the same tile keeps the name, like Windows' own tips).
+        t.park();
+        let gone = t.wait_state("tip=\"\"", 1500);
+        r.check("…and moving off the tile hides it", gone, &t.describe());
     }
     t.click(r, El::Search);
     t.park();
@@ -764,6 +810,8 @@ fn run_input_tests(r: &mut Report, t: &Session) -> bool {
     if !paste_tests(r, t) {
         return false;
     }
+
+    lost_target_test(r, t);
 
     // 9. Drag a tile into the target window.
     if !t.open(r) {
@@ -982,7 +1030,49 @@ fn add_media_test(r: &mut Report, t: &Session) -> bool {
     std::thread::sleep(Duration::from_millis(150));
     t.state_has(r, "Escape leaves Add media without closing the popup", &["screen=gallery"]);
     r.check("popup still open after Escape in Add media", is_visible(t.popup), "");
+    popup_drop_test(r, t);
     true
+}
+
+/// Dropping files on Add media starts the same import. While Add media
+/// is open the popup stays open when another window is clicked, so files can be
+/// dragged in from File Explorer (here: from the test target).
+fn popup_drop_test(r: &mut Report, t: &Session) {
+    let src = t.out.join("drop-in");
+    let file = src.join("Dropped on popup.png");
+    let _ = std::fs::create_dir_all(&src);
+    if std::fs::write(&file, seed::png(48, 32, 221)).is_err() {
+        r.check("drop test file made", false, &file.display().to_string());
+        return;
+    }
+    if !t.open(r) {
+        return;
+    }
+    t.click(r, El::AddMediaButton);
+    let Some(p) = window_rect(t.popup) else { return };
+    let to = (p.left + (p.right - p.left) / 2, p.top + (p.bottom - p.top) / 3);
+    if drag_from_target(r, t, &file, to, t.popup) {
+        let reviewed = t.wait_state("Dropped on popup.png:ok", 8000);
+        let result = std::fs::read_to_string(t.out.join("drag-from-result.txt")).unwrap_or_default();
+        r.check(
+            "files dropped on the quick popup's Add media are checked for adding, like chosen files",
+            reviewed && t.describe().contains("stage=review"),
+            &format!("drag: {result}; {}", t.describe()),
+        );
+        r.check("…the popup stayed open while the other app was used for the drag", is_visible(t.popup), "");
+        r.check("…the dropped file is still where it was (a copy is made only on Add)", file.is_file(), &file.display().to_string());
+        t.shot(r, "state-popup-dropped");
+    }
+    // Back to the gallery without adding, so the library stays as the next checks expect.
+    send(t.main, CMD_FOCUS, t.popup);
+    wait_until(1500, || foreground() == t.popup);
+    for _ in 0..3 {
+        if !t.describe().contains("screen=add") || !guard(r, &t.allowed) {
+            break;
+        }
+        press(&[VK_ESCAPE]);
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 fn popup_size_unchanged(popup: isize) -> bool {
@@ -997,9 +1087,61 @@ fn popup_size_unchanged(popup: isize) -> bool {
 /// a real click (run 2: the menu closed at once). It is on the manual checklist.
 fn tray_menu_test(r: &mut Report) {
     r.skip(
-        "tray menu (Open, Exit)",
+        "tray menu (Quick popup, Open manager, Settings, Exit)",
         "Windows does not deliver simulated clicks to tray icons; checked by hand",
     );
+}
+
+/// A left click on the tray icon opens the quick popup. Windows does
+/// not deliver simulated clicks to tray icons, so the test posts the icon's own
+/// callback (a left button released), as Windows does for a real click.
+fn tray_click_test(r: &mut Report, t: &Session) {
+    post(t.main, crate::WM_TRAY, 0, WM_LBUTTONUP as isize);
+    let shown = wait_until(2000, || is_visible(t.popup));
+    r.check("a left click on the tray icon opens the quick popup (its callback, posted)", shown, &describe_foreground());
+    post(t.popup, WM_CLOSE, 0, 0);
+    wait_until(1500, || !is_visible(t.popup));
+    send(t.main, CMD_FOCUS, t.target);
+    wait_until(1500, || foreground() == t.target);
+}
+
+/// The popup opens next to the target app's text caret. The test
+/// target shows a caret (at `test_target::CARET`) while `caret.txt` exists.
+fn caret_test(r: &mut Report, t: &Session) {
+    let flag = t.out.join("caret.txt");
+    let _ = std::fs::write(&flag, b"on");
+    // The caret appears when the target gets the focus back: open the popup and
+    // close it again (Escape hands the focus back).
+    if !t.open(r) || !guard(r, &t.allowed) {
+        let _ = std::fs::remove_file(&flag);
+        return;
+    }
+    press(&[VK_ESCAPE]);
+    wait_until(1500, || !is_visible(t.popup) && foreground() == t.target);
+    std::thread::sleep(Duration::from_millis(200));
+    let mut caret = windows::Win32::Foundation::POINT { x: test_target::CARET.0, y: test_target::CARET.1 };
+    // SAFETY: the target's own window; caret is a local.
+    let _ = unsafe { windows::Win32::Graphics::Gdi::ClientToScreen(hwnd(t.target), &mut caret) };
+    let opened = t.open(r);
+    let placed = unpack(send(t.main, CMD_POPUP_PLACED, 0));
+    let rect = window_rect(t.popup);
+    // The caret's bottom-left corner: same x, a caret's height (18 px at 96 DPI) lower.
+    let near = placed.is_some_and(|(x, y)| x == caret.x && (caret.y..=caret.y + 60).contains(&y));
+    let beside = match (rect, placed) {
+        (Some(p), Some((_, y))) => p.top >= y || p.bottom <= y - 10,
+        _ => false,
+    };
+    r.check(
+        "the popup opens next to the app's text caret, not over it",
+        opened && near && beside,
+        &format!("caret top-left {:?}; popup placed at {placed:?}; popup {rect:?}", (caret.x, caret.y)),
+    );
+    let _ = std::fs::remove_file(&flag);
+    if guard(r, &t.allowed) {
+        press(&[VK_ESCAPE]);
+    }
+    wait_until(1500, || !is_visible(t.popup));
+    wait_until(1500, || foreground() == t.target);
 }
 
 fn drag_test(r: &mut Report, t: &Session) {
@@ -1083,6 +1225,62 @@ fn drag_to_target(r: &mut Report, t: &Session, from: (i32, i32)) -> bool {
         return r.check("drag reaches test target", false, &format!("window under pointer belongs to pid {}", window_pid(over)));
     }
     mouse_button(false);
+    true
+}
+
+/// Drags `file` from the test target (a separate process, like File Explorer)
+/// to the screen point `to`, which must be on PocketMedia's window `into`, and
+/// releases there. The target starts a real OLE drag (copy only) when the button
+/// goes down on it. Returns false (with a FAIL) if the drag could not be made.
+fn drag_from_target(r: &mut Report, t: &Session, file: &Path, to: (i32, i32), into: isize) -> bool {
+    let order = t.out.join("drag-from.txt");
+    let _ = std::fs::remove_file(t.out.join("drag-from-result.txt"));
+    if std::fs::write(&order, file.display().to_string()).is_err() {
+        return r.check("drag source prepared", false, &order.display().to_string());
+    }
+    let Some(from) = window_rect(t.target) else {
+        return r.check("drag source found", false, "");
+    };
+    let pid = window_pid(t.target);
+    // A point of the target that no other window covers.
+    let spot = (1..8)
+        .flat_map(|i| (1..8).map(move |j| (i, j)))
+        .map(|(i, j)| (from.left + (from.right - from.left) * i / 8, from.top + (from.bottom - from.top) * j / 8))
+        .find(|&(x, y)| window_pid(window_at(x, y)) == pid);
+    let Some((fx, fy)) = spot else {
+        let _ = std::fs::remove_file(&order);
+        return r.check("drag starts on the test target", false, "other windows cover the whole test target");
+    };
+    if !guard(r, &t.allowed) {
+        let _ = std::fs::remove_file(&order);
+        return false;
+    }
+    mouse_to(fx, fy);
+    std::thread::sleep(Duration::from_millis(150));
+    mouse_button(true);
+    std::thread::sleep(Duration::from_millis(250));
+    for i in 1..=5 {
+        mouse_to(fx - i * 6, fy + i * 2); // past the system drag threshold
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    let (tx, ty) = to;
+    for i in 1..=15 {
+        mouse_to(fx + (tx - fx) * i / 15, fy + (ty - fy) * i / 15);
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    let over = window_at(tx, ty);
+    if over != into {
+        // Not over the window it should drop on: Escape cancels the drag.
+        press(&[VK_ESCAPE]);
+        mouse_button(false);
+        let _ = std::fs::remove_file(&order);
+        return r.check("drag reaches PocketMedia", false, &format!("window under the pointer: {over:#x}, wanted {into:#x}"));
+    }
+    mouse_button(false);
+    let done = t.out.join("drag-from-result.txt");
+    wait_until(3000, || done.exists());
+    let _ = std::fs::remove_file(&order);
     true
 }
 
@@ -1185,7 +1383,77 @@ fn paste_tests(r: &mut Report, t: &Session) -> bool {
     r.check("a failed paste brings the popup back and says so", back, &t.describe());
     r.check("nothing was sent to the app", !t.out.join("paste-formats.txt").exists(), "");
     t.shot(r, "state-popup-paste-failed");
+    if guard(r, &t.allowed) {
+        press(&[VK_ESCAPE]);
+    }
+    wait_until(1500, || !is_visible(t.popup));
+
+    // When Windows cannot say whether the app runs as administrator,
+    // Ctrl+V might be dropped without a word, so it is not sent at all.
+    send(t.main, CMD_UNKNOWN_ELEVATION, 0);
+    if !paste(r, t, "portrait") {
+        return false;
+    }
+    let told = wait_until(3000, || t.describe().contains("press Ctrl+V in"));
+    std::thread::sleep(Duration::from_millis(800));
+    let (_, text) = status(t.main);
+    r.check(
+        "when the app's administrator state is unknown, nothing is sent and the popup says to press Ctrl+V",
+        told && text.contains("may run as administrator") && !t.out.join("paste-formats.txt").exists(),
+        &format!("{text} | {}", t.describe()),
+    );
+    // Reopened, the search is empty again: Recently used must not start with it.
+    if guard(r, &t.allowed) {
+        press(&[VK_ESCAPE]);
+    }
+    wait_until(1500, || !is_visible(t.popup));
+    send(t.main, CMD_FOCUS, t.target);
+    wait_until(1500, || foreground() == t.target);
+    if !t.open(r) {
+        return false;
+    }
+    t.click(r, El::Tab(0));
+    let d = t.describe();
+    r.check(
+        "…and it is not counted as used",
+        d.contains("list=Recent") && d.contains("query=\"\"") && !d.contains("names=Portrait.png"),
+        &d,
+    );
+    if guard(r, &t.allowed) {
+        press(&[VK_ESCAPE]);
+    }
+    wait_until(1500, || !is_visible(t.popup));
     true
+}
+
+/// After a GPU reset or a remote desktop reconnect, Direct2D asks
+/// for a new drawing target. The window must ask for a new frame by itself.
+/// Run on a popup with nothing animating (an empty search), so no GIF frame
+/// repaints it by chance.
+fn lost_target_test(r: &mut Report, t: &Session) {
+    if !t.open(r) {
+        return;
+    }
+    t.click(r, El::Search);
+    if !t.select_all_and_type(r, "zzzz") {
+        return;
+    }
+    t.park();
+    std::thread::sleep(Duration::from_millis(500));
+    let before = send(t.main, CMD_LOSE_TARGET, 0);
+    let redrawn = wait_until(2000, || send(t.main, CMD_D2D_TARGETS, 0) > before);
+    let after = send(t.main, CMD_D2D_TARGETS, 0);
+    t.shot(r, "state-popup-after-lost-target");
+    r.check(
+        "after its drawing target is lost, the popup draws itself again",
+        redrawn && is_visible(t.popup),
+        &format!("drawing targets made {before} -> {after}; {}", t.describe()),
+    );
+    if t.select_all_and_type(r, "") && guard(r, &t.allowed) {
+        press(&[VK_BACK]);
+        press(&[VK_ESCAPE]);
+    }
+    wait_until(1500, || !is_visible(t.popup));
 }
 
 /// The folders beside the program.
@@ -1691,6 +1959,11 @@ mod tests {
             CMD_FAIL_NEXT_PASTE,
             CMD_REQUEST_EXIT,
             CMD_BACKUP_START,
+            CMD_POPUP_PLACED,
+            CMD_AGE_TARGET,
+            CMD_UNKNOWN_ELEVATION,
+            CMD_LOSE_TARGET,
+            CMD_D2D_TARGETS,
             preview_test::CMD_PREVIEW_DESCRIBE,
             preview_test::CMD_THUMBS_RESET,
             preview_test::CMD_SET_VIDEO_PREVIEW,

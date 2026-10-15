@@ -72,7 +72,10 @@ pub fn drag_item(source: HWND, id: u32) -> Dragged {
     let Some(file) = media_file(id) else {
         return Dragged::Failed("That item is no longer in the library.".into());
     };
-    match transfer::drag_file_out(source, &file) {
+    DRAGGING_OUT.store(true, Ordering::Relaxed);
+    let dragged = transfer::drag_file_out(source, &file);
+    DRAGGING_OUT.store(false, Ordering::Relaxed);
+    match dragged {
         Ok(effect) if effect.0 & DROPEFFECT_COPY.0 != 0 => {
             library::with_mut(|lib| lib.record_use(id));
             let _ = library::persist();
@@ -81,6 +84,15 @@ pub fn drag_item(source: HWND, id: u32) -> Dragged {
         Ok(_) => Dragged::NoDrop,
         Err(e) => Dragged::Failed(e),
     }
+}
+
+/// A library item is being dragged out of PocketMedia right now.
+static DRAGGING_OUT: AtomicBool = AtomicBool::new(false);
+
+/// True while one of our own tiles is being dragged: our windows then refuse the
+/// drop, so a tile let go over PocketMedia itself is not imported again.
+pub fn dragging_out() -> bool {
+    DRAGGING_OUT.load(Ordering::Relaxed)
 }
 
 /// Self-test only: the next paste fails as if focus never came back.
@@ -157,6 +169,25 @@ pub fn on_prepared(ev: &Event) -> bool {
     true
 }
 
+/// Self-test only: the next target's elevation reads as unknown.
+pub static UNKNOWN_NEXT: AtomicBool = AtomicBool::new(false);
+
+/// Why Ctrl+V must not be sent, if it must not. Windows silently drops input
+/// from a normal app into one that runs as administrator, so a paste there
+/// would be reported as sent while nothing arrived. When the target's state
+/// cannot be read, it may be such an app: nothing is sent then either, and the
+/// item waits on the clipboard.
+fn elevation_block(target: Elevation, ours: Elevation) -> Option<&'static str> {
+    if ours == Elevation::Elevated {
+        return None;
+    }
+    match target {
+        Elevation::Elevated => Some("it runs as administrator"),
+        Elevation::Unknown => Some("it may run as administrator"),
+        Elevation::NotElevated => None,
+    }
+}
+
 /// The item is on the clipboard: hand focus to the target and wait to send Ctrl+V.
 fn deliver(id: u32) {
     let main = app(|a| a.main.get());
@@ -173,10 +204,10 @@ fn deliver(id: u32) {
         popup::show_status(COPIED);
         return;
     }
-    if target::process_elevation(Some(t.pid)) == Elevation::Elevated && target::process_elevation(None) != Elevation::Elevated {
-        set_status(format!("Copied to clipboard; {} runs as administrator.", t.exe), StatusKind::Neutral);
-        // Windows blocks simulated paste from a normal app into an elevated one.
-        popup::show_status(&format!("{COPIED} - press Ctrl+V in {} yourself (it runs as administrator)", t.exe));
+    let theirs = if UNKNOWN_NEXT.swap(false, Ordering::Relaxed) { Elevation::Unknown } else { target::process_elevation(Some(t.pid)) };
+    if let Some(why) = elevation_block(theirs, target::process_elevation(None)) {
+        set_status(format!("Copied to clipboard; {} {why}.", t.exe), StatusKind::Neutral);
+        popup::show_status(&format!("{COPIED} - press Ctrl+V in {} yourself ({why})", t.exe));
         return;
     }
     let close_after = crate::store::settings().close_after_insert;
@@ -244,5 +275,24 @@ pub fn tick() {
         };
         set_status(format!("Nothing was pasted into {}: {why}. The item is on the clipboard.", t.exe), StatusKind::Bad);
         popup::show_failed(NOT_SENT);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ctrl+V goes only to an app known not to run as
+    /// administrator (or from an elevated PocketMedia, which Windows allows).
+    #[test]
+    fn ctrl_v_only_when_windows_will_deliver_it() {
+        use Elevation::*;
+        assert_eq!(elevation_block(NotElevated, NotElevated), None);
+        assert_eq!(elevation_block(Elevated, NotElevated), Some("it runs as administrator"));
+        assert_eq!(elevation_block(Unknown, NotElevated), Some("it may run as administrator"));
+        assert_eq!(elevation_block(Unknown, Unknown), Some("it may run as administrator"));
+        for theirs in [Elevated, NotElevated, Unknown] {
+            assert_eq!(elevation_block(theirs, Elevated), None, "{theirs:?}");
+        }
     }
 }

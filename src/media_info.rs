@@ -88,17 +88,25 @@ fn jpeg(b: &[u8]) -> Option<(u32, u32)> {
     None
 }
 
-/// The first video track's display size from its `tkhd` box (16.16 fixed point).
+/// The first video track's display size from its `tkhd` box (16.16 fixed point),
+/// turned as its matrix turns the picture: a phone video stored 1920 x 1080 with
+/// a quarter turn shows as 1080 x 1920.
 fn mp4(b: &[u8]) -> Option<(u32, u32)> {
     (b.get(4..8)? == b"ftyp").then_some(())?;
     let mut from = 0;
     while let Some(pos) = find(&b[from..], b"tkhd").map(|p| p + from) {
         let version = *b.get(pos + 4)?;
-        // After the box type: version/flags (4), times and track id, then the matrix.
-        let wh = if version == 1 { pos + 4 + 88 } else { pos + 4 + 76 };
+        // After the box type: version/flags (4), times and track id (longer in
+        // version 1), then the 3 x 3 matrix (36 bytes), then width and height.
+        let matrix = if version == 1 { pos + 4 + 52 } else { pos + 4 + 40 };
+        let wh = matrix + 36;
         let (w, h) = (be32(b, wh)? >> 16, be32(b, wh + 4)? >> 16);
         if w > 0 && h > 0 {
-            return Some((w, h));
+            let entry = |i: usize| be32(b, matrix + 4 * i).map(|v| v as i32);
+            // Row by row: a b u / c d v / x y w. A quarter turn has a = d = 0.
+            let (a, bb, c, d) = (entry(0)?, entry(1)?, entry(3)?, entry(4)?);
+            let quarter_turn = a == 0 && d == 0 && bb != 0 && c != 0;
+            return Some(if quarter_turn { (h, w) } else { (w, h) });
         }
         from = pos + 4;
     }
@@ -246,13 +254,29 @@ pub mod fixtures {
 
     /// An MP4 box layout with a track header only (enough for the size; not playable).
     pub fn mp4(w: u16, h: u16, tag: &str) -> Vec<u8> {
+        mp4_turned(w, h, 0, tag)
+    }
+
+    /// Like `mp4`, stored `w` x `h` with a display matrix that turns it by
+    /// `degrees` (0, 90, 180 or 270), as phones record portrait video.
+    pub fn mp4_turned(w: u16, h: u16, degrees: u32, tag: &str) -> Vec<u8> {
         let boxed = |kind: &[u8], body: Vec<u8>| {
             let mut v = ((body.len() + 8) as u32).to_be_bytes().to_vec();
             v.extend(kind);
             v.extend(body);
             v
         };
+        const ONE: i32 = 0x0001_0000; // 1.0 in 16.16
+        let (a, b, c, d) = match degrees {
+            90 => (0, ONE, -ONE, 0),
+            180 => (-ONE, 0, 0, -ONE),
+            270 => (0, -ONE, ONE, 0),
+            _ => (ONE, 0, 0, ONE),
+        };
         let mut tkhd = vec![0u8; 84];
+        for (i, v) in [(0, a), (1, b), (3, c), (4, d), (8, 0x4000_0000)] {
+            tkhd[40 + 4 * i..44 + 4 * i].copy_from_slice(&v.to_be_bytes());
+        }
         tkhd[76..80].copy_from_slice(&((w as u32) << 16).to_be_bytes());
         tkhd[80..84].copy_from_slice(&((h as u32) << 16).to_be_bytes());
         let trak = boxed(b"trak", boxed(b"tkhd", tkhd));
@@ -307,6 +331,15 @@ mod tests {
         let png = crate::test_png::encode_rgba(3, 2, &[0; 24]);
         assert_eq!(dimensions_of(&png), (3, 2));
         assert_eq!(dimensions_of(b"not media"), (0, 0));
+    }
+
+    /// A portrait phone video is stored landscape with a quarter
+    /// turn in its track matrix; its size reads as it is shown.
+    #[test]
+    fn video_size_follows_the_rotation_matrix() {
+        for (degrees, size) in [(0, (1920, 1080)), (90, (1080, 1920)), (180, (1920, 1080)), (270, (1080, 1920))] {
+            assert_eq!(dimensions_of(&fixtures::mp4_turned(1920, 1080, degrees, "r")), size, "{degrees} degrees");
+        }
         assert_eq!(dimensions_of(&[]), (0, 0));
     }
 }

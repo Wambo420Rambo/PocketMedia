@@ -10,11 +10,11 @@ use windows::Win32::Graphics::Gdi::{
     ScreenToClient,
 };
 use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
-use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
 use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VIRTUAL_KEY,
+    GetKeyState, ReleaseCapture, SetCapture, TME_HOVER, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VIRTUAL_KEY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -27,6 +27,8 @@ use crate::ui::layout::Rect;
 
 /// Defined in Win32_UI_Controls; declared here rather than enabling that whole feature.
 pub const WM_MOUSELEAVE: u32 = 0x02A3;
+/// Also from Win32_UI_Controls: the pointer rested in the window (TrackMouseEvent TME_HOVER).
+pub const WM_MOUSEHOVER: u32 = 0x02A1;
 
 /// The PocketMedia logo from the exe's resources (icon group 1, linked by
 /// build.rs), at the system's large or small icon size. Windows' generic program
@@ -118,6 +120,17 @@ pub fn track_mouse_leave(hwnd: HWND) -> bool {
     unsafe { TrackMouseEvent(&mut tme) }.is_ok()
 }
 
+/// Asks for one WM_MOUSEHOVER when the pointer rests in `hwnd` for the system's
+/// hover time (and keeps the WM_MOUSELEAVE request). Windows times it; nothing
+/// here polls. Returns true if armed.
+pub fn track_mouse_hover(hwnd: HWND) -> bool {
+    const HOVER_DEFAULT: u32 = 0xFFFF_FFFF;
+    let mut tme =
+        TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_HOVER | TME_LEAVE, hwndTrack: hwnd, dwHoverTime: HOVER_DEFAULT };
+    // SAFETY: tme is a fully initialised local.
+    unsafe { TrackMouseEvent(&mut tme) }.is_ok()
+}
+
 pub fn set_cursor(ibeam: bool) {
     // SAFETY: system cursors are shared resources; we never free them.
     unsafe {
@@ -179,16 +192,29 @@ pub struct Placement {
 
 pub fn monitor_at_cursor() -> Placement {
     let mut cursor = POINT::default();
+    // SAFETY: out-pointer to a local.
+    let _ = unsafe { GetCursorPos(&mut cursor) };
+    monitor_at(cursor)
+}
+
+/// `point`, and the work area and DPI of the monitor it is on (the nearest one).
+pub fn monitor_at(point: POINT) -> Placement {
+    let cursor = point;
     let mut info = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
     let (mut dpi, mut dpi_y) = (96u32, 96u32);
     // SAFETY: out-pointers to locals.
     unsafe {
-        let _ = GetCursorPos(&mut cursor);
         let monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
         let _ = GetMonitorInfoW(monitor, &mut info);
         let _ = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi, &mut dpi_y);
     }
     Placement { cursor, work: info.rcWork, dpi }
+}
+
+/// How many UTF-16 units of a clipboard block of `bytes` may be read: whole
+/// units inside the block, and at most 4096.
+fn text_limit(bytes: usize) -> usize {
+    (bytes / 2).min(4096)
 }
 
 /// Plain text from the clipboard (for Ctrl+V in text boxes), capped at 4096 characters.
@@ -203,8 +229,10 @@ pub fn clipboard_text(owner: HWND) -> Option<String> {
             if ptr.is_null() {
                 return None;
             }
+            // Never past the block, even when the other app left out the NUL.
+            let max = text_limit(GlobalSize(mem));
             let mut len = 0;
-            while *ptr.add(len) != 0 && len < 4096 {
+            while len < max && *ptr.add(len) != 0 {
                 len += 1;
             }
             let s = String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len));
@@ -244,3 +272,18 @@ impl Drop for OwnedHandle {
 unsafe impl Send for OwnedHandle {}
 // SAFETY: as above; the methods used through `&OwnedHandle` (wait, SetEvent) are thread-safe.
 unsafe impl Sync for OwnedHandle {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The scan for the end of the text stays inside the block.
+    #[test]
+    fn clipboard_text_stays_inside_its_block() {
+        assert_eq!(text_limit(0), 0);
+        assert_eq!(text_limit(1), 0, "half a unit is not read");
+        assert_eq!(text_limit(7), 3);
+        assert_eq!(text_limit(10), 5);
+        assert_eq!(text_limit(1 << 20), 4096);
+    }
+}

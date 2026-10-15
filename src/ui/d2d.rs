@@ -27,9 +27,15 @@ use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 use windows::core::{BOOL, HSTRING, Interface, Result};
 
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::layout::{Rect, TextStyle};
 use crate::pixels::Pixels;
+
+/// Drawing targets made, in any window (for the self-test log).
+pub static TARGETS_MADE: AtomicU64 = AtomicU64::new(0);
+/// Self-test only: the next frame reports a lost device, as after a GPU reset.
+pub static LOSE_NEXT: AtomicBool = AtomicBool::new(false);
 
 /// 0xRRGGBB plus opacity.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -85,6 +91,8 @@ pub struct Gfx {
     /// Bitmaps of the pictures drawn in the last full frame (they belong to the
     /// render target, so they go with it).
     images: RefCell<Vec<Image>>,
+    /// The last frame lost its target and never reached the screen (see `take_lost`).
+    lost: bool,
 }
 
 /// Identifies one picture slot: an item id and the thumbnail box size.
@@ -156,7 +164,7 @@ impl Gfx {
         let dash_props = D2D1_STROKE_STYLE_PROPERTIES { dashStyle: D2D1_DASH_STYLE_CUSTOM, ..Default::default() };
         // SAFETY: plain property struct and a dash array that outlives the call.
         let dashed = unsafe { factory.CreateStrokeStyle(&dash_props, Some(&[3.0, 2.0]))? };
-        Ok(Self { factory, dwrite, formats, dashed, target: None, images: RefCell::new(Vec::new()) })
+        Ok(Self { factory, dwrite, formats, dashed, target: None, images: RefCell::new(Vec::new()), lost: false })
     }
 
     fn format(&self, style: TextStyle) -> &Format {
@@ -258,6 +266,7 @@ impl Gfx {
             // SAFETY: target is live; the color is a plain struct.
             let brush = unsafe { target.CreateSolidColorBrush(&Color::rgb(0).d2d(), None)? };
             self.target = Some((target, brush));
+            TARGETS_MADE.fetch_add(1, Ordering::Relaxed);
         }
         let Some((target, brush)) = &self.target else { return Ok(()) };
         // SAFETY: the target is live; size and dpi are plain values.
@@ -287,10 +296,16 @@ impl Gfx {
         if full {
             self.images.borrow_mut().retain(|i| i.used);
         }
+        // Self-test only: report this frame as a lost device.
+        let result = if LOSE_NEXT.swap(false, Ordering::Relaxed) { Err(D2DERR_RECREATE_TARGET.into()) } else { result };
         if let Err(e) = result {
             if e.code() == D2DERR_RECREATE_TARGET {
                 self.target = None;
                 self.images.borrow_mut().clear();
+                // This frame never reached the screen: another one is needed, which
+                // makes the new target. The window asks for it after
+                // its WM_PAINT has marked the window painted (`take_lost`).
+                self.lost = true;
                 return Ok(());
             }
             return Err(e);
@@ -304,6 +319,13 @@ impl Gfx {
     }
 
     /// Releases the render target (e.g. after a DPI change).
+    /// True once after a frame lost its drawing target. The window procedure
+    /// then asks for a new frame, after ValidateRect (a request made during the
+    /// frame would be cancelled by it).
+    pub fn take_lost(&mut self) -> bool {
+        std::mem::take(&mut self.lost)
+    }
+
     pub fn reset_target(&mut self) {
         self.target = None;
         self.images.borrow_mut().clear();

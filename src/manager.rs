@@ -49,6 +49,10 @@ struct View {
     scroll_drag: Option<(f32, f32)>,
     high_surrogate: Option<u16>,
     tracking_leave: bool,
+    /// The gallery tile whose full name shows as a tooltip (the pointer rested on it).
+    tip: Option<usize>,
+    /// Files and folders dropped here start an import (revoked when dropped).
+    _drop: Option<crate::drop_target::Registration>,
 }
 
 /// Work to do after the view borrow is released (these can re-enter the window procedure).
@@ -78,6 +82,50 @@ thread_local! {
     static TITLE_PAGE: Cell<Option<Page>> = const { Cell::new(None) };
     /// Self-test only: the folder Open folder was asked to show.
     static OPENED: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// Set while other windows cover all of the Manager and its GIFs are paused.
+    static COVERED: RefCell<Option<crate::visibility::CoverWatch>> = const { RefCell::new(None) };
+    /// When a background repaint last checked for that (at most every 250 ms).
+    static COVER_CHECKED: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+}
+
+/// A repaint while the Manager is in the background (a GIF frame
+/// arrived) checks whether other windows now cover all of it. If so, its GIFs
+/// and hover video stop until it can be seen again (`check_uncovered`).
+fn check_covered(hwnd: HWND) {
+    if COVERED.with(|c| c.borrow().is_some()) || !crate::preview::has_motion(Win::Manager) {
+        return;
+    }
+    // SAFETY: no preconditions.
+    if unsafe { GetForegroundWindow() } == hwnd {
+        return;
+    }
+    let now = std::time::Instant::now();
+    if COVER_CHECKED.with(|c| c.get()).is_some_and(|t| now.duration_since(t) < std::time::Duration::from_millis(250)) {
+        return;
+    }
+    COVER_CHECKED.with(|c| c.set(Some(now)));
+    if crate::visibility::is_covered(hwnd) {
+        COVERED.with(|c| *c.borrow_mut() = Some(crate::visibility::CoverWatch::start(hwnd)));
+        crate::preview::set_covered(Win::Manager, true);
+        crate::selftest::note("manager covered: GIFs paused");
+    }
+}
+
+/// Windows moved, closed or minimised while the Manager was covered, or it was
+/// activated: if any of it shows now (or it is hidden), its GIFs may start again.
+fn check_uncovered(hwnd: HWND, surely: bool) {
+    let covered = COVERED.with(|c| c.borrow().as_ref().map(|w| w.rearm()).is_some());
+    if !covered {
+        return;
+    }
+    // SAFETY: no preconditions.
+    let in_front = unsafe { GetForegroundWindow() } == hwnd;
+    if surely || in_front || !crate::visibility::is_covered(hwnd) {
+        COVERED.with(|c| c.borrow_mut().take());
+        crate::preview::set_covered(Win::Manager, false);
+        crate::selftest::note("manager uncovered: GIFs resume");
+        winutil::invalidate(hwnd);
+    }
 }
 
 /// Runs `f` with the view. Returns None if the window does not exist yet or the
@@ -132,6 +180,13 @@ fn create() -> Result<(), String> {
     };
     WINDOW.with(|c| c.set(hwnd));
     winutil::style_frame(hwnd);
+    let drop = match crate::drop_target::Registration::new(hwnd, accepts_drop) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            crate::selftest::note(&format!("manager: {e}"));
+            None
+        }
+    };
     let mut state = ManagerState::new();
     state.settings = crate::settings_state::SettingsPage::with_saved(crate::store::settings());
     library::with(|lib| state.sync(lib));
@@ -148,9 +203,32 @@ fn create() -> Result<(), String> {
             scroll_drag: None,
             high_surrogate: None,
             tracking_leave: false,
+            tip: None,
+            _drop: drop,
         })
     });
     Ok(())
+}
+
+/// A drag of files may drop here unless an import is already running.
+fn accepts_drop() -> bool {
+    with_view(|v| !v.add.as_ref().is_some_and(AddPanel::busy)).unwrap_or(false)
+}
+
+/// Files or a folder were dropped on the Manager (its footer invites it): Add
+/// media checks them, as if they had been chosen in its picker.
+fn on_drop(hwnd: HWND) -> Effect {
+    let Some(paths) = crate::drop_target::take(hwnd) else { return Effect::None };
+    let source = crate::drop_target::source_for(paths);
+    let effect = with_view(|v| {
+        v.tip = None;
+        let outcome = v.add.get_or_insert_with(AddPanel::new).dropped(source);
+        v.add_outcome(outcome)
+    })
+    .unwrap_or(Effect::None);
+    // SAFETY: our own window: back in front so the review can be used with the keyboard.
+    let _ = unsafe { SetForegroundWindow(hwnd) };
+    effect
 }
 
 /// Shows the Manager (creating it the first time), centred on the pointer's monitor.
@@ -257,6 +335,8 @@ pub fn hide() {
 fn release_previews() {
     let profile = crate::store::settings().profile;
     thumbs::hidden(Win::Manager, profile);
+    // Hidden is not covered: it starts afresh when shown (its GIF list is empty now).
+    check_uncovered(hwnd(), true);
     if profile == Profile::LessMemory {
         with_view(|v| v.gfx.release_images());
     }
@@ -444,6 +524,7 @@ impl View {
                     dpi: self.dpi as f32,
                     search: self.search_metrics(&l),
                     rename: self.rename_metrics(&l, lib),
+                    tip: self.tip,
                 };
                 let state = &self.state;
                 let _ = self.gfx.draw(hwnd(), ui.dpi, dirty, |p| manager_view::paint(p, state, lib, &l, &ui));
@@ -577,6 +658,7 @@ impl View {
     }
 
     fn mouse_down(&mut self, x: f32, y: f32) -> Effect {
+        self.tip = None;
         let area = self.area();
         if let Some(add) = self.add.as_mut() {
             let outcome = add.mouse_down(&self.gfx, area, x, y);
@@ -673,7 +755,15 @@ impl View {
             });
             self.clamp_scroll(false);
         }
-        self.hover = self.hit(x, y);
+        let hover = self.hit(x, y);
+        if hover != self.hover {
+            // A new tile: its name shows once the pointer rests (Windows times it).
+            self.tip = None;
+            if matches!(hover, MHit::Tile(_)) {
+                self.tracking_leave = winutil::track_mouse_hover(hwnd());
+            }
+        }
+        self.hover = hover;
         crate::preview::hover(Win::Manager, self.hover_video());
     }
 
@@ -1134,8 +1224,9 @@ fn run(effect: Effect) {
         Effect::Hide => hide(),
         Effect::QuickPopup => {
             hide();
-            // Paste goes to the app remembered when the popup last opened, if it still exists.
-            let target = crate::app(|a| a.target.borrow().clone());
+            // Paste goes to the app remembered when the popup last opened, if it
+            // still exists and that was a short while ago.
+            let target = crate::target::fresh(crate::app(|a| a.target.borrow().clone()), std::time::Instant::now());
             crate::popup::open(target);
         }
         Effect::Capture(true) => winutil::set_capture(h),
@@ -1355,12 +1446,17 @@ extern "system" fn manager_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
     let effect = match msg {
         WM_ERASEBKGND => return LRESULT(1),
         WM_PAINT => {
+            check_covered(hwnd);
             with_view(|v| {
                 let dirty = winutil::update_rect(hwnd, v.dpi);
                 v.paint(dirty)
             });
             // SAFETY: our own window; marks it painted.
             let _ = unsafe { ValidateRect(Some(hwnd), None) };
+            // A frame that lost its drawing target was not shown: draw again.
+            if with_view(|v| v.gfx.take_lost()) == Some(true) {
+                winutil::invalidate(hwnd);
+            }
             return LRESULT(0);
         }
         WM_NCHITTEST => {
@@ -1386,6 +1482,7 @@ extern "system" fn manager_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             with_view(|v| {
                 v.tracking_leave = false;
                 v.hover = MHit::None;
+                v.tip = None;
                 v.s_hover = SHit::None;
                 if let Some(add) = v.add.as_mut() {
                     add.hover = AddHit::None;
@@ -1409,8 +1506,30 @@ extern "system" fn manager_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             v.mouse_up(x, y)
         })
         .unwrap_or(Effect::None),
+        winutil::WM_MOUSEHOVER => {
+            with_view(|v| {
+                v.tracking_leave = false;
+                if let (MHit::Tile(i), None, false) = (v.hover, v.add.as_ref(), v.on_settings()) {
+                    v.tip = Some(i);
+                }
+            });
+            Effect::None
+        }
+        crate::drop_target::WM_DROPPED => on_drop(hwnd),
+        crate::visibility::WM_COVER_CHANGED => {
+            check_uncovered(hwnd, false);
+            Effect::None
+        }
+        WM_ACTIVATE => {
+            if (wparam.0 & 0xFFFF) as u32 != WA_INACTIVE {
+                check_uncovered(hwnd, true);
+            }
+            // SAFETY: forwarding unchanged (activation sets the keyboard focus).
+            return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+        }
         WM_MOUSEWHEEL => {
             with_view(|v| {
+                v.tip = None;
                 v.wheel(((wparam.0 >> 16) & 0xFFFF) as i16);
                 if let Some((x, y)) = winutil::cursor_dip(hwnd, v.dpi) {
                     v.mouse_move(x, y);
@@ -1672,7 +1791,7 @@ pub fn describe() -> String {
             let scrollbar = v.layout(lib).grid.scrollbar(names.len(), s.scroll).is_some();
             format!(
                 "screen=manager filter={:?} sort={:?} query={:?} focus={:?} selected={:?} rename={:?} error={:?} \
-                 can_rename={} confirming={} status={:?} scrollbar={scrollbar} opened={:?} total={} count={} names={}",
+                 can_rename={} confirming={} status={:?} scrollbar={scrollbar} opened={:?} tip={:?} total={} count={} names={}",
                 s.filter,
                 s.sort,
                 s.search.text(),
@@ -1684,6 +1803,7 @@ pub fn describe() -> String {
                 s.confirming,
                 s.status.as_deref().unwrap_or(""),
                 OPENED.with(|o| o.borrow().clone().unwrap_or_default()),
+                v.tip.and_then(|i| names.get(i).copied()).unwrap_or(""),
                 lib.items.len(),
                 names.len(),
                 names.join("|")

@@ -21,7 +21,9 @@ mod add_media;
 mod add_panel;
 mod autostart;
 mod backup;
+mod compose;
 mod dialogs;
+mod drop_target;
 mod digest;
 mod fileops;
 mod gif;
@@ -56,6 +58,7 @@ mod transfer;
 mod tray;
 mod ui;
 mod video;
+mod visibility;
 mod watch;
 mod wic;
 mod winutil;
@@ -107,6 +110,11 @@ thread_local! {
         target: RefCell::new(Err(NoTarget::NothingFocused)),
         status: RefCell::new((String::new(), StatusKind::Neutral)),
     };
+}
+
+thread_local! {
+    /// Lock and unlock notifications for the main window (dropped on WM_DESTROY).
+    static SESSION_NOTES: RefCell<Option<visibility::SessionNotes>> = const { RefCell::new(None) };
 }
 
 pub fn app<R>(f: impl FnOnce(&App) -> R) -> R {
@@ -329,6 +337,11 @@ fn run(mode: &Mode) -> Result<(), String> {
             a.activate.set(instance::activate_message());
         });
         jobs::init(main);
+        // Lock and unlock reach the main window: GIFs stop while locked.
+        match visibility::SessionNotes::register(main) {
+            Ok(n) => SESSION_NOTES.with(|s| *s.borrow_mut() = Some(n)),
+            Err(e) => selftest::note(&e),
+        }
         if let Some(p) = paths::get()
             && let Err(e) = watch::start(&p.media, watch::BUFFER)
         {
@@ -396,6 +409,11 @@ extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
                 if event != WM_MOUSEMOVE {
                     selftest::note(&format!("tray event {event:#06x}"));
                 }
+                if event == WM_LBUTTONUP {
+                    // A left click on the icon opens the quick popup.
+                    // The taskbar has focus now, so there is no app to paste into.
+                    popup::open(target::capture_foreground());
+                }
                 if event == WM_RBUTTONUP || event == WM_CONTEXTMENU {
                     // Capture before the menu takes focus. From the tray this is
                     // normally the taskbar, which `capture_foreground` rejects.
@@ -441,7 +459,18 @@ extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
                 }
                 LRESULT(0)
             }
+            WM_WTSSESSION_CHANGE if matches!(wparam.0 as u32, WTS_SESSION_LOCK | WTS_SESSION_UNLOCK) => {
+                let locked = wparam.0 as u32 == WTS_SESSION_LOCK;
+                selftest::note(if locked { "session locked: GIFs paused" } else { "session unlocked: GIFs resume" });
+                preview::set_locked(locked);
+                if !locked {
+                    winutil::invalidate(popup::hwnd());
+                    winutil::invalidate(manager::hwnd());
+                }
+                LRESULT(0)
+            }
             WM_DESTROY => {
+                SESSION_NOTES.with(|s| s.borrow_mut().take());
                 hotkey::stop();
                 let _ = KillTimer(Some(hwnd), TIMER_PASTE);
                 watch::stop();

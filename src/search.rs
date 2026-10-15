@@ -1,10 +1,16 @@
 //! The one search rule, shared by the popup and, later, the Manager.
 
+use crate::compose::compose;
+
 /// True when every whitespace-separated word of `query` appears, case-insensitively,
 /// somewhere in `file_name` without its extension. Word order does not matter.
 /// An empty or all-whitespace query matches everything.
+///
+/// Letters with accents compare as one character however they are spelled, so
+/// `é` finds a name written `e` + U+0301, as macOS saves it.
 pub fn matches(file_name: &str, query: &str) -> bool {
-    let base = name_without_extension(file_name).to_lowercase();
+    let base = compose(name_without_extension(file_name)).to_lowercase();
+    let query = compose(query);
     query.split_whitespace().all(|word| base.contains(&word.to_lowercase()))
 }
 
@@ -40,6 +46,15 @@ mod tests {
     fn case_is_ignored() {
         assert!(matches("Happy dance.gif", "HAPPY"));
         assert!(matches("ÉTÉ.png", "été"));
+    }
+
+    /// An accent typed as its own character after the letter.
+    #[test]
+    fn accents_match_however_they_are_spelled() {
+        assert!(matches("Cafe\u{0301} night.png", "café"), "name from a Mac, typed query");
+        assert!(matches("Café night.png", "cafe\u{0301}"), "pasted query, ordinary name");
+        assert!(matches("E\u{0301}TE\u{0301}.gif", "été"), "case and accent together");
+        assert!(!matches("Cafe night.png", "café"), "an accent still counts as a different letter");
     }
 
     #[test]

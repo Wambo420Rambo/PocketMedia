@@ -365,6 +365,8 @@ pub struct ManagerUi {
     pub dpi: f32,
     pub search: TextMetrics,
     pub rename: TextMetrics,
+    /// The gallery tile whose full name shows as a tooltip.
+    pub tip: Option<usize>,
 }
 
 /// Items per sidebar entry: everything, then GIFs, pictures and videos.
@@ -416,6 +418,15 @@ pub fn paint(p: &Painter, s: &ManagerState, lib: &Library, l: &ManagerLayout, ui
     gallery(p, s, lib, l, ui);
     inspector(p, s, lib, l, ui, &ring);
 
+    // The full name of the tile the pointer rests on, over the gallery.
+    if let Some(i) = ui.tip
+        && let Some(item) = s.visible(lib).get(i).copied()
+    {
+        let tile = l.grid.tile(i, s.scroll);
+        if tile.bottom() > l.grid.area.y && tile.y < l.grid.area.bottom() {
+            widgets::tooltip(p, &item.name, tile, l.grid.area);
+        }
+    }
     if let Some(row) = s.sort_open {
         let labels = Sort::BOTH.map(Sort::label);
         widgets::menu(p, &l.sort_menu, &labels, row, s.sort.index());

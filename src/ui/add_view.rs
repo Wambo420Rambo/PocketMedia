@@ -87,7 +87,7 @@ const NOTE: &str = "Files are copied into Pictures, GIFs and Videos automaticall
 const CHOOSE_FILES: (&str, &str) = ("Choose files", "Select one or more pictures, GIFs or videos.");
 const IMPORT_EXISTING: (&str, &str) = (
     "Import your existing media",
-    "Choose a folder. Files from it and all subfolders are sorted and copied automatically.",
+    "Select a folder. Supported files from it and all subfolders are sorted and copied into Pictures, GIFs and Videos. Original files stay where they are.",
 );
 
 impl AddLayout {

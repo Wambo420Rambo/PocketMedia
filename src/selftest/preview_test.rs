@@ -11,10 +11,14 @@ use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY
 use windows::Win32::System::Threading::GetCurrentProcess;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN};
-use windows::Win32::UI::WindowsAndMessaging::WM_CLOSE;
+use windows::Win32::Foundation::RECT;
+use windows::Win32::UI::WindowsAndMessaging::{
+    HWND_TOP, SET_WINDOW_POS_FLAGS, SWP_NOACTIVATE, SWP_SHOWWINDOW, SetWindowPos, WM_CLOSE, WM_WTSSESSION_CHANGE, WTS_SESSION_LOCK,
+    WTS_SESSION_UNLOCK,
+};
 
 use super::{
-    CMD_MANAGER, CMD_MANAGER_POINT, CMD_RESET, DESCRIBE, El, Report, Session, capture_screen, foreground, guard,
+    CMD_FOCUS, CMD_MANAGER, CMD_MANAGER_POINT, CMD_RESET, DESCRIBE, El, Report, Session, capture_screen, foreground, guard,
     hwnd, is_visible, mouse_to, mouse_wheel, post, press, save_capture, seed, send, wait_until, window_rect,
 };
 use crate::media_info::fixtures;
@@ -401,11 +405,55 @@ fn manager_tests(r: &mut Report, t: &Session) -> bool {
     send(t.main, CMD_MANAGER_SHOW, 1);
     let (ok, detail) = grows(t, 1, "gif_frames", 4000);
     r.check("restoring the Manager starts them again", ok, &detail);
+    hidden_from_view(r, t, manager);
     post(manager, WM_CLOSE, 0, 0);
     wait_until(1500, || !is_visible(manager));
     let (still, detail) = stays(t, 1, "gif_frames", 1000);
     r.check("closing the Manager stops its GIFs", still, &detail);
     true
+}
+
+/// GIFs stop while the session is locked and while other windows
+/// cover all of the Manager, and start again by themselves afterwards.
+fn hidden_from_view(r: &mut Report, t: &Session, manager: isize) {
+    // Locked: Windows sends the main window WM_WTSSESSION_CHANGE; the test posts
+    // the same message (it cannot lock the PC).
+    post(t.main, WM_WTSSESSION_CHANGE, WTS_SESSION_LOCK as usize, 0);
+    std::thread::sleep(Duration::from_millis(400));
+    let (still, detail) = stays(t, 1, "gif_frames", 1200);
+    r.check("a locked session stops the Manager's GIFs (lock message posted)", still && field(&describe(t, 1), "locked") == 1, &detail);
+    post(t.main, WM_WTSSESSION_CHANGE, WTS_SESSION_UNLOCK as usize, 0);
+    let (ok, detail) = grows(t, 1, "gif_frames", 4000);
+    r.check("…and unlocking starts them again", ok && field(&describe(t, 1), "locked") == 0, &detail);
+
+    // Covered: the test target window is put over the whole Manager and in front.
+    let (Some(m), Some(home)) = (window_rect(manager), window_rect(t.target)) else {
+        r.check("find the Manager and the test target", false, "");
+        return;
+    };
+    let place = |rc: RECT, flags: SET_WINDOW_POS_FLAGS| {
+        // SAFETY: moving the test target's own window; a stale handle only makes it fail.
+        let _ = unsafe { SetWindowPos(hwnd(t.target), Some(HWND_TOP), rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, flags) };
+    };
+    let over = RECT { left: m.left - 20, top: m.top - 20, right: m.right + 20, bottom: m.bottom + 20 };
+    place(over, SWP_SHOWWINDOW);
+    send(t.main, CMD_FOCUS, t.target);
+    let behind = wait_until(1500, || foreground() == t.target);
+    std::thread::sleep(Duration::from_millis(800));
+    let (still, detail) = stays(t, 1, "gif_frames", 1500);
+    r.check(
+        "with the Manager behind the test target, its GIFs stop",
+        behind && still && field(&describe(t, 1), "manager_covered") == 1,
+        &format!("target {over:?} over Manager {m:?}; {detail}"),
+    );
+    // Moving the covering window away (no click on the Manager) starts them again.
+    place(home, SWP_NOACTIVATE);
+    let (ok, detail) = grows(t, 1, "gif_frames", 4000);
+    r.check(
+        "moving that window off the Manager starts its GIFs again, without clicking it",
+        ok && field(&describe(t, 1), "manager_covered") == 0 && foreground() == t.target,
+        &detail,
+    );
 }
 
 /// The stress set: 600 JPEGs, 100 PNGs, 200 animated GIFs, 50 real MP4s and 50

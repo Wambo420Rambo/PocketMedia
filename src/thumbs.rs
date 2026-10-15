@@ -11,7 +11,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
@@ -273,20 +273,37 @@ fn make(req: &Req, wic: Result<&crate::wic::Wic, String>) -> Option<Result<Pixel
         MediaKind::Video => crate::video::poster(&req.path, w, h),
     };
     MADE.fetch_add(1, Ordering::Relaxed);
-    let entry = match made {
-        Ok(p) => Cached::Thumb(p),
-        Err(e) => {
-            NO_PREVIEW.fetch_add(1, Ordering::Relaxed);
-            crate::selftest::note(&format!("no preview for {}: {e}", req.path.display()));
-            Cached::NoPreview
-        }
-    };
+    if let Err(e) = &made {
+        NO_PREVIEW.fetch_add(1, Ordering::Relaxed);
+        crate::selftest::note(&format!("no preview for {}: {e}", req.path.display()));
+    }
+    let (entry, keep) = outcome(made, &req.path);
     // A failed cache write only costs the work next time.
-    let _ = disk(|d| d.write(&name, stamp, &entry));
+    if keep {
+        let _ = disk(|d| d.write(&name, stamp, &entry));
+    }
     Some(match entry {
         Cached::Thumb(p) => Ok(p),
         Cached::NoPreview => Err("no preview".into()),
     })
+}
+
+/// What a decode attempt leaves behind, and whether it goes into the disk cache.
+/// A failure is remembered on disk only when the file itself reads fine, so the
+/// fault is in its content. A file that is locked (antivirus, a copy still
+/// running) or offline is tried again next time, not marked "No preview" for
+/// good. The window still shows "No preview" for now.
+fn outcome(made: Result<Pixels, String>, path: &Path) -> (Cached, bool) {
+    match made {
+        Ok(p) => (Cached::Thumb(p), true),
+        Err(_) => (Cached::NoPreview, file_reads(path)),
+    }
+}
+
+/// True when the first byte of `path` can be read (an empty file counts).
+fn file_reads(path: &Path) -> bool {
+    let mut byte = [0u8; 1];
+    std::fs::File::open(path).and_then(|mut f| std::io::Read::read(&mut f, &mut byte)).is_ok()
 }
 
 /// Stops the workers (Exit). Work in progress finishes and is dropped.
@@ -562,6 +579,25 @@ mod tests {
 
     fn key(id: u32) -> Key {
         Key { id, w: 128, h: 72 }
+    }
+
+    /// A file that cannot be opened (locked, offline, gone) gets
+    /// "No preview" for now but nothing on disk; a file that reads but does not
+    /// decode is remembered.
+    #[test]
+    fn only_content_failures_are_remembered_on_disk() {
+        let dir = std::env::temp_dir().join(format!("pm-thumbs-outcome-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let broken = dir.join("broken.png");
+        std::fs::write(&broken, b"not a picture").unwrap();
+        let missing = dir.join("gone.png");
+        let fail = || Err::<Pixels, String>("could not be opened".into());
+        assert!(matches!(outcome(fail(), &missing), (Cached::NoPreview, false)), "an unopenable file is not cached");
+        assert!(matches!(outcome(fail(), &dir), (Cached::NoPreview, false)), "a folder cannot be read as a file");
+        assert!(matches!(outcome(fail(), &broken), (Cached::NoPreview, true)), "a broken file is cached");
+        assert!(matches!(outcome(Ok(px(4)), &missing), (Cached::Thumb(_), true)), "a thumbnail is cached");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
