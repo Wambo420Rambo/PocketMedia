@@ -32,6 +32,8 @@ pub enum Event {
     Rescanned { job: u64, orphans: Vec<crate::import::Orphan>, missing: Vec<(u32, String)> },
     /// Back up library progress or its result (`backup.rs`).
     Backup { job: u64, progress: crate::backup::Progress },
+    /// A Manager rename or move to the Recycle Bin finished (`manager.rs`).
+    FileOp { job: u64, done: crate::manager::FileDone },
 }
 
 impl Event {
@@ -42,7 +44,8 @@ impl Event {
             | Event::Finished { job, .. }
             | Event::Prepared { job, .. }
             | Event::Rescanned { job, .. }
-            | Event::Backup { job, .. } => *job,
+            | Event::Backup { job, .. }
+            | Event::FileOp { job, .. } => *job,
             Event::Watched(_) => 0,
         }
     }
@@ -76,6 +79,15 @@ pub fn notify(msg: u32) {
 /// Everything that arrived since the last call (UI thread).
 pub fn take() -> Vec<Event> {
     QUEUE.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default()
+}
+
+/// Only the finished renames and removals, leaving everything else queued
+/// (Exit waits for them, `manager::destroy`).
+pub fn take_file_ops() -> Vec<Event> {
+    let Ok(mut q) = QUEUE.lock() else { return Vec::new() };
+    let (mine, rest) = std::mem::take(&mut *q).into_iter().partition(|e| matches!(e, Event::FileOp { .. }));
+    *q = rest;
+    mine
 }
 
 /// A running job. Dropping it does not stop it; `cancel` does.

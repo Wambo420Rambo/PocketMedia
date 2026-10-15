@@ -2,12 +2,12 @@
 //! every screen (focused-20 to focused-31), rename and removal rules,
 //! Add media from the Manager, and the shared library.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_A, VK_BACK, VK_C, VK_CONTROL, VK_ESCAPE, VK_TAB, VK_V};
 
 use super::{
-    ALL, CMD_FOCUS, CMD_MANAGER, CMD_MANAGER_ADD_POINT, CMD_MANAGER_DESCRIBE, CMD_MANAGER_POINT, CMD_RESET,
+    ALL, CMD_FOCUS, CMD_HOTKEY_OK, CMD_MANAGER, CMD_MANAGER_ADD_POINT, CMD_MANAGER_DESCRIBE, CMD_MANAGER_POINT, CMD_RESET,
     DESCRIBE, El, Report, Session, capture_screen, describe_foreground, drag_to_target, foreground, guard, is_visible,
     media_file, mouse_button, mouse_to, press, save_capture, send, type_unicode, unpack, wait_until, window_rect,
 };
@@ -149,6 +149,13 @@ impl Mgr<'_> {
     }
 }
 
+/// Waits (up to 10 s) until the Manager's rename or removal has been recorded.
+pub(super) fn wait_file_op() -> bool {
+    let done = wait_until(10_000, || !crate::manager::file_op_running());
+    std::thread::sleep(Duration::from_millis(100));
+    done
+}
+
 pub(super) fn run(r: &mut Report, t: &Session) -> bool {
     send(t.main, CMD_RESET, 0);
 
@@ -229,7 +236,23 @@ pub(super) fn run(r: &mut Report, t: &Session) -> bool {
         return false;
     }
     m.has(r, "a valid name enables Rename", &["error=None", "can_rename=true"]);
+    // The rename runs on a worker thread. The test makes it wait 1.5 s
+    // before touching the disk; meanwhile the window must keep answering.
+    let videos = t.out.join("app").join("Media").join("Videos");
+    crate::manager::slow_next_file_op(1500);
     m.click(r, MHit::Rename);
+    let asked = Instant::now();
+    let answered = send(t.main, CMD_HOTKEY_OK, 0) >= 0;
+    let took = asked.elapsed();
+    let running = crate::manager::file_op_running();
+    let d = m.describe();
+    r.check(
+        "while a rename runs, PocketMedia keeps answering (the rename is on a worker thread)",
+        answered && running && took < Duration::from_millis(500) && videos.join("Race clip.mp4").is_file() && d.contains("Renaming to Renamed clip.mp4…"),
+        &format!("answered in {} ms; rename still running {running}; file not renamed yet {}; {d}", took.as_millis(), videos.join("Race clip.mp4").is_file()),
+    );
+    let finished = wait_file_op();
+    r.check("…and the rename finishes", finished, "");
     m.park();
     m.shot(r, "focused-28-manager-rename");
     m.has(
@@ -268,6 +291,7 @@ pub(super) fn run(r: &mut Report, t: &Session) -> bool {
     crate::fileops::refuse_next_for_test(true);
     m.click(r, MHit::Recycle);
     m.click(r, MHit::ConfirmMove);
+    wait_file_op();
     crate::fileops::refuse_next_for_test(false);
     m.has(
         r,
@@ -280,6 +304,7 @@ pub(super) fn run(r: &mut Report, t: &Session) -> bool {
     let bin_before = crate::fileops::recycle_bin_items(&media);
     m.click(r, MHit::Recycle);
     m.click(r, MHit::ConfirmMove);
+    wait_file_op();
     m.has(
         r,
         "confirming moves it to the Recycle Bin and selects the next item",

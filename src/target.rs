@@ -1,6 +1,6 @@
 //! The app that was focused before the popup opened ("the target").
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, POINT};
+use windows::Win32::Foundation::{HANDLE, HWND, POINT};
 use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
 use windows::Win32::System::Threading::{
@@ -14,6 +14,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::PWSTR;
 
 use std::time::{Duration, Instant};
+
+use crate::winutil::OwnedHandle;
 
 #[derive(Clone, Debug)]
 pub struct Target {
@@ -67,11 +69,13 @@ impl NoTarget {
 
 /// Reads the foreground window right now. Call this *before* our popup takes focus.
 pub fn capture_foreground() -> Result<Target, NoTarget> {
+    // SAFETY: no arguments; returns a window handle or null.
     let hwnd = unsafe { GetForegroundWindow() };
     if hwnd.is_invalid() {
         return Err(NoTarget::NothingFocused);
     }
     let pid = window_pid(hwnd);
+    // SAFETY: no arguments.
     if pid == unsafe { GetCurrentProcessId() } {
         return Err(NoTarget::Ourselves);
     }
@@ -117,12 +121,14 @@ impl Target {
     }
 
     pub fn still_exists(&self) -> bool {
+        // SAFETY: IsWindow accepts any value, including a stale handle.
         let alive = unsafe { IsWindow(Some(self.hwnd)) }.as_bool();
         alive && window_pid(self.hwnd) == self.pid
     }
 
     /// True when `hwnd` is the target or a window owned by it (e.g. its dialog).
     pub fn owns_foreground(&self) -> bool {
+        // SAFETY: no arguments; returns a window handle or null.
         let fg = unsafe { GetForegroundWindow() };
         if fg.is_invalid() {
             return false;
@@ -130,6 +136,7 @@ impl Target {
         if fg == self.hwnd {
             return true;
         }
+        // SAFETY: a stale handle only yields null.
         let root = |h: HWND| unsafe { GetAncestor(h, GA_ROOTOWNER) };
         root(fg) == root(self.hwnd)
     }
@@ -144,43 +151,44 @@ pub enum Elevation {
 }
 
 pub fn process_elevation(pid: Option<u32>) -> Elevation {
-    unsafe {
-        let process = match pid {
-            None => GetCurrentProcess(),
-            Some(pid) => match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
-                Ok(h) => h,
-                Err(_) => return Elevation::Unknown,
-            },
-        };
-        let result = token_elevation(process);
-        if pid.is_some() {
-            let _ = CloseHandle(process);
-        }
-        result
-    }
+    let opened;
+    let process = match pid {
+        // SAFETY: no arguments; a pseudo-handle that needs no closing.
+        None => unsafe { GetCurrentProcess() },
+        Some(pid) => match open_process(pid) {
+            Some(h) => {
+                opened = h;
+                opened.0
+            }
+            None => return Elevation::Unknown,
+        },
+    };
+    token_elevation(process)
 }
 
-unsafe fn token_elevation(process: HANDLE) -> Elevation {
-    unsafe {
-        let mut token = HANDLE::default();
-        if OpenProcessToken(process, TOKEN_QUERY, &mut token).is_err() {
-            return Elevation::Unknown;
-        }
-        let mut info = TOKEN_ELEVATION::default();
-        let mut len = 0u32;
-        let ok = GetTokenInformation(
-            token,
-            TokenElevation,
-            Some(&mut info as *mut _ as *mut _),
-            size_of::<TOKEN_ELEVATION>() as u32,
-            &mut len,
-        );
-        let _ = CloseHandle(token);
-        match ok {
-            Ok(()) if info.TokenIsElevated != 0 => Elevation::Elevated,
-            Ok(()) => Elevation::NotElevated,
-            Err(_) => Elevation::Unknown,
-        }
+/// Opens `pid` for reading its name and token. Closed when the value drops.
+fn open_process(pid: u32) -> Option<OwnedHandle> {
+    // SAFETY: plain arguments; on success the handle is owned by the returned value.
+    unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok().map(OwnedHandle)
+}
+
+fn token_elevation(process: HANDLE) -> Elevation {
+    let mut token = HANDLE::default();
+    // SAFETY: `process` is open for the caller; `token` is a local out-parameter.
+    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) }.is_err() {
+        return Elevation::Unknown;
+    }
+    let token = OwnedHandle(token);
+    let mut info = TOKEN_ELEVATION::default();
+    let mut len = 0u32;
+    // SAFETY: `info` is a local of exactly the size passed, as TokenElevation requires.
+    let ok = unsafe {
+        GetTokenInformation(token.0, TokenElevation, Some(&mut info as *mut _ as *mut _), size_of::<TOKEN_ELEVATION>() as u32, &mut len)
+    };
+    match ok {
+        Ok(()) if info.TokenIsElevated != 0 => Elevation::Elevated,
+        Ok(()) => Elevation::NotElevated,
+        Err(_) => Elevation::Unknown,
     }
 }
 
@@ -196,38 +204,33 @@ fn is_shell_surface(class: &str) -> bool {
 
 fn window_pid(hwnd: HWND) -> u32 {
     let mut pid = 0u32;
+    // SAFETY: `pid` is a local out-parameter; a stale handle leaves it 0.
     unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
     pid
 }
 
 fn window_title(hwnd: HWND) -> String {
     let mut buf = [0u16; 256];
+    // SAFETY: Windows writes at most `buf.len()` units into the local buffer.
     let n = unsafe { GetWindowTextW(hwnd, &mut buf) };
     String::from_utf16_lossy(&buf[..n.max(0) as usize])
 }
 
 fn class_name(hwnd: HWND) -> String {
     let mut buf = [0u16; 256];
+    // SAFETY: as above.
     let n = unsafe { GetClassNameW(hwnd, &mut buf) };
     String::from_utf16_lossy(&buf[..n.max(0) as usize])
 }
 
 fn process_exe_name(pid: u32) -> Option<String> {
-    unsafe {
-        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
-        let mut buf = [0u16; 1024];
-        let mut len = buf.len() as u32;
-        let ok = QueryFullProcessImageNameW(
-            process,
-            PROCESS_NAME_WIN32,
-            PWSTR(buf.as_mut_ptr()),
-            &mut len,
-        );
-        let _ = CloseHandle(process);
-        ok.ok()?;
-        let full = String::from_utf16_lossy(&buf[..len as usize]);
-        Some(full.rsplit('\\').next().unwrap_or(&full).to_string())
-    }
+    let process = open_process(pid)?;
+    let mut buf = [0u16; 1024];
+    let mut len = buf.len() as u32;
+    // SAFETY: `len` holds the buffer's size in units; Windows writes at most that many.
+    unsafe { QueryFullProcessImageNameW(process.0, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len) }.ok()?;
+    let full = String::from_utf16_lossy(&buf[..(len as usize).min(buf.len())]);
+    Some(full.rsplit('\\').next().unwrap_or(&full).to_string())
 }
 
 #[cfg(test)]

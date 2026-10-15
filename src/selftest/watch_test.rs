@@ -303,6 +303,7 @@ fn own_rename(r: &mut Report, t: &Session, expect_items: i64) -> bool {
     type_unicode("Renamed by PocketMedia");
     std::thread::sleep(Duration::from_millis(200));
     s.manager_click(r, MHit::Rename);
+    super::manager_test::wait_file_op();
     let ext = crate::library::extension(&selected).to_string();
     let folder = match crate::media_info::kind_for(&selected) {
         Some(crate::sample::MediaKind::Gif) => "GIFs",

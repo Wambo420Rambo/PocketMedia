@@ -9,7 +9,7 @@ use windows::Win32::Graphics::Imaging::{
     IWICBitmapSource, IWICImagingFactory, IWICPalette, WICBitmapDitherTypeNone, WICBitmapInterpolationModeFant,
     WICBitmapPaletteTypeCustom, WICDecodeMetadataCacheOnDemand,
 };
-use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize};
+use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize};
 use windows::core::{HSTRING, Interface};
 
 use crate::pixels::{self, Pixels};
@@ -31,6 +31,13 @@ impl ComThread {
     pub fn init() -> Self {
         // SAFETY: called on a worker thread that does not use COM otherwise; paired with Drop.
         let ok = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
+        Self(ok)
+    }
+
+    /// A single-threaded apartment, for COM objects that need one (IFileOperation).
+    pub fn sta() -> Self {
+        // SAFETY: called on a worker thread that does not use COM otherwise; paired with Drop.
+        let ok = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
         Self(ok)
     }
 }

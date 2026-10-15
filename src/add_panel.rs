@@ -159,7 +159,7 @@ impl AddPanel {
                 }
                 self.add.copied(*index, result);
             }
-            Event::Prepared { .. } | Event::Watched(_) | Event::Rescanned { .. } | Event::Backup { .. } => {}
+            Event::Prepared { .. } | Event::Watched(_) | Event::Rescanned { .. } | Event::Backup { .. } | Event::FileOp { .. } => {}
             Event::Finished { stopped, .. } => {
                 self.job = None;
                 if self.saves.finished() {

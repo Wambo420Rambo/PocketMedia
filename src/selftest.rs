@@ -90,6 +90,8 @@ const CMD_UNKNOWN_ELEVATION: usize = 34;
 const CMD_LOSE_TARGET: usize = 35;
 /// The drawing targets made so far (`d2d::TARGETS_MADE`).
 const CMD_D2D_TARGETS: usize = 36;
+/// The shortcut PocketMedia uses, packed by `pack_shortcut`.
+const CMD_SHORTCUT: usize = 37;
 
 static EXIT_CODE: AtomicI32 = AtomicI32::new(0);
 static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -255,6 +257,7 @@ pub fn on_ui_command(wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         CMD_FOCUS => unsafe { SetForegroundWindow(hwnd(lparam.0)) }.0 as isize,
         CMD_POPUP => popup::hwnd().0 as isize,
         CMD_HOTKEY_OK => crate::hotkey::ok() as isize,
+        CMD_SHORTCUT => pack_shortcut(crate::hotkey::current()),
         CMD_POINT => pack(popup::element_center(El::target(lparam.0))),
         CMD_MANAGER => manager::hwnd().0 as isize,
         CMD_MANAGER_POINT => pack(manager::element_center(manager_test::decode(lparam.0))),
@@ -525,6 +528,80 @@ fn script(r: &mut Report, out: &Path, main: isize) {
     }
     blocked_folder_test(r, out, &exe);
     stop_child(&mut target_proc);
+    exit_test(r, main);
+}
+
+/// The tray menu's Exit, with no backup running, cleans up and ends.
+/// Last in the script, because PocketMedia is gone afterwards; the app waits for
+/// this report before the process ends (`wait_for_report`).
+fn exit_test(r: &mut Report, main: isize) {
+    let shortcut = unpack_shortcut(send(main, CMD_SHORTCUT, 0));
+    let before = (crate::backup::running(), tray_icon_rect(main).is_some(), send(main, CMD_HOTKEY_OK, 0) == 1);
+    let ready = before == (false, true, true);
+    r.check(
+        "before Exit: no backup runs, the tray icon is there and the shortcut is registered",
+        ready,
+        &format!("backup running {}, tray icon {}, shortcut {} registered {}", before.0, before.1, shortcut.label(), before.2),
+    );
+    if !ready {
+        return;
+    }
+    post(main, WM_SELFTEST, CMD_REQUEST_EXIT, 0);
+    // SAFETY: IsWindow accepts any value, including a destroyed window's.
+    let gone = wait_until(5000, || !unsafe { IsWindow(Some(hwnd(main))) }.as_bool());
+    r.check("Exit from the tray menu closes PocketMedia's main window without asking (no backup runs)", gone, "");
+    let icon = tray_icon_rect(main);
+    r.check("…and removes the tray icon", gone && icon.is_none(), &format!("icon place now {icon:?}"));
+    let free = gone && shortcut_free(shortcut);
+    r.check(
+        "…and lets the shortcut go (another program could register it now)",
+        free,
+        &format!("{} registered from the self-test thread: {free}", shortcut.label()),
+    );
+    let ended = wait_until(5000, || LOOP_ENDED.load(Ordering::SeqCst));
+    r.check("…and ends the message loop, so the process exits (test.cmd's wait returns)", ended, "");
+}
+
+/// Whether `s` can be registered right now, for this thread (let go again at once).
+fn shortcut_free(s: crate::hotkey::Shortcut) -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey};
+    const ID: i32 = 0x0BEE;
+    // SAFETY: a thread hotkey with plain integer arguments, let go below.
+    let ok = unsafe { RegisterHotKey(None, ID, crate::hotkey::modifiers(s), s.key as u32) }.is_ok();
+    if ok {
+        // SAFETY: registered just above on this thread.
+        let _ = unsafe { UnregisterHotKey(None, ID) };
+    }
+    ok
+}
+
+fn pack_shortcut(s: crate::hotkey::Shortcut) -> isize {
+    let bit = |on: bool, n: u32| (on as isize) << n;
+    s.key as isize | bit(s.ctrl, 16) | bit(s.alt, 17) | bit(s.shift, 18) | bit(s.win, 19)
+}
+
+fn unpack_shortcut(v: isize) -> crate::hotkey::Shortcut {
+    let on = |n: u32| v >> n & 1 == 1;
+    crate::hotkey::Shortcut { ctrl: on(16), alt: on(17), shift: on(18), win: on(19), key: (v & 0xFFFF) as u16 }
+}
+
+static LOOP_ENDED: AtomicBool = AtomicBool::new(false);
+
+/// The app's message loop has ended (main.rs).
+pub fn message_loop_ended() {
+    LOOP_ENDED.store(true, Ordering::SeqCst);
+}
+
+/// Before the process ends: give a running self-test up to 20 s to write its
+/// last checks (`exit_test` runs after the window is gone).
+pub fn wait_for_report() {
+    if !ENABLED.load(Ordering::SeqCst) {
+        return;
+    }
+    let end = Instant::now() + Duration::from_secs(20);
+    while !FINISHED.load(Ordering::SeqCst) && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// Everything that needs injected input. Returns false if it had to stop.
@@ -1930,6 +2007,19 @@ fn save_capture(r: &mut Report, path: &Path, capture: Result<Capture, String>) {
 
 #[cfg(test)]
 mod tests {
+    /// The Exit check asks the UI thread for the shortcut; it must arrive unchanged.
+    #[test]
+    fn a_shortcut_survives_the_trip_from_the_window_thread() {
+        use super::*;
+        for s in [
+            crate::hotkey::Shortcut::default(),
+            crate::hotkey::Shortcut { ctrl: true, alt: false, shift: true, win: false, key: 0x75 },
+            crate::hotkey::Shortcut { ctrl: true, alt: true, shift: true, win: true, key: 0xFE },
+        ] {
+            assert_eq!(unpack_shortcut(pack_shortcut(s)), s);
+        }
+    }
+
     /// Every self-test command has its own number: a shared one runs the wrong
     /// command (CMD_REQUEST_EXIT once shared 21 with CMD_PREVIEW_DESCRIBE and
     /// ended the self-test early).
@@ -1964,6 +2054,7 @@ mod tests {
             CMD_UNKNOWN_ELEVATION,
             CMD_LOSE_TARGET,
             CMD_D2D_TARGETS,
+            CMD_SHORTCUT,
             preview_test::CMD_PREVIEW_DESCRIBE,
             preview_test::CMD_THUMBS_RESET,
             preview_test::CMD_SET_VIDEO_PREVIEW,

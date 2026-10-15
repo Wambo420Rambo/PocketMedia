@@ -318,15 +318,25 @@ impl ManagerState {
         if wanted == current {
             return;
         }
-        match lib.rename(id, self.rename.text()) {
+        let typed = self.rename.text().to_string();
+        self.renamed(lib, id, &typed);
+    }
+
+    /// Item `id`'s file now has the name `typed` (plus its extension): records it.
+    /// The item may no longer be selected (the file was renamed on a worker thread).
+    pub fn renamed(&mut self, lib: &mut Library, id: u32, typed: &str) {
+        match lib.rename(id, typed) {
             Ok(new_name) => {
-                self.rename.clear();
-                self.rename.insert(name_without_extension(&new_name));
-                self.rename_error = None;
+                if self.selected == Some(id) {
+                    self.rename.clear();
+                    self.rename.insert(name_without_extension(&new_name));
+                    self.rename_error = None;
+                }
                 self.status = Some(format!("Renamed to {new_name}."));
                 self.sync(lib);
             }
-            Err(e) => self.rename_error = Some(e),
+            Err(e) if self.selected == Some(id) => self.rename_error = Some(e),
+            Err(_) => {}
         }
     }
 
@@ -356,17 +366,25 @@ impl ManagerState {
         });
     }
 
-    /// Removes the selected item after confirmation (its file is already in the
-    /// Recycle Bin) and selects the one that took its place.
-    pub fn confirm_recycle(&mut self, lib: &mut Library) {
-        let Some(id) = self.selected.filter(|_| self.confirming) else { return };
-        let index = self.selected_index(lib).unwrap_or(0);
-        let Some(name) = lib.remove(id) else { return };
-        self.confirming = false;
-        let visible = self.visible(lib);
-        self.selected = visible.get(index.min(visible.len().saturating_sub(1))).map(|i| i.id);
+    /// The item Move to Recycle Bin may remove: the selected one, and only after
+    /// the confirmation.
+    pub fn recycle_target(&self) -> Option<u32> {
+        self.selected.filter(|_| self.confirming)
+    }
+
+    /// Item `id`'s file is in the Recycle Bin: removes the item. If it was
+    /// selected, the one that took its place is selected. The item may already
+    /// be gone (the folder watcher saw the file leave first).
+    pub fn recycled(&mut self, lib: &mut Library, id: u32, name: &str) {
+        let index = self.selected.filter(|s| *s == id).map(|_| self.selected_index(lib).unwrap_or(0));
+        lib.remove(id);
+        if let Some(index) = index {
+            self.confirming = false;
+            let visible = self.visible(lib);
+            self.selected = visible.get(index.min(visible.len().saturating_sub(1))).map(|i| i.id);
+            self.focus = if self.selected.is_some() { MFocus::Gallery } else { MFocus::Search };
+        }
         self.status = Some(format!("{name} was moved to the Recycle Bin."));
-        self.focus = if self.selected.is_some() { MFocus::Gallery } else { MFocus::Search };
         self.sync(lib);
     }
 
@@ -533,15 +551,16 @@ mod tests {
     fn recycle_needs_confirmation_and_selects_the_next_item() {
         let (mut m, mut lib) = setup();
         m.select(2, &lib);
-        m.confirm_recycle(&mut lib);
-        assert_eq!(lib.items.len(), 8, "nothing happens without confirmation");
+        assert_eq!(m.recycle_target(), None, "nothing happens without confirmation");
         m.ask_recycle();
         assert!(m.confirming);
         m.cancel_recycle();
         assert!(!m.confirming);
         assert_eq!(lib.items.len(), 8);
         m.ask_recycle();
-        m.confirm_recycle(&mut lib);
+        assert_eq!(m.recycle_target(), Some(2));
+        m.recycled(&mut lib, 2, "Square.png");
+        assert_eq!(m.status.as_deref(), Some("Square.png was moved to the Recycle Bin."));
         assert_eq!(lib.items.len(), 7);
         assert!(lib.get(2).is_none());
         assert_eq!(m.selected, Some(3), "Race clip took Square's place");
@@ -576,8 +595,33 @@ mod tests {
         m.set_filter(TypeFilter::Video, &lib);
         m.select(6, &lib);
         m.ask_recycle();
-        m.confirm_recycle(&mut lib);
+        m.recycled(&mut lib, 6, "Clip.mp4");
         assert_eq!(m.selected, Some(3));
+    }
+
+    /// Renames and removals finish on a worker thread, after the user
+    /// may have selected another item. The result goes to the right item, and the
+    /// new selection and its name field stay as they are.
+    #[test]
+    fn a_change_that_finishes_later_goes_to_its_own_item() {
+        let (mut m, mut lib) = setup();
+        m.select(2, &lib);
+        set_rename(&mut m, &lib, "Squared");
+        m.select(3, &lib);
+        m.renamed(&mut lib, 2, "Squared");
+        assert_eq!(lib.get(2).map(|i| i.name.as_str()), Some("Squared.png"));
+        assert_eq!(m.selected, Some(3));
+        assert_eq!(m.rename.text(), "Race clip", "the field shows the selected item");
+        assert_eq!(m.status.as_deref(), Some("Renamed to Squared.png."));
+
+        m.recycled(&mut lib, 2, "Squared.png");
+        assert!(lib.get(2).is_none());
+        assert_eq!(m.selected, Some(3), "the selection stays");
+        assert_eq!(m.rename.text(), "Race clip");
+
+        // The folder watcher may have removed the record first: still fine.
+        m.recycled(&mut lib, 2, "Squared.png");
+        assert_eq!(lib.items.len(), 7);
     }
 
     #[test]

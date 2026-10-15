@@ -9,7 +9,7 @@ use windows::Win32::Graphics::Gdi::{
     ClientToScreen, GetMonitorInfoW, GetUpdateRect, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
     ScreenToClient,
 };
-use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
+use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData};
 use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
 use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
@@ -217,31 +217,53 @@ fn text_limit(bytes: usize) -> usize {
     (bytes / 2).min(4096)
 }
 
+/// The clipboard, opened by this thread, with one owner: dropping it closes it.
+pub struct OpenClipboard(());
+
+impl OpenClipboard {
+    /// Another app can hold the clipboard open for a moment; tries `attempts`
+    /// times, 15 ms apart.
+    pub fn open(owner: HWND, attempts: u32) -> Result<Self, String> {
+        for attempt in 0..attempts {
+            // SAFETY: `owner` is our own window; closed by Drop only after success.
+            if unsafe { windows::Win32::System::DataExchange::OpenClipboard(Some(owner)) }.is_ok() {
+                return Ok(Self(()));
+            }
+            if attempt + 1 < attempts {
+                std::thread::sleep(std::time::Duration::from_millis(15));
+            }
+        }
+        Err("The clipboard is in use by another app. Try again.".into())
+    }
+}
+
+impl Drop for OpenClipboard {
+    fn drop(&mut self) {
+        // SAFETY: this value exists only after a successful open, so it is closed once.
+        let _ = unsafe { CloseClipboard() };
+    }
+}
+
 /// Plain text from the clipboard (for Ctrl+V in text boxes), capped at 4096 characters.
 pub fn clipboard_text(owner: HWND) -> Option<String> {
-    // SAFETY: the clipboard is opened and closed in this block; the memory is
-    // read only while locked and copied out before unlocking.
-    unsafe {
-        OpenClipboard(Some(owner)).ok()?;
-        let text = GetClipboardData(CF_UNICODETEXT.0 as u32).ok().and_then(|h| {
-            let mem = HGLOBAL(h.0);
-            let ptr = GlobalLock(mem) as *const u16;
-            if ptr.is_null() {
-                return None;
-            }
-            // Never past the block, even when the other app left out the NUL.
-            let max = text_limit(GlobalSize(mem));
-            let mut len = 0;
-            while len < max && *ptr.add(len) != 0 {
-                len += 1;
-            }
-            let s = String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len));
-            let _ = GlobalUnlock(mem);
-            Some(s)
-        });
-        let _ = CloseClipboard();
-        text
+    let _open = OpenClipboard::open(owner, 1).ok()?;
+    // SAFETY: the clipboard is open (above); the handle is checked by Windows.
+    let mem = HGLOBAL(unsafe { GetClipboardData(CF_UNICODETEXT.0 as u32) }.ok()?.0);
+    // SAFETY: `mem` is the clipboard's text block; it stays valid while the clipboard is open.
+    let ptr = unsafe { GlobalLock(mem) } as *const u16;
+    if ptr.is_null() {
+        return None;
     }
+    // Never past the block, even when the other app left out the NUL.
+    // SAFETY: as above.
+    let max = text_limit(unsafe { GlobalSize(mem) });
+    // SAFETY: `ptr` points at a locked block of at least `max` units (text_limit).
+    let units = unsafe { std::slice::from_raw_parts(ptr, max) };
+    let len = units.iter().position(|&u| u == 0).unwrap_or(max);
+    let text = String::from_utf16_lossy(&units[..len]);
+    // SAFETY: unlocks the lock taken above; `units` is not used after this.
+    let _ = unsafe { GlobalUnlock(mem) };
+    Some(text)
 }
 
 /// Opens a folder in File Explorer.

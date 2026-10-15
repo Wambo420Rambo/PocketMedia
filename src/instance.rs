@@ -16,7 +16,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, WPARAM};
 use windows::Win32::System::Threading::{
     CreateMutexW, OpenMutexW, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
     SYNCHRONIZATION_SYNCHRONIZE,
@@ -104,15 +104,8 @@ fn create(name: &str) -> Result<(OwnedHandle, bool), ()> {
 /// True when a process holds the named mutex (it exists).
 fn exists(name: &str) -> bool {
     let name = HSTRING::from(name);
-    // SAFETY: a valid name; the handle, if any, is closed right away.
-    match unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, &name) } {
-        Ok(h) => {
-            // SAFETY: just opened, closed once.
-            let _ = unsafe { CloseHandle(h) };
-            true
-        }
-        Err(_) => false,
-    }
+    // SAFETY: a valid name; the handle, if any, is owned (and closed) by OwnedHandle.
+    unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, &name) }.map(OwnedHandle).is_ok()
 }
 
 pub fn claim() -> Claim {

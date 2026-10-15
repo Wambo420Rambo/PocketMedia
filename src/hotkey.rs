@@ -3,7 +3,7 @@
 //! Windows. Win + Alt + . by default; check that registration really
 //! succeeded, say so plainly if not, and let the user choose another.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use serde::{Deserialize, Serialize};
 
@@ -149,8 +149,47 @@ const TRIAL_ID: i32 = 2;
 thread_local! {
     static CURRENT: Cell<Shortcut> = Cell::new(Shortcut::default());
     static MAIN: Cell<HWND> = Cell::new(HWND::default());
-    static REGISTERED: Cell<bool> = const { Cell::new(false) };
+    /// The shortcut as registered with Windows; dropping it lets the shortcut go.
+    static REGISTERED: RefCell<Option<Registration>> = const { RefCell::new(None) };
     static PAUSED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// A shortcut registered on a window, with one owner: dropping it unregisters it.
+struct Registration {
+    main: HWND,
+    id: i32,
+}
+
+impl Registration {
+    fn new(main: HWND, id: i32, s: Shortcut) -> Result<Self, String> {
+        // SAFETY: `main` is our own window; plain integer arguments.
+        unsafe { RegisterHotKey(Some(main), id, modifiers(s), s.key as u32) }.map_err(|e| reason(&e))?;
+        Ok(Self { main, id })
+    }
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        // SAFETY: this registration was made by `new` on this thread and is let go once.
+        let _ = unsafe { UnregisterHotKey(Some(self.main), self.id) };
+    }
+}
+
+fn is_registered() -> bool {
+    REGISTERED.with(|r| r.borrow().is_some())
+}
+
+/// Registers `s` as the shortcut, or lets the current one go when it cannot be.
+fn register(main: HWND, s: Shortcut) -> Result<(), String> {
+    let reg = Registration::new(main, ID, s);
+    let result = reg.as_ref().map(|_| ()).map_err(Clone::clone);
+    REGISTERED.with(|r| *r.borrow_mut() = reg.ok());
+    result
+}
+
+/// Lets the shortcut go. True if it was registered.
+fn unregister() -> bool {
+    REGISTERED.with(|r| r.borrow_mut().take()).is_some()
 }
 
 /// The shortcut PocketMedia uses (registered or not).
@@ -160,10 +199,10 @@ pub fn current() -> Shortcut {
 
 /// True while the shortcut is registered (or only paused by the chooser).
 pub fn ok() -> bool {
-    REGISTERED.with(|r| r.get()) || PAUSED.with(|p| p.get())
+    is_registered() || PAUSED.with(|p| p.get())
 }
 
-fn modifiers(s: Shortcut) -> HOT_KEY_MODIFIERS {
+pub fn modifiers(s: Shortcut) -> HOT_KEY_MODIFIERS {
     let mut m = MOD_NOREPEAT.0;
     for (on, flag) in [(s.ctrl, MOD_CONTROL), (s.alt, MOD_ALT), (s.shift, MOD_SHIFT), (s.win, MOD_WIN)] {
         if on {
@@ -181,23 +220,14 @@ fn reason(e: &windows::core::Error) -> String {
     }
 }
 
-fn register_raw(main: HWND, id: i32, s: Shortcut) -> Result<(), String> {
-    // SAFETY: `main` is our own window; plain integer arguments.
-    unsafe { RegisterHotKey(Some(main), id, modifiers(s), s.key as u32) }.map_err(|e| reason(&e))
-}
-
-fn unregister_raw(main: HWND, id: i32) {
-    // SAFETY: as above; unregistering an id that is not registered only fails.
-    let _ = unsafe { UnregisterHotKey(Some(main), id) };
-}
-
 /// Registers `s` as PocketMedia's shortcut on `main` (start-up).
 pub fn start(main: HWND, s: Shortcut) -> Result<(), String> {
     MAIN.with(|m| m.set(main));
     CURRENT.with(|c| c.set(s));
-    let result = s.problem().map_or_else(|| register_raw(main, ID, s), |p| Err(p.to_string()));
-    REGISTERED.with(|r| r.set(result.is_ok()));
-    result
+    match s.problem() {
+        Some(p) => Err(p.to_string()),
+        None => register(main, s),
+    }
 }
 
 /// Switches to `new`. On failure the old shortcut is registered again and stays.
@@ -206,20 +236,16 @@ pub fn apply(new: Shortcut) -> Result<(), String> {
     if let Some(p) = new.problem() {
         return Err(p.to_string());
     }
-    let was = REGISTERED.with(|r| r.replace(false));
-    if was {
-        unregister_raw(main, ID);
-    }
-    match register_raw(main, ID, new) {
+    let was = unregister();
+    match register(main, new) {
         Ok(()) => {
             CURRENT.with(|c| c.set(new));
-            REGISTERED.with(|r| r.set(true));
             PAUSED.with(|p| p.set(false));
             Ok(())
         }
         Err(e) => {
             if was && !PAUSED.with(|p| p.get()) {
-                REGISTERED.with(|r| r.set(register_raw(main, ID, current()).is_ok()));
+                let _ = register(main, current());
             }
             Err(e)
         }
@@ -233,9 +259,8 @@ pub fn is_free(s: Shortcut) -> Result<(), String> {
         return Err(p.to_string());
     }
     let main = MAIN.with(|m| m.get());
-    register_raw(main, TRIAL_ID, s)?;
-    unregister_raw(main, TRIAL_ID);
-    Ok(())
+    // Registered and let go again at once (dropped at the end of this statement).
+    Registration::new(main, TRIAL_ID, s).map(drop)
 }
 
 /// While the shortcut chooser is open the shortcut is let go, so pressing it
@@ -246,22 +271,18 @@ pub fn set_paused(paused: bool) {
         return;
     }
     if paused {
-        if REGISTERED.with(|r| r.replace(false)) {
-            unregister_raw(main, ID);
+        if unregister() {
             PAUSED.with(|p| p.set(true));
         }
     } else {
         PAUSED.with(|p| p.set(false));
-        REGISTERED.with(|r| r.set(register_raw(main, ID, current()).is_ok()));
+        let _ = register(main, current());
     }
 }
 
 /// Exit: let the shortcut go.
 pub fn stop() {
-    let main = MAIN.with(|m| m.get());
-    if REGISTERED.with(|r| r.replace(false)) {
-        unregister_raw(main, ID);
-    }
+    unregister();
     PAUSED.with(|p| p.set(false));
 }
 
@@ -336,6 +357,18 @@ mod tests {
         assert_eq!(h.keys(), ["Ctrl", "Shift"]);
         assert_eq!(h.with(0x4B).label(), "Ctrl + Shift + K");
         assert!(!Held::default().any());
+    }
+
+    /// A registration lets its shortcut go when dropped. Windows only
+    /// (a thread hotkey: no window needed).
+    #[cfg(windows)]
+    #[test]
+    fn dropping_a_registration_lets_the_shortcut_go() {
+        let s = sc(true, true, true, false, 0x87); // Ctrl + Alt + Shift + F24: nobody uses it
+        let first = Registration::new(HWND::default(), 0x0B01, s).expect("Ctrl + Alt + Shift + F24 is free");
+        assert!(Registration::new(HWND::default(), 0x0B02, s).is_err(), "taken while the first is held");
+        drop(first);
+        assert!(Registration::new(HWND::default(), 0x0B03, s).is_ok(), "free again after the drop");
     }
 
     #[test]

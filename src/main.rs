@@ -236,20 +236,22 @@ fn main() {
     {
         message_box(&text, "PocketMedia - library", MB_ICONINFORMATION);
     }
-    unsafe {
-        // Ignore failure: it only fails if awareness was already set (e.g. by a manifest).
-        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        if let Err(e) = OleInitialize(None) {
-            fatal(&format!("Could not initialise OLE (needed for drag and drop): {e}"));
-            return;
-        }
+    // Ignore failure: it only fails if awareness was already set (e.g. by a manifest).
+    // SAFETY: called once at startup, before any window exists.
+    let _ = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+    // SAFETY: once, on the thread that will own every window; paired with OleUninitialize below.
+    if let Err(e) = unsafe { OleInitialize(None) } {
+        fatal(&format!("Could not initialise OLE (needed for drag and drop): {e}"));
+        return;
     }
 
     if let Err(e) = run(&mode) {
         fatal(&e);
     }
 
+    // SAFETY: pairs the OleInitialize above, on the same thread, after every window is gone.
     unsafe { OleUninitialize() };
+    selftest::wait_for_report();
     std::process::exit(selftest::exit_code());
 }
 
@@ -304,19 +306,68 @@ fn check_library(paths: paths::Paths, report: &std::path::Path) -> i32 {
 
 fn run(mode: &Mode) -> Result<(), String> {
     app(|a| a.quiet.set(matches!(mode, Mode::SelfTest(_))));
+    let main = create_main_window()?;
+    app(|a| {
+        a.main.set(main);
+        // SAFETY: registering a message name has no preconditions.
+        a.taskbar_created.set(unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) });
+        a.activate.set(instance::activate_message());
+    });
+    jobs::init(main);
+    // Lock and unlock reach the main window: GIFs stop while locked.
+    match visibility::SessionNotes::register(main) {
+        Ok(n) => SESSION_NOTES.with(|s| *s.borrow_mut() = Some(n)),
+        Err(e) => selftest::note(&e),
+    }
+    if let Some(p) = paths::get()
+        && let Err(e) = watch::start(&p.media, watch::BUFFER)
+    {
+        selftest::note(&e);
+    }
+
+    popup::create(module())?;
+    tray::add(main);
+
+    let shortcut = store::settings().shortcut;
+    if let Err(reason) = hotkey::start(main, shortcut) {
+        tray::set_tip(main, "PocketMedia - shortcut unavailable");
+        report_hotkey_failure(&shortcut.label(), &reason);
+    }
+
+    match mode {
+        Mode::SelfTest(out) => selftest::start(out.clone(), main),
+        Mode::Normal { exit_after_start: true, .. } => exit(),
+        Mode::Normal { backup: true, .. } => manager::back_up_from_uninstaller(),
+        Mode::Normal { autostart: false, .. } => popup::open(target::capture_foreground()),
+        _ => {}
+    }
+    message_loop();
+    selftest::message_loop_ended();
+    Ok(())
+}
+
+/// This program's module handle.
+fn module() -> windows::Win32::Foundation::HINSTANCE {
+    // SAFETY: None asks for the running exe's own module, which always exists.
+    unsafe { GetModuleHandleW(None) }.map(Into::into).unwrap_or_default()
+}
+
+/// The hidden owner window: receives tray, hotkey and timer messages. Never shown.
+fn create_main_window() -> Result<HWND, String> {
+    let instance = module();
+    let class = WNDCLASSW {
+        lpfnWndProc: Some(main_proc),
+        hInstance: instance,
+        lpszClassName: instance::main_class(),
+        ..Default::default()
+    };
+    // SAFETY: `class` is a local whose strings are static; Windows copies it.
+    if unsafe { RegisterClassW(&class) } == 0 {
+        return Err("Could not register the main window class.".into());
+    }
+    // SAFETY: the class was registered above; all other arguments are plain values.
     unsafe {
-        let instance = GetModuleHandleW(None).map_err(|e| e.to_string())?;
-        let class = WNDCLASSW {
-            lpfnWndProc: Some(main_proc),
-            hInstance: instance.into(),
-            lpszClassName: instance::main_class(),
-            ..Default::default()
-        };
-        if RegisterClassW(&class) == 0 {
-            return Err("Could not register the main window class.".into());
-        }
-        // Hidden owner window: receives tray, hotkey and timer messages. Never shown.
-        let main = CreateWindowExW(
+        CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             instance::main_class(),
             w!("PocketMedia"),
@@ -327,46 +378,11 @@ fn run(mode: &Mode) -> Result<(), String> {
             0,
             None,
             None,
-            Some(instance.into()),
+            Some(instance),
             None,
         )
-        .map_err(|e| format!("Could not create the main window: {e}"))?;
-        app(|a| {
-            a.main.set(main);
-            a.taskbar_created.set(RegisterWindowMessageW(w!("TaskbarCreated")));
-            a.activate.set(instance::activate_message());
-        });
-        jobs::init(main);
-        // Lock and unlock reach the main window: GIFs stop while locked.
-        match visibility::SessionNotes::register(main) {
-            Ok(n) => SESSION_NOTES.with(|s| *s.borrow_mut() = Some(n)),
-            Err(e) => selftest::note(&e),
-        }
-        if let Some(p) = paths::get()
-            && let Err(e) = watch::start(&p.media, watch::BUFFER)
-        {
-            selftest::note(&e);
-        }
-
-        popup::create(instance.into())?;
-        tray::add(main);
-
-        let shortcut = store::settings().shortcut;
-        if let Err(reason) = hotkey::start(main, shortcut) {
-            tray::set_tip(main, "PocketMedia - shortcut unavailable");
-            report_hotkey_failure(&shortcut.label(), &reason);
-        }
-
-        match mode {
-            Mode::SelfTest(out) => selftest::start(out.clone(), main),
-            Mode::Normal { exit_after_start: true, .. } => exit(),
-            Mode::Normal { backup: true, .. } => manager::back_up_from_uninstaller(),
-            Mode::Normal { autostart: false, .. } => popup::open(target::capture_foreground()),
-            _ => {}
-        }
-        message_loop();
     }
-    Ok(())
+    .map_err(|e| format!("Could not create the main window: {e}"))
 }
 
 fn report_hotkey_failure(label: &str, reason: &str) {
@@ -383,14 +399,16 @@ fn report_hotkey_failure(label: &str, reason: &str) {
     message_box(&text, "PocketMedia - shortcut not available", MB_ICONWARNING);
 }
 
-unsafe fn message_loop() {
-    unsafe {
-        let mut msg = MSG::default();
-        loop {
-            let r = GetMessageW(&mut msg, None, 0, 0).0;
-            if r == 0 || r == -1 {
-                break;
-            }
+fn message_loop() {
+    let mut msg = MSG::default();
+    loop {
+        // SAFETY: `msg` is a local the call fills in.
+        let r = unsafe { GetMessageW(&mut msg, None, 0, 0) }.0;
+        if r == 0 || r == -1 {
+            break;
+        }
+        // SAFETY: `msg` was just filled in by GetMessageW on this thread.
+        unsafe {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -398,107 +416,108 @@ unsafe fn message_loop() {
 }
 
 extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    unsafe {
-        match msg {
-            WM_HOTKEY if wparam.0 as i32 == hotkey::ID => {
-                popup::toggle_from_hotkey();
-                LRESULT(0)
-            }
-            WM_TRAY => {
-                let event = (lparam.0 as u32) & 0xFFFF;
-                if event != WM_MOUSEMOVE {
-                    selftest::note(&format!("tray event {event:#06x}"));
-                }
-                if event == WM_LBUTTONUP {
-                    // A left click on the icon opens the quick popup.
-                    // The taskbar has focus now, so there is no app to paste into.
-                    popup::open(target::capture_foreground());
-                }
-                if event == WM_RBUTTONUP || event == WM_CONTEXTMENU {
-                    // Capture before the menu takes focus. From the tray this is
-                    // normally the taskbar, which `capture_foreground` rejects.
-                    let captured = target::capture_foreground();
-                    match tray::show_menu(hwnd) {
-                        tray::MenuChoice::QuickPopup => popup::open(captured),
-                        tray::MenuChoice::Manager => manager::show(),
-                        tray::MenuChoice::Settings => manager::show_settings(),
-                        tray::MenuChoice::Exit => request_exit(),
-                        tray::MenuChoice::None => {}
-                    }
-                }
-                LRESULT(0)
-            }
-            WM_SELFTEST => selftest::on_ui_command(wparam, lparam),
-            jobs::WM_JOB => {
-                for ev in jobs::take() {
-                    if watch::on_event(&ev) || backup::on_event(&ev) {
-                        continue;
-                    }
-                    if !paste::on_prepared(&ev) && !popup::on_job(&ev) {
-                        manager::on_job(&ev);
-                    }
-                }
-                LRESULT(0)
-            }
-            jobs::WM_PREVIEW => {
-                thumbs::on_wake();
-                preview::on_wake();
-                LRESULT(0)
-            }
-            WM_TIMER if wparam.0 == TIMER_PASTE => {
-                paste::tick();
-                LRESULT(0)
-            }
-            // Signing out or shutting down while a backup runs: Windows asks first,
-            // showing backup::SHUTDOWN_REASON (set when the backup started).
-            WM_QUERYENDSESSION => LRESULT(backup::may_end_session()),
-            WM_ENDSESSION => {
-                if wparam.0 != 0 {
-                    // The session ends anyway: stop the backup and let it clean up.
-                    backup::shutdown();
-                }
-                LRESULT(0)
-            }
-            WM_WTSSESSION_CHANGE if matches!(wparam.0 as u32, WTS_SESSION_LOCK | WTS_SESSION_UNLOCK) => {
-                let locked = wparam.0 as u32 == WTS_SESSION_LOCK;
-                selftest::note(if locked { "session locked: GIFs paused" } else { "session unlocked: GIFs resume" });
-                preview::set_locked(locked);
-                if !locked {
-                    winutil::invalidate(popup::hwnd());
-                    winutil::invalidate(manager::hwnd());
-                }
-                LRESULT(0)
-            }
-            WM_DESTROY => {
-                SESSION_NOTES.with(|s| s.borrow_mut().take());
-                hotkey::stop();
-                let _ = KillTimer(Some(hwnd), TIMER_PASTE);
-                watch::stop();
-                backup::shutdown();
-                preview::shutdown();
-                thumbs::shutdown();
-                tray::remove(hwnd);
-                manager::destroy();
-                popup::destroy();
-                PostQuitMessage(0);
-                LRESULT(0)
-            }
-            m if m != 0 && m == app(|a| a.activate.get()) => {
-                // Another launch of PocketMedia: do what it asked, here.
-                if wparam.0 == instance::BACK_UP {
-                    manager::back_up_from_uninstaller();
-                } else {
-                    popup::open(target::capture_foreground());
-                }
-                LRESULT(0)
-            }
-            m if m != 0 && m == app(|a| a.taskbar_created.get()) => {
-                // Explorer restarted: the tray icon is gone and must be re-added.
-                tray::add(hwnd);
-                LRESULT(0)
-            }
-            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    match msg {
+        WM_HOTKEY if wparam.0 as i32 == hotkey::ID => {
+            popup::toggle_from_hotkey();
+            LRESULT(0)
         }
+        WM_TRAY => {
+            let event = (lparam.0 as u32) & 0xFFFF;
+            if event != WM_MOUSEMOVE {
+                selftest::note(&format!("tray event {event:#06x}"));
+            }
+            if event == WM_LBUTTONUP {
+                // A left click on the icon opens the quick popup.
+                // The taskbar has focus now, so there is no app to paste into.
+                popup::open(target::capture_foreground());
+            }
+            if event == WM_RBUTTONUP || event == WM_CONTEXTMENU {
+                // Capture before the menu takes focus. From the tray this is
+                // normally the taskbar, which `capture_foreground` rejects.
+                let captured = target::capture_foreground();
+                match tray::show_menu(hwnd) {
+                    tray::MenuChoice::QuickPopup => popup::open(captured),
+                    tray::MenuChoice::Manager => manager::show(),
+                    tray::MenuChoice::Settings => manager::show_settings(),
+                    tray::MenuChoice::Exit => request_exit(),
+                    tray::MenuChoice::None => {}
+                }
+            }
+            LRESULT(0)
+        }
+        WM_SELFTEST => selftest::on_ui_command(wparam, lparam),
+        jobs::WM_JOB => {
+            for ev in jobs::take() {
+                if watch::on_event(&ev) || backup::on_event(&ev) {
+                    continue;
+                }
+                if !paste::on_prepared(&ev) && !popup::on_job(&ev) {
+                    manager::on_job(ev);
+                }
+            }
+            LRESULT(0)
+        }
+        jobs::WM_PREVIEW => {
+            thumbs::on_wake();
+            preview::on_wake();
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == TIMER_PASTE => {
+            paste::tick();
+            LRESULT(0)
+        }
+        // Signing out or shutting down while a backup runs: Windows asks first,
+        // showing backup::SHUTDOWN_REASON (set when the backup started).
+        WM_QUERYENDSESSION => LRESULT(backup::may_end_session()),
+        WM_ENDSESSION => {
+            if wparam.0 != 0 {
+                // The session ends anyway: stop the backup and let it clean up.
+                backup::shutdown();
+            }
+            LRESULT(0)
+        }
+        WM_WTSSESSION_CHANGE if matches!(wparam.0 as u32, WTS_SESSION_LOCK | WTS_SESSION_UNLOCK) => {
+            let locked = wparam.0 as u32 == WTS_SESSION_LOCK;
+            selftest::note(if locked { "session locked: GIFs paused" } else { "session unlocked: GIFs resume" });
+            preview::set_locked(locked);
+            if !locked {
+                winutil::invalidate(popup::hwnd());
+                winutil::invalidate(manager::hwnd());
+            }
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            SESSION_NOTES.with(|s| s.borrow_mut().take());
+            hotkey::stop();
+            // SAFETY: our own window and timer id; a timer that is not running only fails.
+            let _ = unsafe { KillTimer(Some(hwnd), TIMER_PASTE) };
+            watch::stop();
+            backup::shutdown();
+            preview::shutdown();
+            thumbs::shutdown();
+            tray::remove();
+            manager::destroy();
+            popup::destroy();
+            // SAFETY: no preconditions; ends this thread's message loop.
+            unsafe { PostQuitMessage(0) };
+            LRESULT(0)
+        }
+        m if m != 0 && m == app(|a| a.activate.get()) => {
+            // Another launch of PocketMedia: do what it asked, here.
+            if wparam.0 == instance::BACK_UP {
+                manager::back_up_from_uninstaller();
+            } else {
+                popup::open(target::capture_foreground());
+            }
+            LRESULT(0)
+        }
+        m if m != 0 && m == app(|a| a.taskbar_created.get()) => {
+            // Explorer restarted: the tray icon is gone and must be re-added.
+            tray::add(hwnd);
+            LRESULT(0)
+        }
+        // SAFETY: passes the window procedure's own arguments on unchanged.
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
 }
 
@@ -529,22 +548,15 @@ fn ask_yes_no(text: &str, caption: &str) -> bool {
 
 pub fn exit() {
     let main = app(|a| a.main.get());
-    unsafe {
-        let _ = DestroyWindow(main);
-    }
+    // SAFETY: our own main window, on its own thread; a destroyed window only fails.
+    let _ = unsafe { DestroyWindow(main) };
 }
 
 pub fn message_box(text: &str, caption: &str, icon: MESSAGEBOX_STYLE) {
     let text = transfer::to_wide(text);
     let caption = transfer::to_wide(caption);
-    unsafe {
-        MessageBoxW(
-            None,
-            PCWSTR(text.as_ptr()),
-            PCWSTR(caption.as_ptr()),
-            icon | MB_OK | MB_SETFOREGROUND,
-        );
-    }
+    // SAFETY: both strings are null-terminated UTF-16 that outlive the call.
+    unsafe { MessageBoxW(None, PCWSTR(text.as_ptr()), PCWSTR(caption.as_ptr()), icon | MB_OK | MB_SETFOREGROUND) };
 }
 
 fn fatal(text: &str) {

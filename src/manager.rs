@@ -6,6 +6,7 @@
 //! Created the first time it is shown. × hides it; the tray and shortcut stay.
 
 use std::cell::{Cell, RefCell};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{ScreenToClient, ValidateRect};
@@ -388,6 +389,15 @@ pub fn refresh() {
 }
 
 pub fn destroy() {
+    // Exit during a rename or removal: let it finish (bounded) and record it, so
+    // the library file follows the Media folder.
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while file_op_running() && std::time::Instant::now() < end {
+        for ev in crate::jobs::take_file_ops() {
+            on_job(ev);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     VIEW.with(|v| v.borrow_mut().take());
     let h = WINDOW.with(|c| c.replace(HWND::default()));
     if !h.is_invalid() {
@@ -1297,7 +1307,15 @@ fn run(effect: Effect) {
 }
 
 /// A worker result. Returns true if the Manager's Add media panel owned it.
-pub fn on_job(ev: &crate::jobs::Event) -> bool {
+pub fn on_job(ev: crate::jobs::Event) -> bool {
+    let ev = match ev {
+        crate::jobs::Event::FileOp { done, .. } => {
+            finish_file_op(done);
+            return true;
+        }
+        other => other,
+    };
+    let ev = &ev;
     let effect = with_view(|v| {
         if !v.add.as_ref().is_some_and(|a| a.owns(ev)) {
             return None;
@@ -1319,6 +1337,7 @@ pub fn on_job(ev: &crate::jobs::Event) -> bool {
 pub fn start_backup(folder: Option<std::path::PathBuf>) {
     let note = match folder {
         None => "Backup cancelled: no folder was chosen.".to_string(),
+        Some(_) if file_op_running() => FILE_OP_BUSY.to_string(),
         Some(dest) => match crate::backup::start(dest) {
             Ok(()) => {
                 with_view(|v| {
@@ -1338,59 +1357,144 @@ fn media_path(rel: &str) -> Option<std::path::PathBuf> {
     crate::paths::get().and_then(|p| crate::import::media_file(&p.media, rel))
 }
 
-/// Rename: the file first, then the record. A failure changes nothing.
+/// A rename or a move to the Recycle Bin, done on a worker thread
+/// (disk work never blocks the message loop). One at a time.
+#[derive(Debug)]
+pub enum FileDone {
+    Renamed { id: u32, typed: String, result: Result<(), std::io::Error> },
+    Recycled { id: u32, name: String, result: Result<(), crate::fileops::RecycleError> },
+}
+
+/// True from the moment a rename or removal starts until its result is recorded.
+static FILE_OP: AtomicBool = AtomicBool::new(false);
+/// Self-test: the next rename or removal waits this long before touching the disk.
+static SLOW_NEXT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a rename or removal is still running (any thread).
+pub fn file_op_running() -> bool {
+    FILE_OP.load(Ordering::SeqCst)
+}
+
+/// Self-test: makes the next rename or removal take at least `ms` longer.
+pub fn slow_next_file_op(ms: u64) {
+    SLOW_NEXT_MS.store(ms, Ordering::SeqCst);
+}
+
+const FILE_OP_BUSY: &str = "Still working on the last change. Try again in a moment.";
+
+/// Runs `work` on a worker thread and records its result through `on_job`.
+fn start_file_op(s: &mut ManagerState, working: String, work: impl FnOnce() -> FileDone + Send + 'static) {
+    FILE_OP.store(true, Ordering::SeqCst);
+    let started = crate::jobs::spawn("file", move |job, _cancel| {
+        let slow = SLOW_NEXT_MS.swap(0, Ordering::SeqCst);
+        if slow > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(slow));
+        }
+        crate::jobs::post(crate::jobs::Event::FileOp { job, done: work() });
+    });
+    match started {
+        Ok(_) => s.status = Some(working),
+        Err(e) => {
+            FILE_OP.store(false, Ordering::SeqCst);
+            s.status = Some(format!("Could not start: {e}."));
+        }
+    }
+}
+
+/// Rename: the file first (on a worker thread), then the record. A failure changes nothing.
 fn rename_selected(s: &mut ManagerState) {
     if crate::backup::running() {
         s.status = Some(crate::backup::BUSY.into());
+        return;
+    }
+    if file_op_running() {
+        s.status = Some(FILE_OP_BUSY.into());
         return;
     }
     let plan = library::with(|lib| {
         let id = s.selected.filter(|_| s.can_rename())?;
         let item = lib.get(id)?;
         let new_rel = lib.renamed_path(id, s.rename.text().trim_start())?;
-        (item.path != new_rel).then(|| (item.path.clone(), new_rel))
+        Some((id, item.path.clone(), new_rel))
     });
-    if let Some((old, new)) = plan {
-        let (Some(from), Some(to)) = (media_path(&old), media_path(&new)) else { return };
-        if let Some(id) = s.selected {
-            crate::preview::release_item(id);
-        }
-        if let Err(e) = crate::fileops::move_no_replace(&from, &to) {
-            s.status = Some(if e.kind() == std::io::ErrorKind::AlreadyExists {
-                "A file with that name is already in the Media folder. Choose another name.".into()
-            } else {
-                format!("Could not rename the file: {e}")
-            });
-            return;
-        }
+    let Some((id, old, new)) = plan else { return };
+    if old == new {
+        // Nothing changes on disk (for example only a leading space was typed).
+        library::with_mut(|lib| s.apply_rename(lib));
+        return;
     }
-    library::with_mut(|lib| s.apply_rename(lib));
-    if let Err(e) = library::persist() {
-        s.status = Some(format!("Renamed, but {e}."));
-    }
+    let (Some(from), Some(to)) = (media_path(&old), media_path(&new)) else { return };
+    crate::preview::release_item(id);
+    let typed = s.rename.text().to_string();
+    let name = new.rsplit('/').next().unwrap_or(&new).to_string();
+    start_file_op(s, format!("Renaming to {name}…"), move || FileDone::Renamed {
+        id,
+        typed,
+        result: crate::fileops::move_no_replace(&from, &to),
+    });
 }
 
-/// Move to Recycle Bin (after the confirmation): the managed copy only.
+/// Move to Recycle Bin (after the confirmation): the managed copy only, on a worker thread.
 fn recycle_selected(s: &mut ManagerState) {
     if crate::backup::running() {
         s.cancel_recycle();
         s.status = Some(crate::backup::BUSY.into());
         return;
     }
-    let Some((name, rel)) = library::with(|lib| s.selected_item(lib).map(|i| (i.name.clone(), i.path.clone()))) else { return };
-    let Some(path) = media_path(&rel) else { return };
-    if let Some(id) = s.selected {
-        crate::preview::release_item(id);
+    if file_op_running() {
+        s.status = Some(FILE_OP_BUSY.into());
+        return;
     }
-    match crate::fileops::recycle(&path) {
-        Ok(()) => {
-            library::with_mut(|lib| s.confirm_recycle(lib));
-            if let Err(e) = library::persist() {
-                s.status = Some(format!("{name} is in the Recycle Bin, but {e}."));
+    let Some(id) = s.recycle_target() else { return };
+    let Some((name, rel)) = library::with(|lib| lib.get(id).map(|i| (i.name.clone(), i.path.clone()))) else { return };
+    let Some(path) = media_path(&rel) else { return };
+    crate::preview::release_item(id);
+    start_file_op(s, format!("Moving {name} to the Recycle Bin…"), move || {
+        // IFileOperation needs a single-threaded apartment.
+        let _com = crate::wic::ComThread::sta();
+        let result = crate::fileops::recycle(&path);
+        FileDone::Recycled { id, name, result }
+    });
+}
+
+/// A rename or removal finished on its worker thread: record it and save.
+fn finish_file_op(done: FileDone) {
+    // Without the Manager (Exit is closing it) the record still follows the file.
+    let mut detached = ManagerState::new();
+    let mut view = VIEW.with(|v| v.try_borrow_mut().ok().and_then(|mut v| v.as_mut().map(|v| std::mem::take(&mut v.state))));
+    let s = view.as_mut().unwrap_or(&mut detached);
+    let saved = |what: String| library::persist().err().map(|e| format!("{what}, but {e}."));
+    match done {
+        FileDone::Renamed { id, typed, result: Ok(()) } => {
+            library::with_mut(|lib| s.renamed(lib, id, &typed));
+            if let Some(line) = saved("Renamed".into()) {
+                s.status = Some(line);
             }
         }
-        Err(e) => s.recycle_failed(&name, &e),
+        FileDone::Renamed { result: Err(e), .. } => {
+            s.status = Some(if e.kind() == std::io::ErrorKind::AlreadyExists {
+                "A file with that name is already in the Media folder. Choose another name.".into()
+            } else {
+                format!("Could not rename the file: {e}")
+            });
+        }
+        FileDone::Recycled { id, name, result: Ok(()) } => {
+            library::with_mut(|lib| s.recycled(lib, id, &name));
+            if let Some(line) = saved(format!("{name} is in the Recycle Bin")) {
+                s.status = Some(line);
+            }
+        }
+        FileDone::Recycled { name, result: Err(e), .. } => s.recycle_failed(&name, &e),
     }
+    if let Some(state) = view {
+        with_view(|v| {
+            v.state = state;
+            v.clamp_scroll(true);
+        });
+    }
+    FILE_OP.store(false, Ordering::SeqCst);
+    crate::popup::library_changed();
+    winutil::invalidate(hwnd());
 }
 
 /// Open folder in the inspector: File Explorer with the file selected. Under

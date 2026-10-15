@@ -6,7 +6,7 @@ use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
 use windows::Win32::Graphics::Gdi::{BI_RGB, BITMAPINFOHEADER};
 use windows::Win32::System::Com::IDataObject;
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
+    EmptyClipboard, RegisterClipboardFormatW, SetClipboardData,
 };
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows::Win32::System::Ole::{CF_DIB, CF_HDROP, DROPEFFECT, DROPEFFECT_COPY};
@@ -83,55 +83,49 @@ pub fn put_on_clipboard(owner: HWND, p: &Payload) -> Result<(), String> {
     let hdrop = hdrop_bytes(&p.file);
     let effect = DROPEFFECT_COPY.0.to_le_bytes();
 
-    open_clipboard(owner)?;
-    let result = (|| {
-        // SAFETY: the clipboard is open by this thread.
-        unsafe { EmptyClipboard() }.map_err(|e| format!("Could not empty the clipboard: {e}"))?;
-        for (format, bytes) in [(png_f, &p.png), (jfif_f, &p.jfif), (gif_f, &p.gif), (CF_DIB.0 as u32, &p.dib)] {
-            if let Some(b) = bytes {
-                set_data(format, b)?;
-            }
-        }
-        set_data(CF_HDROP.0 as u32, &hdrop)?;
-        set_data(effect_f, &effect)?;
-        Ok(())
-    })();
-    // SAFETY: closes the clipboard opened above.
-    let _ = unsafe { CloseClipboard() };
-    result
-}
-
-/// Another app can hold the clipboard open for a moment; retry briefly.
-fn open_clipboard(owner: HWND) -> Result<(), String> {
-    for attempt in 0..10 {
-        if unsafe { OpenClipboard(Some(owner)) }.is_ok() {
-            return Ok(());
-        }
-        if attempt < 9 {
-            std::thread::sleep(std::time::Duration::from_millis(15));
+    let _open = crate::winutil::OpenClipboard::open(owner, 10)?;
+    // SAFETY: the clipboard is open by this thread (above).
+    unsafe { EmptyClipboard() }.map_err(|e| format!("Could not empty the clipboard: {e}"))?;
+    for (format, bytes) in [(png_f, &p.png), (jfif_f, &p.jfif), (gif_f, &p.gif), (CF_DIB.0 as u32, &p.dib)] {
+        if let Some(b) = bytes {
+            set_data(format, b)?;
         }
     }
-    Err("The clipboard is in use by another app. Try again.".into())
+    set_data(CF_HDROP.0 as u32, &hdrop)?;
+    set_data(effect_f, &effect)
 }
 
+/// Global memory being filled for the clipboard: freed on drop unless the
+/// clipboard took it.
+struct ClipboardMemory(HGLOBAL);
+
+impl Drop for ClipboardMemory {
+    fn drop(&mut self) {
+        // SAFETY: still ours: `give_to_clipboard` forgets the value when Windows takes it.
+        let _ = unsafe { GlobalFree(Some(self.0)) };
+    }
+}
+
+/// Puts a copy of `bytes` on the open clipboard as `format`.
 fn set_data(format: u32, bytes: &[u8]) -> Result<(), String> {
-    unsafe {
-        let mem: HGLOBAL = GlobalAlloc(GMEM_MOVEABLE, bytes.len())
-            .map_err(|e| format!("Out of memory for clipboard data: {e}"))?;
-        let ptr = GlobalLock(mem) as *mut u8;
-        if ptr.is_null() {
-            let _ = GlobalFree(Some(mem));
-            return Err("Could not lock clipboard memory.".into());
-        }
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
-        let _ = GlobalUnlock(mem);
-        // On success the clipboard owns `mem`; on failure we still do.
-        if let Err(e) = SetClipboardData(format, Some(HANDLE(mem.0))) {
-            let _ = GlobalFree(Some(mem));
-            return Err(format!("Could not set clipboard format {format}: {e}"));
-        }
-        Ok(())
+    // SAFETY: plain arguments; the block is owned by `mem` from here on.
+    let mem = ClipboardMemory(
+        unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes.len()) }.map_err(|e| format!("Out of memory for clipboard data: {e}"))?,
+    );
+    // SAFETY: `mem` is a live moveable block of `bytes.len()` bytes.
+    let ptr = unsafe { GlobalLock(mem.0) } as *mut u8;
+    if ptr.is_null() {
+        return Err("Could not lock clipboard memory.".into());
     }
+    // SAFETY: `ptr` is locked and at least `bytes.len()` long; the two do not overlap.
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len()) };
+    // SAFETY: unlocks the lock taken above.
+    let _ = unsafe { GlobalUnlock(mem.0) };
+    // SAFETY: the clipboard is open by this thread (put_on_clipboard).
+    unsafe { SetClipboardData(format, Some(HANDLE(mem.0.0))) }.map_err(|e| format!("Could not set clipboard format {format}: {e}"))?;
+    // On success the clipboard owns the block, so it must not be freed here.
+    std::mem::forget(mem);
+    Ok(())
 }
 
 /// A 32-bit bottom-up CF_DIB from top-down BGRA pixels.
@@ -148,8 +142,7 @@ pub fn dib_from_bgra(b: &crate::wic::Bgra) -> Vec<u8> {
         ..Default::default()
     };
     let mut out = Vec::with_capacity(size_of::<BITMAPINFOHEADER>() + b.pixels.len());
-    // SAFETY: BITMAPINFOHEADER is a plain C struct; viewing it as bytes is sound.
-    out.extend_from_slice(unsafe { as_bytes(&header) });
+    out.extend_from_slice(as_bytes(&header));
     for row in b.pixels.chunks_exact(stride.max(1)).rev() {
         out.extend_from_slice(row);
     }
@@ -163,7 +156,7 @@ fn hdrop_bytes(file: &Path) -> Vec<u8> {
         ..Default::default()
     };
     let mut out = Vec::new();
-    out.extend_from_slice(unsafe { as_bytes(&header) });
+    out.extend_from_slice(as_bytes(&header));
     for unit in path_wide(file) {
         out.extend_from_slice(&unit.to_le_bytes()); // includes the path's NUL
     }
@@ -171,7 +164,13 @@ fn hdrop_bytes(file: &Path) -> Vec<u8> {
     out
 }
 
-unsafe fn as_bytes<T>(value: &T) -> &[u8] {
+/// The bytes of a plain C header struct (no padding, no pointers that matter).
+trait PlainHeader: Copy {}
+impl PlainHeader for BITMAPINFOHEADER {}
+impl PlainHeader for DROPFILES {}
+
+fn as_bytes<T: PlainHeader>(value: &T) -> &[u8] {
+    // SAFETY: `T` is one of the padding-free C headers above; reading its bytes is sound.
     unsafe { std::slice::from_raw_parts(value as *const T as *const u8, size_of::<T>()) }
 }
 
@@ -180,6 +179,7 @@ unsafe fn as_bytes<T>(value: &T) -> &[u8] {
 pub fn modifiers_held() -> bool {
     [VK_LWIN, VK_RWIN, VK_MENU, VK_SHIFT, VK_CONTROL]
         .iter()
+        // SAFETY: any key code is valid.
         .any(|vk| unsafe { GetAsyncKeyState(vk.0 as i32) } as u16 & 0x8000 != 0)
 }
 
@@ -199,6 +199,7 @@ pub fn send_ctrl_v() -> Result<(), String> {
         }
     }
     let inputs = [key(VK_CONTROL, false), key(VK_V, false), key(VK_V, true), key(VK_CONTROL, true)];
+    // SAFETY: `inputs` is a local array of keyboard INPUTs with the matching size.
     let sent = unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) };
     if sent as usize == inputs.len() {
         Ok(())
@@ -214,16 +215,15 @@ pub fn send_ctrl_v() -> Result<(), String> {
 /// one Explorer uses when you drag a file. Blocks until the drop or cancel.
 pub fn drag_file_out(source: HWND, file: &Path) -> Result<DROPEFFECT, String> {
     let wide = path_wide(file);
-    unsafe {
-        let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None)
-            .map_err(|e| format!("Could not open the file for dragging: {e}"))?;
-        let data: IDataObject = item
-            .BindToHandler(None, &BHID_DataObject)
-            .map_err(|e| format!("Could not create drag data: {e}"))?;
-        // No custom IDropSource: the shell supplies its default one and drag image.
-        SHDoDragDrop(Some(source), &data, None, DROPEFFECT_COPY)
-            .map_err(|e| format!("Drag failed: {e}"))
-    }
+    // SAFETY: `wide` is a null-terminated path that outlives the call.
+    let item: IShellItem = unsafe { SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None) }
+        .map_err(|e| format!("Could not open the file for dragging: {e}"))?;
+    // SAFETY: a COM call on a live item; the result is an owned interface.
+    let data: IDataObject =
+        unsafe { item.BindToHandler(None, &BHID_DataObject) }.map_err(|e| format!("Could not create drag data: {e}"))?;
+    // No custom IDropSource: the shell supplies its default one and drag image.
+    // SAFETY: our window and a live data object; the call is modal and returns after the drop.
+    unsafe { SHDoDragDrop(Some(source), &data, None, DROPEFFECT_COPY) }.map_err(|e| format!("Drag failed: {e}"))
 }
 
 #[cfg(test)]
