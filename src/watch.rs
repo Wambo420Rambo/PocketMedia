@@ -181,6 +181,8 @@ static WAKES: AtomicU64 = AtomicU64::new(0);
 static NOTICES: AtomicU64 = AtomicU64::new(0);
 /// Wakes because a waiting batch's quiet time was over.
 static DUE: AtomicU64 = AtomicU64::new(0);
+/// The last change Windows reported: its action number and path under Media (for the self-test's log).
+static LAST: Mutex<(u32, String)> = Mutex::new((0, String::new()));
 static BATCHES: AtomicU64 = AtomicU64::new(0);
 static OVERFLOWS: AtomicU64 = AtomicU64::new(0);
 static RESCANS: AtomicU64 = AtomicU64::new(0);
@@ -356,6 +358,9 @@ mod win {
                         let bytes: Vec<u8> = buf.iter().flat_map(|w| w.to_le_bytes()).take(n as usize).collect();
                         for (action, path) in parse(&bytes) {
                             EVENTS.fetch_add(1, Ordering::Relaxed);
+                            if let Ok(mut last) = LAST.lock() {
+                                *last = (action, path.clone());
+                            }
                             pending.add(action, &path);
                         }
                     }
@@ -468,7 +473,7 @@ fn after(applied: crate::library::Applied) {
 pub fn describe() -> String {
     let a = APPLIED.with(|a| a.borrow().clone());
     format!(
-        "watch running={} events={} wakes={} notices={} due={} batches={} overflows={} rescans={} added={} renamed={} replaced={} removed={}",
+        "watch running={} events={} wakes={} notices={} due={} batches={} overflows={} rescans={} added={} renamed={} replaced={} removed={} last={}",
         RUNNING.load(Ordering::SeqCst),
         EVENTS.load(Ordering::Relaxed),
         WAKES.load(Ordering::Relaxed),
@@ -481,7 +486,23 @@ pub fn describe() -> String {
         a.renamed.len(),
         a.replaced.len(),
         a.removed.len(),
+        last_change(),
     )
+}
+
+/// The last change Windows reported, for the self-test's log: "modified Pictures/Cat.png".
+fn last_change() -> String {
+    let Ok(last) = LAST.lock() else { return "?".into() };
+    let what = match last.0 {
+        0 => return "none".into(),
+        1 => "added",
+        2 => "removed",
+        3 => "modified",
+        4 => "renamed-from",
+        5 => "renamed-to",
+        _ => "other",
+    };
+    format!("{what} \"{}\"", last.1)
 }
 
 #[cfg(test)]

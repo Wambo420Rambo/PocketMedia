@@ -10,12 +10,12 @@ use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use windows::Win32::UI::Input::KeyboardAndMouse::{VK_A, VK_CONTROL};
+use windows::Win32::UI::Input::KeyboardAndMouse::{VK_A, VK_CONTROL, VK_ESCAPE};
 
 use super::preview_test::{close_windows, open_all_media};
 use super::settings_test::Set;
 use super::{
-    CMD_MANAGER, CMD_RESET, CMD_SETTINGS_SCROLL, CMD_STORE_REOPEN, DESCRIBE, El, Report, Session, describe_foreground, foreground,
+    CMD_BACKUP_START, CMD_MANAGER, CMD_RESET, CMD_SETTINGS_SCROLL, CMD_STORE_REOPEN, DESCRIBE, El, Report, Session, describe_foreground, foreground,
     guard, is_visible, press, send, type_unicode, wait_until,
 };
 use crate::ui::manager_view::MHit;
@@ -142,7 +142,10 @@ fn watch_tests(r: &mut Report, t: &Session) -> bool {
     r.check(
         "while nothing changes, watching does no work (no polling, no scans)",
         before.iter().all(|v| *v >= 0) && wakes == notices + due && rescans == 0,
-        &format!("in 2.5 s: {wakes} wakes ({notices} from changes Windows reported, {due} batch ends, {events} file events), {rescans} folder comparisons"),
+        &format!(
+            "in 2.5 s: {wakes} wakes ({notices} from changes Windows reported, {due} batch ends, {events} file events), {rescans} folder comparisons{}",
+            if events > 0 { format!("; last change: {}", w.split("last=").nth(1).unwrap_or("?")) } else { String::new() }
+        ),
     );
 
     // 1. A file copied in from outside joins the library, and the popup shows it.
@@ -436,6 +439,55 @@ fn backup_tests(r: &mut Report, t: &Session) -> bool {
         r.check("Cancel backup stops it and removes the unfinished copy", cancelled && left == 0, &format!("{} / {left} left", s.describe()));
         r.check("…and the panel says so", note_has(&s, "panel=done:Backup cancelled", 3000), &s.describe());
         s.click(r, SHit::PanelDone);
+
+        // An import whose review was open before the backup started
+        // waits too. The quick popup reaches its review; the backup then starts
+        // without a click (a click elsewhere would close the popup); Add says why
+        // and keeps the review as it was.
+        // Its own file, so the review has a row to add (the stress test left the
+        // pickers returning no files).
+        let pm14 = t.out.join("pm14-src");
+        let pm14_file = pm14.join("Waits for the backup.png");
+        let _ = std::fs::create_dir_all(&pm14);
+        put(&pm14_file, &super::seed::png(40, 30, 214));
+        crate::dialogs::set_test_pick(vec![pm14_file.clone()], pm14.clone());
+        if t.open(r) {
+            t.click(r, El::AddMediaButton);
+            t.click(r, El::AddChooseFiles);
+            let reviewed = t.wait_state("stage=review", 10_000);
+            let before = t.describe();
+            let started = send(t.main, CMD_BACKUP_START, 0) != 0;
+            t.click(r, El::AddAdd);
+            std::thread::sleep(Duration::from_millis(300));
+            let d = t.describe();
+            let rows = |x: &str| x.split("rows=").nth(1).map(str::to_string);
+            r.check(
+                "Add in a review that was open before the backup started waits, says why, and keeps the review",
+                reviewed
+                    && before.contains("can_add=true")
+                    && rows(&before).is_some_and(|x| x.contains("Waits for the backup.png:ok"))
+                    && started
+                    && d.contains("stage=review")
+                    && d.contains(crate::backup::BUSY)
+                    && rows(&d) == rows(&before),
+                &format!("before: {before}; backup started: {started}; after: {d}"),
+            );
+            t.shot(r, "state-add-waits-for-backup");
+            crate::backup::cancel();
+            let stopped = wait_until(10_000, || !crate::backup::running());
+            let left = std::fs::read_dir(&dest).map(|d| d.count()).unwrap_or(99);
+            r.check("…that backup is cancelled again and leaves nothing", stopped && left == 0, &format!("{left} left"));
+            if guard(r, &t.allowed) {
+                press(&[VK_ESCAPE]);
+                std::thread::sleep(Duration::from_millis(200));
+                press(&[VK_ESCAPE]);
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            page(r, &s, true);
+            if s.describe().contains("panel=done") {
+                s.click(r, SHit::PanelDone);
+            }
+        }
     }
     crate::backup::TEST_DELAY_MS.store(0, Ordering::SeqCst);
 

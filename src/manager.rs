@@ -1156,21 +1156,7 @@ fn run(effect: Effect) {
             let folder = crate::dialogs::pick_backup_folder(h);
             // SAFETY: our own window; back in front after the picker.
             let _ = unsafe { SetForegroundWindow(h) };
-            let note = match folder {
-                None => "Backup cancelled: no folder was chosen.".to_string(),
-                Some(dest) => match crate::backup::start(dest) {
-                    Ok(()) => {
-                        with_view(|v| {
-                            v.state.settings.backup_running = true;
-                            v.state.settings.set_backup_panel(BackupPanel::Running(crate::backup::Step::default()));
-                        });
-                        "Backing up…".to_string()
-                    }
-                    Err(e) => format!("Backup failed: {e}"),
-                },
-            };
-            with_view(|v| v.state.settings.show_note(&note));
-            winutil::invalidate(h);
+            start_backup(folder);
         }
         Effect::TileDown => {
             let mut pt = POINT::default();
@@ -1234,6 +1220,27 @@ pub fn on_job(ev: &crate::jobs::Event) -> bool {
         run(effect);
     }
     handled
+}
+
+/// Starts Back up library into `folder` (None: the picker was closed) and shows
+/// the backup panel. The self-test calls it too (a backup started
+/// while the quick popup's review stays open).
+pub fn start_backup(folder: Option<std::path::PathBuf>) {
+    let note = match folder {
+        None => "Backup cancelled: no folder was chosen.".to_string(),
+        Some(dest) => match crate::backup::start(dest) {
+            Ok(()) => {
+                with_view(|v| {
+                    v.state.settings.backup_running = true;
+                    v.state.settings.set_backup_panel(BackupPanel::Running(crate::backup::Step::default()));
+                });
+                "Backing up…".to_string()
+            }
+            Err(e) => format!("Backup failed: {e}"),
+        },
+    };
+    with_view(|v| v.state.settings.show_note(&note));
+    winutil::invalidate(hwnd());
 }
 
 fn media_path(rel: &str) -> Option<std::path::PathBuf> {

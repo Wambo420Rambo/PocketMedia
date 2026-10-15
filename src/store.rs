@@ -234,6 +234,14 @@ fn validate(mut data: StoreData) -> (StoreData, Vec<String>) {
     (data, fixes)
 }
 
+/// Library file writes since start (the self-test counts them).
+static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many times the library file was written since start.
+pub fn writes() -> u64 {
+    WRITES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Ids at or above this are renumbered on load (`next_id` must never wrap).
 const ID_LIMIT: u32 = u32::MAX / 2;
 
@@ -357,6 +365,7 @@ impl Store {
         fs::rename(&tmp, &main)?;
         self.main_good = true;
         self.last_saved = Some(text);
+        WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(true)
     }
 }

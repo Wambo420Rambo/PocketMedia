@@ -4,6 +4,7 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use crate::import::{self, Copied, CopyRequest, Plan, Status};
 use crate::names::{self, NameError};
@@ -32,6 +33,8 @@ pub struct ImportRow {
     pub dup_of: Option<usize>,
     /// Why a Skip row is skipped.
     pub skip_reason: Option<String>,
+    /// The file or folder could not be read.
+    pub unreadable: bool,
     /// Editable name without the extension (copy rows only).
     pub name: TextField,
     /// A number was added because the name was taken; cleared once the user edits.
@@ -51,7 +54,7 @@ impl ImportRow {
     }
 
     pub fn unsupported(&self) -> bool {
-        self.kind.is_none()
+        self.kind.is_none() && !self.unreadable
     }
 
     /// The line under the name, if any.
@@ -75,6 +78,39 @@ pub enum Stage {
     Scanning,
     Review,
     Copying { done: usize, total: usize, stopping: bool },
+}
+
+/// When to save the library file during an import: after every
+/// `EVERY` copies or `AFTER` time, and once at the end, instead of after each
+/// file. A crash in between loses no file: the startup comparison adds finished
+/// copies that have no record yet.
+#[derive(Debug, Default)]
+pub struct SaveBatch {
+    unsaved: usize,
+    since: Option<Instant>,
+}
+
+impl SaveBatch {
+    pub const EVERY: usize = 100;
+    pub const AFTER: Duration = Duration::from_secs(3);
+
+    /// A copy was recorded at `now`. True when the library file should be saved now.
+    pub fn copied(&mut self, now: Instant) -> bool {
+        self.unsaved += 1;
+        let since = *self.since.get_or_insert(now);
+        if self.unsaved >= Self::EVERY || now.duration_since(since) >= Self::AFTER {
+            *self = Self::default();
+            return true;
+        }
+        false
+    }
+
+    /// The import ended. True when a recorded copy is not saved yet.
+    pub fn finished(&mut self) -> bool {
+        let any = self.unsaved > 0;
+        *self = Self::default();
+        any
+    }
 }
 
 /// Keyboard focus inside the Add media panel, in Tab order.
@@ -162,6 +198,7 @@ impl AddMedia {
                     Status::InLibrary(name) => (RowStatus::Skip, Some(format!("Already in your library as {name}"))),
                     Status::InBatch(name) => (RowStatus::Skip, Some(format!("Same file as {name} above"))),
                     Status::Unsupported => (RowStatus::Skip, Some(UNSUPPORTED.into())),
+                    Status::Unreadable(why) => (RowStatus::Skip, Some(format!("Skipped: {why}"))),
                 };
                 let mut name = TextField::default();
                 name.insert(&p.base);
@@ -173,6 +210,7 @@ impl AddMedia {
                     status,
                     dup_of: None,
                     skip_reason,
+                    unreadable: matches!(p.status, Status::Unreadable(_)),
                     name,
                     auto_renamed: p.auto_renamed,
                     error: None,
@@ -288,7 +326,12 @@ impl AddMedia {
     }
 
     pub fn duplicates(&self) -> usize {
-        self.rows.iter().filter(|r| r.status == RowStatus::Skip && !r.unsupported()).count()
+        self.rows.iter().filter(|r| r.status == RowStatus::Skip && !r.unsupported() && !r.unreadable).count()
+    }
+
+    /// Files or folders that could not be read.
+    pub fn unreadable(&self) -> usize {
+        self.rows.iter().filter(|r| r.unreadable).count()
     }
 
     pub fn unsupported(&self) -> usize {
@@ -314,6 +357,10 @@ impl AddMedia {
                 let u = self.unsupported();
                 if u > 0 {
                     text += &format!(" · {u} not supported");
+                }
+                let r = self.unreadable();
+                if r > 0 {
+                    text += &format!(" · {r} could not be read");
                 }
                 text
             }
@@ -385,6 +432,10 @@ impl AddMedia {
         if u > 0 {
             text += &format!(" · {u} not supported");
         }
+        let r = self.unreadable();
+        if r > 0 {
+            text += &format!(" · {r} could not be read");
+        }
         if let Some(first) = failed.first() {
             let why = match &first.outcome {
                 Some(Err(e)) => e.as_str(),
@@ -439,7 +490,7 @@ mod tests {
 
     fn row(name: &str, status: Status, base: &str, auto: bool) -> Planned {
         let cand =
-            Candidate { source: PathBuf::from(format!("C:/src/{name}")), name: name.into(), size: 1, kind: crate::media_info::kind_for(name) };
+            Candidate { source: PathBuf::from(format!("C:/src/{name}")), name: name.into(), size: 1, kind: crate::media_info::kind_for(name), problem: None };
         Planned { cand, status, base: base.into(), auto_renamed: auto }
     }
 
@@ -467,6 +518,41 @@ mod tests {
         a.rows[row].name.backspace();
         a.rows[row].name.insert(to);
         a.edited(row, &LIBRARY);
+    }
+
+    /// An import saves the library file a few times, not once per file.
+    #[test]
+    fn an_import_saves_in_batches_not_per_file() {
+        let t0 = Instant::now();
+        let mut b = SaveBatch::default();
+        let saves = (0..50).filter(|_| b.copied(t0)).count() + usize::from(b.finished());
+        assert_eq!(saves, 1, "50 quick copies: one save at the end");
+        let saves = (0..250).filter(|_| b.copied(t0)).count() + usize::from(b.finished());
+        assert_eq!(saves, 3, "250 quick copies: after 100, after 200, and the last 50 at the end");
+        assert!(!b.finished(), "nothing left to save");
+        // Slow copies are saved after a while, so little is ever left unsaved.
+        assert!(!b.copied(t0));
+        assert!(b.copied(t0 + SaveBatch::AFTER));
+        assert!(!b.finished());
+    }
+
+    /// A file that could not be read is its own kind of skipped row.
+    #[test]
+    fn unreadable_files_are_counted_on_their_own() {
+        let mut a = AddMedia::new();
+        let plan = Plan {
+            rows: vec![
+                row("Cat.png", Status::Copy, "Cat", false),
+                row("Lost.png", Status::Unreadable("C:\\src\\Lost.png could not be read: denied".into()), "Lost", false),
+                row("Folder", Status::Unreadable("the folder C:\\src\\Folder could not be opened: denied".into()), "Folder", false),
+            ],
+            library_hashes: Vec::new(),
+        };
+        a.load_plan(&plan, &[]);
+        assert_eq!(a.summary(), "1 ready to add · 2 could not be read");
+        assert_eq!((a.duplicates(), a.unsupported(), a.unreadable()), (0, 0, 2));
+        assert_eq!(a.rows[1].message().as_deref(), Some("Skipped: C:\\src\\Lost.png could not be read: denied"));
+        assert!(a.can_add());
     }
 
     #[test]

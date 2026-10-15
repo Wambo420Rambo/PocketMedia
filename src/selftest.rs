@@ -76,6 +76,9 @@ const CMD_FAIL_NEXT_PASTE: usize = 20;
 /// Posted, never sent: the tray menu's Exit (it may ask first, in a modal box).
 /// 21-24 belong to preview_test, 40-42 to watch_test, 50-51 to shortcut_test.
 const CMD_REQUEST_EXIT: usize = 30;
+/// Starts Back up library into the self-test's backup folder without a click,
+/// so the quick popup keeps its review open meanwhile.
+const CMD_BACKUP_START: usize = 31;
 
 static EXIT_CODE: AtomicI32 = AtomicI32::new(0);
 static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -326,6 +329,10 @@ pub fn on_ui_command(wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         CMD_REQUEST_EXIT => {
             crate::request_exit();
             0
+        }
+        CMD_BACKUP_START => {
+            manager::start_backup(crate::dialogs::pick_backup_folder(manager::hwnd()));
+            crate::backup::running() as isize
         }
         cmd @ preview_test::CMD_PREVIEW_DESCRIBE..=preview_test::CMD_MANAGER_SHOW => preview_test::on_ui_command(cmd, lparam.0),
         cmd @ watch_test::CMD_LIB_FIND..=watch_test::CMD_WATCH_RESTART => watch_test::on_ui_command(cmd, lparam.0),
@@ -1683,6 +1690,7 @@ mod tests {
             CMD_SET_CLOSE_AFTER,
             CMD_FAIL_NEXT_PASTE,
             CMD_REQUEST_EXIT,
+            CMD_BACKUP_START,
             preview_test::CMD_PREVIEW_DESCRIBE,
             preview_test::CMD_THUMBS_RESET,
             preview_test::CMD_SET_VIDEO_PREVIEW,

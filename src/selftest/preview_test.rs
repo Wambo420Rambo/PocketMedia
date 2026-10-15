@@ -524,11 +524,21 @@ fn stress_test(r: &mut Report, t: &Session) -> bool {
     let reviewed = t.wait_state("stage=review", 120_000);
     r.check("the 1,000 files are reviewed", reviewed && t.describe().contains("can_add=true"), &t.describe().chars().take(300).collect::<String>());
     let started = Instant::now();
+    let writes = crate::store::writes();
     t.click(r, El::AddAdd);
     let imported = t.wait_state("screen=gallery", 300_000);
     let d = t.describe();
     r.check("1,000 files imported", imported && d.contains("1000 files added"), &d.chars().take(300).collect::<String>());
-    r.info(&format!("import took {:.1} s", started.elapsed().as_secs_f32()));
+    let secs = started.elapsed().as_secs_f32();
+    r.info(&format!("import took {secs:.1} s"));
+    // Saved in batches (every 100 copies or 3 s, and at the end), not once per file.
+    let writes = crate::store::writes() - writes;
+    let most = 1000 / crate::add_media::SaveBatch::EVERY as u64 + (secs / crate::add_media::SaveBatch::AFTER.as_secs_f32()) as u64 + 2;
+    r.check(
+        "the library file is saved in batches during the import, not once per file",
+        imported && (1..=most).contains(&writes),
+        &format!("{writes} saves for 1,000 files in {secs:.1} s (at most {most})"),
+    );
 
     if !open_all_media(r, t) {
         return false;

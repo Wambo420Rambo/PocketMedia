@@ -605,7 +605,10 @@ pub fn start(dest: PathBuf) -> Result<(), String> {
         return Err(BUSY.into());
     }
     let p = crate::paths::get().ok_or("the PocketMedia folders are not set up")?;
-    // The library file's view of the library, as last saved (persist runs after every change).
+    // Imports save in batches, so bring the library file up to date
+    // first. Even if that save fails, `persist` has put the library into the store,
+    // which is what the backup's library file is written from.
+    let _ = crate::library::persist();
     let data = crate::store::with(|s| s.data.clone()).ok_or("the library is not loaded")?;
     let plan = Plan { root: p.root.clone(), media: p.media.clone(), data, dest, stamp: stamp(), rename: crate::fileops::move_no_replace };
     WORKING.store(true, Ordering::SeqCst);

@@ -50,6 +50,9 @@ pub struct Candidate {
     pub size: u64,
     /// None: not a supported format.
     pub kind: Option<MediaKind>,
+    /// Why it could not be read while the files were listed: it
+    /// becomes a skipped row with this reason instead of stopping the import.
+    pub problem: Option<String>,
 }
 
 fn cancelled(cancel: &AtomicBool) -> Result<(), String> {
@@ -62,7 +65,12 @@ pub fn is_partial(name: &str) -> bool {
 
 fn candidate(path: &Path, size: u64) -> Candidate {
     let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-    Candidate { source: path.to_path_buf(), kind: media_info::kind_for(&name), name, size }
+    Candidate { source: path.to_path_buf(), kind: media_info::kind_for(&name), name, size, problem: None }
+}
+
+/// A file or folder that could not be read while listing.
+fn unreadable(path: &Path, why: String) -> Candidate {
+    Candidate { problem: Some(why), ..candidate(path, 0) }
 }
 
 /// Lists what the user chose. `media` is PocketMedia's own Media folder, which
@@ -77,7 +85,7 @@ pub fn scan(source: &Source, media: &Path, cancel: &AtomicBool) -> Result<Vec<Ca
                 match fs::metadata(f) {
                     Ok(m) if m.is_file() => out.push(candidate(f, m.len())),
                     Ok(_) => {}
-                    Err(e) => return Err(format!("{} could not be read: {e}", f.display())),
+                    Err(e) => out.push(unreadable(f, format!("{} could not be read: {e}", display_path(f)))),
                 }
             }
             Ok(out)
@@ -91,12 +99,33 @@ pub fn scan(source: &Source, media: &Path, cancel: &AtomicBool) -> Result<Vec<Ca
             let mut stack = vec![root_real];
             while let Some(dir) = stack.pop() {
                 cancelled(cancel)?;
-                let Ok(entries) = fs::read_dir(&dir) else { continue };
+                // A subfolder or file that cannot be read is listed with the reason,
+                // so the result never looks complete when it is not.
+                let entries = match fs::read_dir(&dir) {
+                    Ok(entries) => entries,
+                    Err(e) => {
+                        out.push(unreadable(&dir, format!("the folder {} could not be opened: {e}", display_path(&dir))));
+                        continue;
+                    }
+                };
                 let mut files = Vec::new();
                 let mut dirs = Vec::new();
-                for e in entries.flatten() {
+                for e in entries {
+                    let e = match e {
+                        Ok(e) => e,
+                        Err(err) => {
+                            out.push(unreadable(&dir, format!("part of the folder {} could not be read: {err}", display_path(&dir))));
+                            continue;
+                        }
+                    };
                     // symlink_metadata does not follow links; on Windows, junctions count as links too.
-                    let Ok(m) = fs::symlink_metadata(e.path()) else { continue };
+                    let m = match fs::symlink_metadata(e.path()) {
+                        Ok(m) => m,
+                        Err(err) => {
+                            out.push(unreadable(&e.path(), format!("{} could not be read: {err}", display_path(&e.path()))));
+                            continue;
+                        }
+                    };
                     if m.file_type().is_symlink() {
                         continue;
                     }
@@ -123,11 +152,11 @@ pub fn scan(source: &Source, media: &Path, cancel: &AtomicBool) -> Result<Vec<Ca
 /// Hashes a whole file.
 pub fn hash_file(path: &Path, digest: NewDigest, cancel: &AtomicBool) -> Result<String, String> {
     let mut d = digest()?;
-    let mut f = File::open(path).map_err(|e| format!("{} could not be read: {e}", path.display()))?;
+    let mut f = File::open(path).map_err(|e| format!("{} could not be read: {e}", display_path(path)))?;
     let mut buf = vec![0u8; CHUNK];
     loop {
         cancelled(cancel)?;
-        let n = f.read(&mut buf).map_err(|e| format!("{} could not be read: {e}", path.display()))?;
+        let n = f.read(&mut buf).map_err(|e| format!("{} could not be read: {e}", display_path(path)))?;
         if n == 0 {
             return Ok(d.finish());
         }
@@ -154,6 +183,8 @@ pub enum Status {
     /// Identical to an earlier file in this batch (its name).
     InBatch(String),
     Unsupported,
+    /// The file could not be read; the reason.
+    Unreadable(String),
 }
 
 #[derive(Clone, Debug)]
@@ -197,6 +228,21 @@ pub fn unique_base(base: &str, ext: &str, taken: &HashSet<String>, dir: &Path) -
     (format!("{base} ({})", MAX_NUMBER + 1), true)
 }
 
+/// Hashes `path` into `slot` unless that was done already. `Ok(Err(why))` when
+/// the file cannot be read; `Err` only when the user cancelled.
+fn hash_into(slot: &mut String, path: &Path, digest: NewDigest, cancel: &AtomicBool) -> Result<Result<(), String>, String> {
+    if slot.is_empty() {
+        match hash_file(path, digest, cancel) {
+            Ok(h) => *slot = h,
+            Err(why) => {
+                cancelled(cancel)?;
+                return Ok(Err(why));
+            }
+        }
+    }
+    Ok(Ok(()))
+}
+
 /// Decides what happens to each file. Hashes only files whose size matches
 /// another file's.
 pub fn plan(cands: Vec<Candidate>, known: &[KnownFile], media: &Path, digest: NewDigest, cancel: &AtomicBool) -> Result<Plan, String> {
@@ -212,41 +258,53 @@ pub fn plan(cands: Vec<Candidate>, known: &[KnownFile], media: &Path, digest: Ne
 
     for cand in cands {
         cancelled(cancel)?;
+        if let Some(why) = &cand.problem {
+            let status = Status::Unreadable(why.clone());
+            let base = name_without_extension(&cand.name).to_string();
+            plan.rows.push(Planned { cand, status, base, auto_renamed: false });
+            continue;
+        }
         let Some(kind) = cand.kind else {
             let base = name_without_extension(&cand.name).to_string();
             plan.rows.push(Planned { cand, status: Status::Unsupported, base, auto_renamed: false });
             continue;
         };
+        // Only Cancel stops the plan; a file that cannot be read becomes a row
+        // with the reason.
         let mut own_hash = String::new();
-        let mut hash_me = |cancel: &AtomicBool| -> Result<String, String> {
-            if own_hash.is_empty() {
-                own_hash = hash_file(&cand.source, digest, cancel)?;
-            }
-            Ok(own_hash.clone())
-        };
         let mut status = Status::Copy;
-        for &i in lib_by_size.get(&cand.size).map(Vec::as_slice).unwrap_or(&[]) {
-            if lib_hash[i].is_empty() {
-                let Ok(h) = hash_file(&known[i].abs, digest, cancel) else {
-                    cancelled(cancel)?;
-                    continue; // a library file that cannot be read is not a duplicate
-                };
-                plan.library_hashes.push((known[i].id, h.clone()));
-                lib_hash[i] = h;
-            }
-            if hash_me(cancel)? == lib_hash[i] {
-                status = Status::InLibrary(known[i].name.clone());
-                break;
-            }
-        }
-        if status == Status::Copy {
-            for earlier in batch.iter_mut().filter(|b| b.0 == cand.size) {
-                if earlier.3.is_empty() {
-                    earlier.3 = hash_file(&earlier.2, digest, cancel)?;
+        'compare: {
+            for &i in lib_by_size.get(&cand.size).map(Vec::as_slice).unwrap_or(&[]) {
+                if lib_hash[i].is_empty() {
+                    let Ok(h) = hash_file(&known[i].abs, digest, cancel) else {
+                        cancelled(cancel)?;
+                        continue; // a library file that cannot be read is not a duplicate
+                    };
+                    plan.library_hashes.push((known[i].id, h.clone()));
+                    lib_hash[i] = h;
                 }
-                if hash_me(cancel)? == earlier.3 {
+                if let Err(why) = hash_into(&mut own_hash, &cand.source, digest, cancel)? {
+                    status = Status::Unreadable(why);
+                    break 'compare;
+                }
+                if own_hash == lib_hash[i] {
+                    status = Status::InLibrary(known[i].name.clone());
+                    break 'compare;
+                }
+            }
+            for earlier in batch.iter_mut().filter(|b| b.0 == cand.size) {
+                // An earlier file that cannot be read now is not a match; its own
+                // copy reports the problem.
+                if hash_into(&mut earlier.3, &earlier.2, digest, cancel)?.is_err() {
+                    continue;
+                }
+                if let Err(why) = hash_into(&mut own_hash, &cand.source, digest, cancel)? {
+                    status = Status::Unreadable(why);
+                    break 'compare;
+                }
+                if own_hash == earlier.3 {
                     status = Status::InBatch(earlier.1.clone());
-                    break;
+                    break 'compare;
                 }
             }
         }
@@ -595,6 +653,56 @@ pub mod tests {
             ]
         );
         assert_eq!(plan.library_hashes.len(), 1, "only the same-size library file was hashed");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A file that cannot be read becomes a row with the reason; the
+    /// rest of the batch is planned as usual.
+    #[test]
+    fn a_file_that_cannot_be_read_becomes_a_row_and_the_rest_go_on() {
+        let root = temp("unreadable");
+        let media = media(&root);
+        let src = root.join("src");
+        write(&src.join("A.png"), b"same1");
+        write(&src.join("B.png"), b"same2"); // same size: B is hashed and compared with A
+        write(&src.join("C.gif"), b"c");
+        let files = vec![src.join("A.png"), src.join("B.png"), src.join("C.gif"), src.join("gone.png")];
+        let cands = scan(&Source::Files(files), &media, &no_cancel()).unwrap();
+        fs::remove_file(src.join("B.png")).unwrap(); // vanishes between listing and checking
+        let first = plan(cands, &[], &media, fnv, &no_cancel()).unwrap();
+        let got: Vec<(&str, bool)> = first.rows.iter().map(|r| (r.cand.name.as_str(), matches!(r.status, Status::Unreadable(_)))).collect();
+        assert_eq!(got, [("A.png", false), ("B.png", true), ("C.gif", false), ("gone.png", true)]);
+        assert_eq!(first.rows[0].status, Status::Copy);
+        assert_eq!(first.rows[2].status, Status::Copy);
+        let Status::Unreadable(why) = &first.rows[1].status else { panic!() };
+        assert!(why.contains("B.png") && why.contains("could not be read"), "{why}");
+
+        // An earlier file of the batch that cannot be read is not taken for a match.
+        write(&src.join("A2.png"), b"same3");
+        let cands = scan(&Source::Files(vec![src.join("A.png"), src.join("A2.png")]), &media, &no_cancel()).unwrap();
+        fs::remove_file(src.join("A.png")).unwrap();
+        let second = plan(cands, &[], &media, fnv, &no_cancel()).unwrap();
+        assert_eq!(second.rows.iter().map(|r| r.status.clone()).collect::<Vec<_>>(), [Status::Copy, Status::Copy]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A subfolder that cannot be opened is listed, not skipped silently.
+    #[cfg(windows)]
+    #[test]
+    fn a_folder_that_cannot_be_opened_is_listed() {
+        let root = temp("locked-folder");
+        let media = media(&root);
+        let src = root.join("src");
+        write(&src.join("ok.png"), b"ok");
+        write(&src.join("locked/inside.png"), b"in");
+        let locked = src.join("locked");
+        let icacls = |args: &[&str]| std::process::Command::new("icacls").arg(&locked).args(args).output().unwrap();
+        assert!(icacls(&["/deny", "*S-1-1-0:(RX)"]).status.success());
+        let cands = scan(&Source::Folder(src.clone()), &media, &no_cancel());
+        let _ = icacls(&["/remove:d", "*S-1-1-0"]);
+        let cands = cands.unwrap();
+        assert!(cands.iter().any(|c| c.name == "ok.png" && c.problem.is_none()));
+        assert!(cands.iter().any(|c| c.name == "locked" && c.problem.as_deref().is_some_and(|p| p.contains("could not be opened"))), "{cands:?}");
         let _ = fs::remove_dir_all(&root);
     }
 

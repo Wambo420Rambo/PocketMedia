@@ -9,8 +9,13 @@ use crate::sample::MediaKind;
 
 /// The kind of a supported file name, or None. Only .jpg .jpeg .png
 /// .gif .mp4, case-insensitive.
+///
+/// The extension follows the one rule the app uses everywhere
+/// (`search::name_without_extension`): a name that is only an extension, such as
+/// `.png`, has none, so it is not a supported file.
 pub fn kind_for(name: &str) -> Option<MediaKind> {
-    let ext = name.rsplit_once('.')?.1.to_ascii_lowercase();
+    let stem = crate::search::name_without_extension(name);
+    let ext = name[stem.len()..].strip_prefix('.')?.to_ascii_lowercase();
     match ext.as_str() {
         "jpg" | "jpeg" | "png" => Some(MediaKind::Picture),
         "gif" => Some(MediaKind::Gif),
@@ -272,6 +277,26 @@ mod tests {
         }
         assert_eq!(kind_for("x.gif"), Some(MediaKind::Gif));
         assert_eq!(kind_for("x.jpeg"), Some(MediaKind::Picture));
+    }
+
+    /// The type and the extension come from the same rule, so a file
+    /// named only `.png` is not taken (it would have no name once imported).
+    #[test]
+    fn the_type_and_the_extension_agree() {
+        use crate::import::ext_of;
+        for (name, kind, ext) in [
+            (".png", None, ""),
+            ("a.png", Some(MediaKind::Picture), ".png"),
+            ("a.", None, "."),
+            ("a", None, ""),
+            ("..gif", Some(MediaKind::Gif), ".gif"),
+            ("Happy dance.GIF", Some(MediaKind::Gif), ".GIF"),
+        ] {
+            assert_eq!((kind_for(name), ext_of(name)), (kind, ext), "{name}");
+            if kind.is_some() {
+                assert!(!crate::search::name_without_extension(name).is_empty(), "{name} has a name");
+            }
+        }
     }
 
     #[test]

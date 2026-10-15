@@ -55,6 +55,17 @@ pub struct AddPanel {
     leave_if_no_pick: bool,
     /// A save of the library file failed during this import.
     save_error: Option<String>,
+    /// Copies recorded but not saved yet.
+    saves: crate::add_media::SaveBatch,
+}
+
+/// A panel closed before its import reported the end still saves what it recorded.
+impl Drop for AddPanel {
+    fn drop(&mut self) {
+        if self.saves.finished() {
+            let _ = library::persist();
+        }
+    }
 }
 
 impl Default for AddPanel {
@@ -65,13 +76,15 @@ impl Default for AddPanel {
 
 impl AddPanel {
     pub fn new() -> Self {
-        Self { add: AddMedia::new(), hover: AddHit::None, pressed: AddHit::None, job: None, leave_if_no_pick: false, save_error: None }
+        Self { add: AddMedia::new(), hover: AddHit::None, pressed: AddHit::None, job: None, leave_if_no_pick: false, save_error: None, saves: Default::default() }
     }
 
     /// Settings' "Choose folder…": the host shows the folder picker right away;
     /// cancelling it goes back to Settings.
     pub fn for_settings() -> Self {
-        Self { leave_if_no_pick: true, ..Self::new() }
+        let mut panel = Self::new();
+        panel.leave_if_no_pick = true;
+        panel
     }
 
     /// A scan or copy is running: the host keeps the panel (and its window state).
@@ -128,13 +141,18 @@ impl AddPanel {
             Event::Copied { index, kind, result, .. } => {
                 if let Ok(c) = result {
                     library::with_mut(|lib| lib.add_copied(c, *kind));
-                    self.note_save(library::persist());
+                    if self.saves.copied(std::time::Instant::now()) {
+                        self.note_save(library::persist());
+                    }
                 }
                 self.add.copied(*index, result);
             }
             Event::Prepared { .. } | Event::Watched(_) | Event::Rescanned { .. } | Event::Backup { .. } => {}
             Event::Finished { stopped, .. } => {
                 self.job = None;
+                if self.saves.finished() {
+                    self.note_save(library::persist());
+                }
                 let mut status = self.add.finish(*stopped);
                 if let Some(e) = self.save_error.take() {
                     status = format!("{status} Warning: {e}.");
@@ -286,6 +304,9 @@ impl AddPanel {
             AddHit::Remove(i) if a.editable() => library::with(|lib| a.remove(i, &lib.names())),
             AddHit::ChooseFiles => return AddOutcome::Pick(Pick::Files),
             AddHit::ImportExisting => return AddOutcome::Pick(Pick::Folder),
+            // A review opened before a backup started waits for it too;
+            // the review stays as it is, and the footer says why.
+            AddHit::Add if a.can_add() && crate::backup::running() => a.notice = Some(crate::backup::BUSY.into()),
             AddHit::Add => {
                 if let (Some(requests), Some(p)) = (a.begin_copy(), crate::paths::get()) {
                     self.save_error = None;
@@ -401,6 +422,7 @@ impl AddPanel {
             .iter()
             .map(|r| {
                 let state = match (r.status, r.error) {
+                    (RowStatus::Skip, _) if r.unreadable => "unreadable".to_string(),
                     (RowStatus::Skip, _) if r.unsupported() => "unsupported".to_string(),
                     (RowStatus::Skip, _) => "skip".to_string(),
                     (_, Some(e)) => format!("{e:?}"),
