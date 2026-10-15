@@ -138,6 +138,36 @@ pub fn make_source(out: &Path) -> std::io::Result<(Vec<PathBuf>, PathBuf)> {
     Ok((PICKED.iter().map(|n| dir.join(n)).collect(), dir))
 }
 
+/// A junction inside the import source,
+/// `import-src\more\linked`, that leads to `junction-target\Outside.png` outside
+/// it. A folder import must not follow it. Returns what was made, for the log.
+pub fn make_junction(out: &Path) -> Result<String, String> {
+    let target = out.join("junction-target");
+    let _ = std::fs::remove_dir_all(&target);
+    std::fs::create_dir_all(&target).map_err(|e| e.to_string())?;
+    std::fs::write(target.join(JUNCTION_FILE), png(30, 20, 103)).map_err(|e| e.to_string())?;
+    let link = junction(out);
+    let made = std::process::Command::new("cmd")
+        .arg("/C")
+        .arg("mklink")
+        .arg("/J")
+        .arg(&link)
+        .arg(&target)
+        .output()
+        .map_err(|e| format!("mklink could not run: {e}"))?;
+    let said = String::from_utf8_lossy(&made.stdout).trim().to_string() + &String::from_utf8_lossy(&made.stderr);
+    if !made.status.success() {
+        return Err(format!("mklink /J failed: {said}"));
+    }
+    Ok(said)
+}
+
+/// The junction `make_junction` makes, and the file it leads to.
+pub fn junction(out: &Path) -> PathBuf {
+    out.join("import-src").join("more").join("linked")
+}
+pub const JUNCTION_FILE: &str = "Outside.png";
+
 /// True when every source file still has exactly the bytes it was made with.
 pub fn source_unchanged(out: &Path) -> Result<(), String> {
     let dir = out.join("import-src");

@@ -92,6 +92,12 @@ const CMD_LOSE_TARGET: usize = 35;
 const CMD_D2D_TARGETS: usize = 36;
 /// The shortcut PocketMedia uses, packed by `pack_shortcut`.
 const CMD_SHORTCUT: usize = 37;
+/// The library as a first start finds it: no library file and empty
+/// Media folders, read the way start-up reads them. Puts `store::describe()` in DESCRIBE.
+const CMD_FIRST_START: usize = 38;
+/// Adds lparam extra pictures ("Page item NN.png") to the library, as
+/// files found in Media at start-up are. Returns the library's item count.
+const CMD_MANY_ITEMS: usize = 39;
 
 static EXIT_CODE: AtomicI32 = AtomicI32::new(0);
 static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -103,6 +109,8 @@ static DESCRIBE: Mutex<String> = Mutex::new(String::new());
 #[derive(Clone, Copy, Debug)]
 enum El {
     Neutral,
+    /// The popup's × (top right).
+    Close,
     /// The popup's logo, which drags it.
     Handle,
     Search,
@@ -131,6 +139,7 @@ impl El {
     fn code(self) -> isize {
         match self {
             El::Neutral => 0,
+            El::Close => 1,
             El::Handle => 5,
             El::Search => 2,
             El::OpenManager => 4,
@@ -369,16 +378,82 @@ pub fn on_ui_command(wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             made as isize
         }
         CMD_D2D_TARGETS => crate::ui::d2d::TARGETS_MADE.load(Ordering::Relaxed) as isize,
+        CMD_MANY_ITEMS => match many_items(lparam.0.clamp(0, 200) as u32) {
+            Ok(n) => n as isize,
+            Err(e) => {
+                note(&e);
+                -1
+            }
+        },
+        CMD_FIRST_START => {
+            let done = first_start();
+            if let Ok(mut d) = DESCRIBE.lock() {
+                *d = match &done {
+                    Ok(()) => crate::store::describe(),
+                    Err(e) => format!("could not set up a first start: {e}"),
+                };
+            }
+            done.is_ok() as isize
+        }
         CMD_BACKUP_START => {
             manager::start_backup(crate::dialogs::pick_backup_folder(manager::hwnd()));
             crate::backup::running() as isize
         }
-        cmd @ preview_test::CMD_PREVIEW_DESCRIBE..=preview_test::CMD_MANAGER_SHOW => preview_test::on_ui_command(cmd, lparam.0),
+        cmd @ preview_test::CMD_PREVIEW_DESCRIBE..=preview_test::CMD_SET_PROFILE => preview_test::on_ui_command(cmd, lparam.0),
         cmd @ watch_test::CMD_LIB_FIND..=watch_test::CMD_WATCH_RESTART => watch_test::on_ui_command(cmd, lparam.0),
         cmd @ shortcut_test::CMD_SC_TRY..=shortcut_test::CMD_SC_FREE => shortcut_test::on_ui_command(cmd, lparam.0),
         _ => 0,
     };
     LRESULT(value)
+}
+
+/// UI thread: no library file and empty Media folders, then the library is read
+/// as at start-up (`load_library`). Only in the self-test's own folder.
+fn first_start() -> Result<(), String> {
+    let p = crate::paths::get().ok_or("no folders")?;
+    if p.root.file_name().and_then(|n| n.to_str()) != Some("app") {
+        return Err(format!("refusing to empty {}", p.root.display()));
+    }
+    crate::watch::stop();
+    crate::store::reset_for_test();
+    for folder in crate::import::FOLDERS {
+        let dir = p.media.join(folder);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    }
+    crate::store::init(&p.data);
+    crate::autostart::sync_store();
+    if let Some(message) = crate::load_library(&p.media) {
+        note(&message);
+    }
+    if let Err(e) = crate::watch::start(&p.media, crate::watch::BUFFER) {
+        note(&e);
+    }
+    popup::reset();
+    manager::reset();
+    Ok(())
+}
+
+/// UI thread: `n` small pictures written to Media\Pictures, then the library is
+/// read as at start-up, which adds them. Only in the self-test's own folder.
+fn many_items(n: u32) -> Result<usize, String> {
+    let p = crate::paths::get().ok_or("no folders")?;
+    if p.root.file_name().and_then(|n| n.to_str()) != Some("app") {
+        return Err(format!("refusing to add files to {}", p.root.display()));
+    }
+    crate::watch::stop();
+    for i in 0..n {
+        std::fs::write(p.pictures.join(format!("Page item {i:02}.png")), seed::png(40, 30, 300 + i)).map_err(|e| e.to_string())?;
+    }
+    if let Some(message) = crate::load_library(&p.media) {
+        note(&message);
+    }
+    if let Err(e) = crate::watch::start(&p.media, crate::watch::BUFFER) {
+        note(&e);
+    }
+    popup::reset();
+    manager::reset();
+    Ok(crate::library::with(|lib| lib.items.len()))
 }
 
 /// Packs a screen point into an LRESULT (isize::MIN = not on screen).
@@ -449,7 +524,7 @@ impl Report {
 fn script(r: &mut Report, out: &Path, main: isize) {
     let me = std::process::id();
     r.info(&format!("output folder: {}", out.display()));
-    for stale in ["paste-received.png", "paste-formats.txt", "drop-received.png", "drop-source.txt"] {
+    for stale in ["paste-received.png", "paste-received.jfif", "paste-formats.txt", "drop-received.png", "drop-source.txt"] {
         let _ = std::fs::remove_file(out.join(stale));
     }
 
@@ -505,9 +580,16 @@ fn script(r: &mut Report, out: &Path, main: isize) {
         Ok((files, folder)) => crate::dialogs::set_test_pick(files, folder),
         Err(e) => r.info(&format!("could not create the import source: {e}")),
     }
+    let junction = seed::make_junction(out);
+    r.info(&format!("junction in the import source: {junction:?}"));
     send(main, CMD_RESET, 0);
 
     let t = Session { main, out: out.to_path_buf(), allowed: allowed.to_vec(), target, popup: send(main, CMD_POPUP, 0) };
+    if let Some(sections) = only() {
+        quick_run(r, &t, &sections);
+        stop_child(&mut target_proc);
+        return;
+    }
     if !run_input_tests(r, &t) {
         r.info("input tests stopped early");
     }
@@ -529,6 +611,41 @@ fn script(r: &mut Report, out: &Path, main: isize) {
     blocked_folder_test(r, out, &exe);
     stop_child(&mut target_proc);
     exit_test(r, main);
+}
+
+/// Sections a quick run can be limited to (`--self-test <dir> --only a,b`), for
+/// checks that changed while the rest did not.
+const SECTIONS: [&str; 4] = ["empty-library", "page-keys", "stress", "jump"];
+
+/// The sections named after `--only`, if any.
+fn only() -> Option<Vec<String>> {
+    let args: Vec<String> = std::env::args().collect();
+    let at = args.iter().position(|a| a == "--only")?;
+    Some(args.get(at + 1)?.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+}
+
+/// Runs only `sections`, in the order given. The start-up checks above still ran;
+/// the instance, folder and Exit checks do not.
+fn quick_run(r: &mut Report, t: &Session, sections: &[String]) {
+    r.info(&format!("QUICK RUN: only {} (not the whole self-test)", sections.join(", ")));
+    for name in sections {
+        r.info(&format!("section {name}"));
+        let ok = match name.as_str() {
+            "empty-library" => first_start_test(r, t),
+            "page-keys" => manager_test::page_keys(r, t),
+            "stress" => preview_test::stress_only(r, t, true),
+            "jump" => preview_test::stress_only(r, t, false),
+            other => r.check(&format!("quick run: a section named {other:?}"), false, &format!("known sections: {}", SECTIONS.join(", "))),
+        };
+        if !ok {
+            r.info(&format!("section {name} stopped early"));
+            break;
+        }
+    }
+    if is_visible(t.popup) && foreground() == t.popup && guard(r, &t.allowed) {
+        press(&[VK_ESCAPE]);
+        wait_until(1500, || !is_visible(t.popup));
+    }
 }
 
 /// The tray menu's Exit, with no backup running, cleans up and ends.
@@ -780,6 +897,33 @@ fn run_input_tests(r: &mut Report, t: &Session) -> bool {
     r.check("Escape closes popup", wait_until(1500, || !is_visible(popup)), "");
     r.check("focus returns to previous app after Escape", wait_until(1500, || foreground() == target), &describe_foreground());
 
+    // 5b. The popup's × hides it the same way (focused-10).
+    if !t.open(r) {
+        return false;
+    }
+    let before = window_rect(popup);
+    if let Some((x, y)) = t.point(El::Close) {
+        mouse_to(x, y);
+        t.shot(r, "state-popup-close-hover");
+    }
+    t.click(r, El::Close);
+    let closed = wait_until(1500, || !is_visible(popup));
+    r.check("the popup's × closes it", closed, &t.describe());
+    r.check("…and focus returns to the previous app", wait_until(1500, || foreground() == target), &describe_foreground());
+    r.check(
+        "…and PocketMedia keeps running in the tray, with its shortcut",
+        tray_icon_rect(main).is_some() && send(main, CMD_HOTKEY_OK, 0) == 1,
+        "",
+    );
+    if let Some(rect) = before {
+        // Where the popup was: the app behind it shows again.
+        std::thread::sleep(Duration::from_millis(200));
+        save_capture(r, &t.out.join("screens").join("focused-10-popup-closed-hidden-to-tray.png"), capture_screen(rect));
+    }
+    if !closed {
+        return false;
+    }
+
     // 6. Shortcut toggles: open, then close again.
     if !t.open(r) || !guard(r, &t.allowed) {
         return false;
@@ -926,12 +1070,101 @@ fn run_input_tests(r: &mut Report, t: &Session) -> bool {
         r.check("clicking outside closes popup", wait_until(1500, || !is_visible(popup)), "");
     }
 
+    // 11b. A first start: no library yet.
+    if !first_start_test(r, t) {
+        return false;
+    }
+    if !manager_test::page_keys(r, t) {
+        return false;
+    }
+
     // 12. The Manager, from a fresh fake library.
     manager_test::run(r, t)
         && settings_test::run(r, t)
         && window_test::run(r, t)
         && preview_test::run(r, t)
         && watch_test::run(r, t)
+}
+
+/// What a first start shows. No library file and empty Media
+/// folders; the popup says the library is empty and offers Add media, and the
+/// Manager has nothing in it. The next section resets the library.
+fn first_start_test(r: &mut Report, t: &Session) -> bool {
+    if is_visible(t.popup) {
+        post(t.popup, WM_CLOSE, 0, 0);
+        wait_until(1500, || !is_visible(t.popup));
+    }
+    send(t.main, CMD_FOCUS, t.target);
+    wait_until(1500, || foreground() == t.target);
+    let made = send(t.main, CMD_FIRST_START, 0) == 1;
+    let store = DESCRIBE.lock().map(|d| d.clone()).unwrap_or_default();
+    r.check(
+        "a first start finds no library file and starts with an empty library",
+        made && store.contains("outcome=new") && store.contains("items=0") && count_files(&t.out) == 0,
+        &format!("{store}; {} files in Media", count_files(&t.out)),
+    );
+    if !t.open(r) {
+        return false;
+    }
+    t.park();
+    t.shot(r, "state-first-start-empty-library");
+    t.state_has(r, "on a first start the popup says the library is empty", &["screen=gallery", "empty=Some(NoLibrary)", "count=0"]);
+    t.click(r, El::EmptyAction);
+    t.park();
+    t.state_has(r, "…and its Add media button opens Add media", &["screen=add", "stage=start"]);
+    if !guard(r, &t.allowed) {
+        return false;
+    }
+    press(&[VK_ESCAPE]);
+    std::thread::sleep(Duration::from_millis(200));
+    t.state_has(r, "…Escape goes back to the empty library", &["screen=gallery", "empty=Some(NoLibrary)"]);
+    if !t.click(r, El::OpenManager) {
+        return false;
+    }
+    let manager = send(t.main, CMD_MANAGER, 0);
+    let shown = wait_until(2000, || manager != 0 && is_visible(manager) && foreground() == manager);
+    send(t.main, CMD_MANAGER_DESCRIBE, 0);
+    let d = DESCRIBE.lock().map(|d| d.clone()).unwrap_or_default();
+    if let Some(rect) = window_rect(manager) {
+        std::thread::sleep(Duration::from_millis(300));
+        save_capture(r, &t.out.join("screens").join("state-manager-first-start-empty.png"), capture_screen(rect));
+    }
+    r.check(
+        "…and the Manager opens empty, with nothing selected",
+        shown && d.contains("total=0") && d.contains("count=0") && d.contains("selected=\"\""),
+        &d,
+    );
+    // Its empty state's button is Add media too (it used to only clear filters).
+    if shown && let Some((x, y)) = unpack(send(t.main, CMD_MANAGER_POINT, manager_test::code(crate::ui::manager_view::MHit::EmptyAction))) {
+        if !guard(r, &t.allowed) {
+            return false;
+        }
+        mouse_to(x, y);
+        std::thread::sleep(Duration::from_millis(60));
+        mouse_button(true);
+        std::thread::sleep(Duration::from_millis(40));
+        mouse_button(false);
+        let opened = wait_until(1500, || {
+            send(t.main, CMD_MANAGER_DESCRIBE, 0);
+            DESCRIBE.lock().map(|d| d.starts_with("host=manager") && d.contains("stage=start")).unwrap_or(false)
+        });
+        send(t.main, CMD_MANAGER_DESCRIBE, 0);
+        let d = DESCRIBE.lock().map(|d| d.clone()).unwrap_or_default();
+        r.check("…and the Manager's Add media button on the empty library opens Add media there", opened, &d);
+        if opened && guard(r, &t.allowed) {
+            press(&[VK_ESCAPE]);
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    } else {
+        r.check("…the Manager's empty state shows its Add media button", false, "not on screen");
+    }
+    if is_visible(manager) {
+        post(manager, WM_CLOSE, 0, 0);
+        wait_until(1500, || !is_visible(manager));
+    }
+    send(t.main, CMD_FOCUS, t.target);
+    wait_until(1500, || foreground() == t.target);
+    true
 }
 
 /// Files in the test library's Media folders (not counting temporary files).
@@ -1088,6 +1321,17 @@ fn add_media_test(r: &mut Report, t: &Session) -> bool {
             "summary=\"1 ready to add · 7 duplicates skipped · 1 not supported\"",
             "can_add=true",
         ],
+    );
+    // import-src\more\linked is a real junction to a folder
+    // outside import-src. Its file must not be offered (the rows above are exact too).
+    let link = seed::junction(&t.out);
+    let is_link = std::fs::symlink_metadata(&link).is_ok_and(|m| m.file_type().is_symlink());
+    let reachable = link.join(seed::JUNCTION_FILE).is_file();
+    let d = t.describe();
+    r.check(
+        "a folder import does not follow a junction inside the folder: the file it leads to is not offered",
+        is_link && reachable && !d.contains(seed::JUNCTION_FILE),
+        &format!("{} is a junction: {is_link}; {} reachable through it: {reachable}; {d}", link.display(), seed::JUNCTION_FILE),
     );
     t.wheel_at(r, El::AddMain, 10);
     t.park();
@@ -1374,7 +1618,7 @@ fn media_file(out: &Path, name: &str) -> PathBuf {
 /// the clipboard formats, history, Close after inserting off, and a failed paste.
 fn paste_tests(r: &mut Report, t: &Session) -> bool {
     let fresh = |t: &Session| {
-        for f in ["paste-formats.txt", "paste-received.png", "paste-hdrop.txt", "paste-dib.txt"] {
+        for f in ["paste-formats.txt", "paste-received.png", "paste-received.jfif", "paste-hdrop.txt", "paste-dib.txt"] {
             let _ = std::fs::remove_file(t.out.join(f));
         }
     };
@@ -1391,10 +1635,12 @@ fn paste_tests(r: &mut Report, t: &Session) -> bool {
         true
     };
     // (search, file, formats that must be there, formats that must not)
-    let cases: [(&str, &str, &[&str], &[&str]); 3] = [
-        ("square", "Square.png", &["PNG", "CF_DIB", "CF_HDROP", "Preferred DropEffect"], &[]),
-        ("happy dance", "Happy dance.gif", &["GIF", "CF_HDROP", "Preferred DropEffect"], &["PNG", "CF_DIB"]),
-        ("race clip", "Race clip.mp4", &["CF_HDROP", "Preferred DropEffect"], &["PNG", "CF_DIB", "GIF"]),
+    let cases: [(&str, &str, &[&str], &[&str]); 4] = [
+        ("square", "Square.png", &["PNG", "CF_DIB", "CF_HDROP", "Preferred DropEffect"], &["JFIF"]),
+        ("happy dance", "Happy dance.gif", &["GIF", "CF_HDROP", "Preferred DropEffect"], &["PNG", "CF_DIB", "JFIF"]),
+        ("race clip", "Race clip.mp4", &["CF_HDROP", "Preferred DropEffect"], &["PNG", "CF_DIB", "GIF", "JFIF"]),
+        // A JPEG offers its own bytes (JFIF), a bitmap and the file.
+        ("wallpaper", "Wallpaper.jpg", &["JFIF", "CF_DIB", "CF_HDROP", "Preferred DropEffect"], &["PNG", "GIF"]),
     ];
     for (query, name, needed, absent) in cases {
         if !paste(r, t, query) {
@@ -1419,6 +1665,17 @@ fn paste_tests(r: &mut Report, t: &Session) -> bool {
             let dib = std::fs::read_to_string(t.out.join("paste-dib.txt")).unwrap_or_default();
             r.check("the bitmap on the clipboard has the picture's size (300 x 300)", dib == "300 300", &dib);
         }
+        if name.ends_with(".jpg") {
+            let jfif = std::fs::read(t.out.join("paste-received.jfif")).ok();
+            let original = std::fs::read(&file).ok();
+            r.check(
+                "the JPEG on the clipboard (JFIF) is the original file, byte for byte",
+                jfif.is_some() && jfif == original,
+                &format!("{} bytes received, {} in the library", jfif.map_or(0, |b| b.len()), original.map_or(0, |b| b.len())),
+            );
+            let dib = std::fs::read_to_string(t.out.join("paste-dib.txt")).unwrap_or_default();
+            r.check("…and its bitmap has the picture's size (1920 x 1080)", dib == "1920 1080", &dib);
+        }
         let (kind, text) = status(t.main);
         r.check(&format!("{name}: the app records the paste"), kind == 1, &text);
     }
@@ -1427,7 +1684,7 @@ fn paste_tests(r: &mut Report, t: &Session) -> bool {
     t.state_has(
         r,
         "pastes go to the top of Recently used, newest first",
-        &["names=Race clip.mp4|Happy dance.gif|Square.png|"],
+        &["names=Wallpaper.jpg|Race clip.mp4|Happy dance.gif|Square.png|"],
     );
     if guard(r, &t.allowed) {
         press(&[VK_ESCAPE]);
@@ -1445,6 +1702,20 @@ fn paste_tests(r: &mut Report, t: &Session) -> bool {
     r.check("…and the popup stays on screen", is_visible(t.popup), "");
     r.check("…without taking focus from the app", foreground() == t.target, &describe_foreground());
     t.shot(r, "state-popup-stays-open");
+    // A second paste from the popup that stayed open (a click on the tile).
+    fresh(t);
+    t.click(r, El::Tile(0));
+    let again = wait_until(3000, || formats_file.exists());
+    let hdrop = std::fs::read_to_string(t.out.join("paste-hdrop.txt")).unwrap_or_default();
+    let hello = media_file(&t.out, "Hello.gif");
+    r.check(
+        "with Close after inserting off, a second paste from the open popup arrives too",
+        again && hdrop == hello.display().to_string(),
+        &format!("target got: {hdrop:?}; {}", t.describe()),
+    );
+    r.check("…the popup still stays on screen", is_visible(t.popup), "");
+    r.check("…and the app has the focus again", wait_until(1500, || foreground() == t.target), &describe_foreground());
+    t.shot(r, "state-popup-second-paste");
     send(t.main, CMD_SET_CLOSE_AFTER, 1);
     if t.open(r) && guard(r, &t.allowed) {
         press(&[VK_ESCAPE]);
@@ -2055,10 +2326,13 @@ mod tests {
             CMD_LOSE_TARGET,
             CMD_D2D_TARGETS,
             CMD_SHORTCUT,
+            CMD_FIRST_START,
+            CMD_MANY_ITEMS,
             preview_test::CMD_PREVIEW_DESCRIBE,
             preview_test::CMD_THUMBS_RESET,
             preview_test::CMD_SET_VIDEO_PREVIEW,
             preview_test::CMD_MANAGER_SHOW,
+            preview_test::CMD_SET_PROFILE,
             watch_test::CMD_LIB_FIND,
             watch_test::CMD_WATCH_DESCRIBE,
             watch_test::CMD_WATCH_RESTART,
@@ -2071,7 +2345,7 @@ mod tests {
         assert_eq!(sorted.len(), all.len(), "two self-test commands share a number: {all:?}");
         // The ranges the UI thread dispatches on hold only their own module's commands.
         for c in all {
-            let in_preview = (preview_test::CMD_PREVIEW_DESCRIBE..=preview_test::CMD_MANAGER_SHOW).contains(&c);
+            let in_preview = (preview_test::CMD_PREVIEW_DESCRIBE..=preview_test::CMD_SET_PROFILE).contains(&c);
             let in_watch = (watch_test::CMD_LIB_FIND..=watch_test::CMD_WATCH_RESTART).contains(&c);
             let in_shortcut = (shortcut_test::CMD_SC_TRY..=shortcut_test::CMD_SC_FREE).contains(&c);
             let own = [
@@ -2079,6 +2353,7 @@ mod tests {
                 preview_test::CMD_THUMBS_RESET,
                 preview_test::CMD_SET_VIDEO_PREVIEW,
                 preview_test::CMD_MANAGER_SHOW,
+                preview_test::CMD_SET_PROFILE,
                 watch_test::CMD_LIB_FIND,
                 watch_test::CMD_WATCH_DESCRIBE,
                 watch_test::CMD_WATCH_RESTART,

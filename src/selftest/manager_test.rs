@@ -4,13 +4,16 @@
 
 use std::time::{Duration, Instant};
 
-use windows::Win32::UI::Input::KeyboardAndMouse::{VK_A, VK_BACK, VK_C, VK_CONTROL, VK_ESCAPE, VK_TAB, VK_V};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    VIRTUAL_KEY, VK_A, VK_BACK, VK_C, VK_CONTROL, VK_DELETE, VK_END, VK_ESCAPE, VK_F2, VK_HOME, VK_NEXT, VK_PRIOR, VK_TAB, VK_V,
+};
 
 use super::{
     ALL, CMD_FOCUS, CMD_HOTKEY_OK, CMD_MANAGER, CMD_MANAGER_ADD_POINT, CMD_MANAGER_DESCRIBE, CMD_MANAGER_POINT, CMD_RESET,
     DESCRIBE, El, Report, Session, capture_screen, describe_foreground, drag_to_target, foreground, guard, is_visible,
-    media_file, mouse_button, mouse_to, press, save_capture, send, type_unicode, unpack, wait_until, window_rect,
+    media_file, mouse_button, mouse_to, post, press, save_capture, send, type_unicode, unpack, wait_until, window_rect,
 };
+use windows::Win32::UI::WindowsAndMessaging::WM_CLOSE;
 use crate::ui::manager_view::MHit;
 
 const BY_NAME: [&str; 8] = [
@@ -357,6 +360,9 @@ pub(super) fn run(r: &mut Report, t: &Session) -> bool {
         &["total=12", "selected=\"Hello (2).gif\"", "names=Hello (2).gif|IMG_4821.png|Clip.mp4|Wave.gif|Cat.png|", "5 files added"],
     );
 
+    if !keyboard_tests(r, t, &m) {
+        return false;
+    }
     transfer_tests(r, t, &m);
 
     // The popup sees the same library: the rename, the removal and the import.
@@ -379,6 +385,143 @@ pub(super) fn run(r: &mut Report, t: &Session) -> bool {
     r.check("× hides the Manager", wait_until(1500, || !is_visible(hwnd)), "");
     // The UI thread still answers and the (hidden) window still exists.
     r.check("the app is still running after ×", send(t.main, CMD_MANAGER, 0) == hwnd, "");
+    true
+}
+
+/// Page Down and Page Up on 48 items, more than a page holds
+/// (with 12 items a page held them all). Leaves the library reset.
+pub(super) fn page_keys(r: &mut Report, t: &Session) -> bool {
+    super::preview_test::close_windows(r, t);
+    send(t.main, CMD_RESET, 0);
+    let total = send(t.main, super::CMD_MANY_ITEMS, 40);
+    if !t.open(r) || !t.click(r, El::OpenManager) {
+        return false;
+    }
+    let hwnd = send(t.main, CMD_MANAGER, 0);
+    if !wait_until(2000, || hwnd != 0 && is_visible(hwnd) && foreground() == hwnd) {
+        return r.check("Page keys: the Manager opens", false, &describe_foreground());
+    }
+    let m = Mgr { t, hwnd };
+    m.click(r, MHit::Tile(0));
+    m.park();
+    let d = m.describe();
+    let names: Vec<String> = d.split("names=").nth(1).unwrap_or("").split('|').filter(|n| !n.is_empty()).map(String::from).collect();
+    let page = d.split("page=").nth(1).and_then(|p| p.split_whitespace().next()).and_then(|p| p.parse::<usize>().ok()).unwrap_or(0);
+    let n = names.len();
+    // Fair only when two pages down is still short of the end.
+    let fair = page >= 1 && 2 * page < n;
+    r.check(
+        "Page keys: the library holds more than two pages of items",
+        fair && d.contains("focus=Gallery"),
+        &format!("{n} items (library said {total}), a page is {page}; {}", d.chars().take(200).collect::<String>()),
+    );
+    if !fair {
+        return true;
+    }
+    for (vk, want, name) in [
+        (VK_NEXT, page, "Page Down moves the selection one page (the rows that fit) down"),
+        (VK_NEXT, 2 * page, "…a second Page Down moves another page"),
+        (VK_PRIOR, page, "Page Up moves it back up a page"),
+    ] {
+        if !guard(r, &t.allowed) {
+            return false;
+        }
+        press(&[vk]);
+        std::thread::sleep(Duration::from_millis(200));
+        let d = m.describe();
+        let got = selected(&d);
+        r.check(
+            &format!("Manager: {name}"),
+            got == names[want] && d.contains("focus=Gallery"),
+            &format!("selected {got:?}, wanted {:?} (item {want} of {n}, a page is {page} items)", names[want]),
+        );
+        if want == 2 * page {
+            m.park();
+            m.shot(r, "state-manager-page-down");
+        }
+    }
+    post(hwnd, WM_CLOSE, 0, 0);
+    wait_until(1500, || !is_visible(hwnd));
+    send(t.main, CMD_RESET, 0);
+    true
+}
+
+/// The `selected="…"` name in a Manager description.
+fn selected(d: &str) -> String {
+    d.split("selected=\"").nth(1).and_then(|s| s.split('"').next()).unwrap_or("").to_string()
+}
+
+/// The gallery keys Home, End, Page Down, Page Up, Delete (asks
+/// first; Escape keeps the item) and F2 (renames, the whole name selected), on
+/// the 12 items after the Manager's import. Nothing is renamed or removed.
+fn keyboard_tests(r: &mut Report, t: &Session, m: &Mgr) -> bool {
+    send(t.main, CMD_FOCUS, m.hwnd);
+    wait_until(1500, || foreground() == m.hwnd);
+    m.click(r, MHit::Tile(0));
+    m.park();
+    let d = m.describe();
+    let names: Vec<String> = d.split("names=").nth(1).unwrap_or("").split('|').filter(|n| !n.is_empty()).map(String::from).collect();
+    let page = d.split("page=").nth(1).and_then(|p| p.split_whitespace().next()).and_then(|p| p.parse::<usize>().ok()).unwrap_or(0);
+    let n = names.len();
+    if n < 2 || !d.contains("focus=Gallery") {
+        return r.check("Manager keys: the gallery has the focus and at least 2 items", false, &d);
+    }
+    let key = |r: &mut Report, vk: VIRTUAL_KEY| -> Option<String> {
+        if !guard(r, &t.allowed) {
+            return None;
+        }
+        press(&[vk]);
+        std::thread::sleep(Duration::from_millis(200));
+        Some(m.describe())
+    };
+    // Page Down and Page Up are checked on a library bigger than a page (`page_keys`):
+    // here a page holds all 12 items, so Page Down would land where End does.
+    for (vk, want, name) in [(VK_END, n - 1, "End selects the last item"), (VK_HOME, 0, "Home selects the first item")] {
+        let Some(d) = key(r, vk) else { return false };
+        let got = selected(&d);
+        r.check(
+            &format!("Manager: {name}"),
+            got == names[want] && d.contains("focus=Gallery"),
+            &format!("selected {got:?}, wanted {:?} (item {want} of {n}, a page is {page} items)", names[want]),
+        );
+    }
+
+    // Delete asks first, like the button; Escape keeps the item.
+    let first = names[0].clone();
+    let file = media_file(&t.out, &first);
+    let Some(d) = key(r, VK_DELETE) else { return false };
+    m.park();
+    m.shot(r, "state-manager-delete-key-confirm");
+    r.check(
+        "Manager: Delete asks before moving the selected item to the Recycle Bin",
+        d.contains("confirming=true") && d.contains(&format!("total={n}")) && selected(&d) == first,
+        &d,
+    );
+    let Some(d) = key(r, VK_ESCAPE) else { return false };
+    r.check(
+        "…Escape answers no: the item and its file stay",
+        d.contains("confirming=false") && d.contains(&format!("total={n}")) && file.is_file(),
+        &format!("{} is a file: {}; {d}", file.display(), file.is_file()),
+    );
+
+    // F2 starts a rename with the whole name selected; Escape gives the name back.
+    m.click(r, MHit::Tile(0));
+    let base = first.rsplit_once('.').map_or(first.as_str(), |(b, _)| b).to_string();
+    let Some(d) = key(r, VK_F2) else { return false };
+    r.check("Manager: F2 starts renaming the selected item", d.contains("focus=RenameInput") && d.contains(&format!("rename={base:?}")), &d);
+    if !guard(r, &t.allowed) {
+        return false;
+    }
+    type_unicode("Keyboard name");
+    std::thread::sleep(Duration::from_millis(200));
+    let d = m.describe();
+    r.check("…with the whole name selected: typing replaces it", d.contains("rename=\"Keyboard name\""), &d);
+    let Some(d) = key(r, VK_ESCAPE) else { return false };
+    r.check(
+        "…and Escape gives the name back; nothing was renamed",
+        d.contains(&format!("rename={base:?}")) && selected(&d) == first && file.is_file(),
+        &d,
+    );
     true
 }
 

@@ -32,6 +32,8 @@ pub(super) const CMD_THUMBS_RESET: usize = 22;
 pub(super) const CMD_SET_VIDEO_PREVIEW: usize = 23;
 /// lparam 0: minimise the Manager, 1: restore it.
 pub(super) const CMD_MANAGER_SHOW: usize = 24;
+/// lparam 1: Open faster, 0: Use less memory (saved, as Settings would).
+pub(super) const CMD_SET_PROFILE: usize = 25;
 
 const STRESS_DIR: &str = "stress-src-v2";
 const MIB: f64 = 1024.0 * 1024.0;
@@ -55,6 +57,15 @@ pub(super) fn on_ui_command(cmd: usize, arg: isize) -> isize {
             crate::manager::reload_settings();
         }
         CMD_MANAGER_SHOW => crate::manager::test_show_state(arg != 0),
+        CMD_SET_PROFILE => {
+            use crate::settings_state::Profile;
+            let mut s = crate::store::settings();
+            s.profile = if arg != 0 { Profile::OpenFaster } else { Profile::LessMemory };
+            let saved = crate::store::save_settings(s).is_ok();
+            crate::manager::reload_settings();
+            // The settings live on this thread: 1 = Open faster is saved now, 0 = Use less memory.
+            return (saved && crate::store::settings().profile == Profile::OpenFaster) as isize;
+        }
         _ => {}
     }
     0
@@ -275,7 +286,25 @@ pub(super) fn run(r: &mut Report, t: &Session) -> bool {
     }
 
     // 7. The stress test.
-    stress_test(r, t)
+    stress_test(r, t, false)
+}
+
+/// The quick run (`--only stress` or `--only jump`): the 1,000-file import and the
+/// jump to the middle, from a fresh library and thumbnail cache; `stress` also
+/// browses with Open faster.
+pub(super) fn stress_only(r: &mut Report, t: &Session, open_faster: bool) -> bool {
+    let _com = crate::wic::ComThread::init();
+    close_windows(r, t);
+    send(t.main, CMD_RESET, 0);
+    let _ = std::fs::remove_dir_all(t.out.join("app").join("Cache").join(crate::thumb_store::DIR));
+    send(t.main, CMD_THUMBS_RESET, 0);
+    if !stress_test(r, t, true) {
+        return false;
+    }
+    if open_faster {
+        open_faster_test(r, t);
+    }
+    true
 }
 
 /// A crafted GIF: a 100 x 100 picture whose frame claims to be
@@ -542,8 +571,9 @@ fn jump(r: &mut Report, t: &Session, down: bool) -> bool {
     if !guard(r, &t.allowed) {
         return false;
     }
-    let delta = if down { -120 * 270 } else { 120 * 270 };
-    let inputs: Vec<_> = (0..6)
+    // 1,620 notches in steps of 20 (large single steps did not scroll).
+    let delta = if down { -120 * 20 } else { 120 * 20 };
+    let inputs: Vec<_> = (0..81)
         .map(|_| {
             let mut i = super::mouse(windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_WHEEL, 0, 0);
             i.Anonymous.mi.mouseData = delta as u32;
@@ -554,7 +584,40 @@ fn jump(r: &mut Report, t: &Session, down: bool) -> bool {
     true
 }
 
-fn stress_test(r: &mut Report, t: &Session) -> bool {
+/// Jumps the popup's gallery from the top to the middle of `count` tiles in one
+/// input batch, so the tiles in between are never drawn. Returns the notches sent
+/// and the scroll offset (DIPs) the middle should be at.
+fn jump_middle(r: &mut Report, t: &Session, count: usize) -> Option<(i32, f32)> {
+    use crate::ui::layout::{Grid, Rect};
+    // The row height does not depend on the window's width.
+    let half = Grid::new(Rect::new(0.0, 0.0, 500.0, 500.0)).content_height(count) / 2.0;
+    let notches = (half / crate::popup::WHEEL_STEP).round() as i32;
+    let (x, y) = t.point(El::GalleryGap)?;
+    if !guard(r, &t.allowed) {
+        return None;
+    }
+    mouse_to(x, y);
+    std::thread::sleep(Duration::from_millis(80));
+    if !guard(r, &t.allowed) {
+        return None;
+    }
+    // Steps of 20 notches, the size the fast-scroll checks use
+    // (two events of up to 270 notches did not move the gallery at all).
+    let mut left = notches;
+    let mut inputs = Vec::new();
+    while left > 0 {
+        let n = left.min(20);
+        let mut i = super::mouse(windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_WHEEL, 0, 0);
+        i.Anonymous.mi.mouseData = (-120 * n) as u32;
+        inputs.push(i);
+        left -= n;
+    }
+    super::send_inputs(&inputs);
+    Some((notches, half))
+}
+
+/// `quick`: only the import, the jump and Open faster (the quick run).
+fn stress_test(r: &mut Report, t: &Session, quick: bool) -> bool {
     let started = Instant::now();
     let src = match make_stress(&t.out) {
         Ok(d) => d,
@@ -598,20 +661,42 @@ fn stress_test(r: &mut Report, t: &Session) -> bool {
     let baseline = private_bytes();
     r.info(&format!("All media: {}; private bytes {}", t.describe().split(" names=").next().unwrap_or(""), mib(baseline)));
 
-    // A jump to the end: only the tiles shown there get thumbnails.
-    if !jump(r, t, true) {
-        return r.check("jump to the end of the gallery", false, "input stopped");
-    }
+    // A jump to the middle: only the tiles shown there get thumbnails, and they do
+    // get them (the end of the list holds the seed files, made
+    // earlier, so a jump there proved nothing with 0 made).
+    let hits0 = field(&describe(t, 0), "disk_hits");
+    let Some((notches, half)) = jump_middle(r, t, 1008) else {
+        return r.check("jump to the middle of the gallery", false, "input stopped");
+    };
+    // Wait for the popup to draw the new place first: right after the scroll its
+    // last frame is still the top's, which `settle` would accept at once (quick
+    // run 1: the screenshot showed the middle's thumbnails, the counts were the top's).
+    let started = wait_until(5000, || {
+        let d = describe(t, 0);
+        field(&d, "made") > made0 || field(&d, "disk_hits") > hits0
+    });
     settle(t, 0, 20_000);
+    std::thread::sleep(Duration::from_millis(500));
     let d = describe(t, 0);
     let made_jump = field(&d, "made") - made0;
+    let popup = t.describe();
+    // The gallery really moved, far from the top: between a quarter and three
+    // quarters of the list. Windows drops a step or two of a big wheel batch now
+    // and then (quick runs 1 and 2 stopped 1 and 2 steps of 20 notches short).
+    let scroll = field(&popup, "scroll") as f32;
+    let moved = (half * 0.5..=half * 1.5).contains(&scroll);
+    shot_popup(r, t, "state-popup-jumped-to-middle");
     r.check(
-        "jumping to the end makes thumbnails only for the tiles shown there",
-        (0..=30).contains(&made_jump) && t.describe().contains("count=1008"),
-        &format!("{made_jump} made; {d}"),
+        "jumping to the middle of 1,008 files makes thumbnails for the tiles shown there, and only for them",
+        moved && (1..=30).contains(&made_jump) && field(&d, "drawn") > 0 && popup.contains("count=1008"),
+        &format!("scrolled to {scroll:.0} DIP (middle {half:.0}, accepted {:.0}-{:.0}) after {notches} notches; work started within 5 s: {started}; {made_jump} made; {d}", half * 0.5, half * 1.5),
     );
     jump(r, t, false);
     settle(t, 0, 20_000);
+    r.info(&format!("back at the top: scrolled to {} DIP", field(&t.describe(), "scroll")));
+    if quick {
+        return true;
+    }
 
     // Down to the end and back, fast, twice.
     let mut peak = baseline;
@@ -700,5 +785,71 @@ fn stress_test(r: &mut Report, t: &Session) -> bool {
         std::thread::sleep(Duration::from_millis(1500));
         r.info(&format!("private bytes with the popup hidden: {}", mib(private_bytes())));
     }
+    open_faster_test(r, t);
     true
+}
+
+/// Browsing the 1,008 files with Open faster. Its RAM
+/// cache may hold 16 MiB (Use less memory: 8), and hiding the popup keeps it,
+/// so the popup opens again without making or reading anything.
+fn open_faster_test(r: &mut Report, t: &Session) {
+    use crate::settings_state::Profile;
+    // Asked on the window thread: the settings are not readable from this one
+    // (read from here, it gave the defaults and reported "saved: false").
+    let chosen = send(t.main, CMD_SET_PROFILE, 1) == 1;
+    let less = crate::thumbs::budget(Profile::LessMemory) as i64;
+    let faster = crate::thumbs::budget(Profile::OpenFaster) as i64;
+    if !open_all_media(r, t) {
+        send(t.main, CMD_SET_PROFILE, 0);
+        r.check("open the popup on All media (Open faster)", false, &t.describe());
+        return;
+    }
+    settle(t, 0, 10_000);
+    // Browse: down to the end and back to the top, quickly (as in the stress test).
+    let mut peak = 0;
+    for notches in [-1100, 1100] {
+        if fast_scroll(r, t, notches).is_none() {
+            send(t.main, CMD_SET_PROFILE, 0);
+            r.check("scroll the popup quickly (Open faster)", false, "input stopped");
+            return;
+        }
+        settle(t, 0, 20_000);
+        std::thread::sleep(Duration::from_millis(400));
+        peak = peak.max(field(&describe(t, 0), "ram_bytes"));
+    }
+    let d = describe(t, 0);
+    let ram = field(&d, "ram_bytes");
+    shot_popup(r, t, "state-popup-open-faster-browsed");
+    r.check(
+        "with Open faster, browsing 1,008 files keeps more thumbnails in RAM than Use less memory may (8 MiB), within its own 16 MiB",
+        chosen && ram > less && peak <= faster,
+        &format!("profile Open faster saved: {chosen}; RAM cache {} now, {} at most; {d}", mib(ram.max(0) as u64), mib(peak.max(0) as u64)),
+    );
+    // Hidden, the popup is kept ready: nothing is released.
+    if guard(r, &t.allowed) {
+        press(&[VK_ESCAPE]);
+    }
+    let hidden = wait_until(1500, || !is_visible(t.popup));
+    std::thread::sleep(Duration::from_millis(300));
+    let after_hide = describe(t, 0);
+    r.check(
+        "…hiding the popup keeps its thumbnails in RAM (the popup is kept ready)",
+        hidden && field(&after_hide, "ram_bytes") == ram && ram > 0,
+        &after_hide,
+    );
+    // Opened again on the same tiles: they come from RAM, nothing is made or read from disk.
+    let (made, hits) = (field(&after_hide, "made"), field(&after_hide, "disk_hits"));
+    let opened = open_all_media(r, t);
+    let ready = opened && settle(t, 0, 5000);
+    let again = describe(t, 0);
+    r.check(
+        "…and opening it again shows the tiles from RAM, without making or reading any thumbnail",
+        ready && field(&again, "made") == made && field(&again, "disk_hits") == hits && field(&again, "drawn") > 0,
+        &format!("made {made} -> {}, disk hits {hits} -> {}; {again}", field(&again, "made"), field(&again, "disk_hits")),
+    );
+    if guard(r, &t.allowed) {
+        press(&[VK_ESCAPE]);
+    }
+    wait_until(1500, || !is_visible(t.popup));
+    send(t.main, CMD_SET_PROFILE, 0);
 }

@@ -214,7 +214,7 @@ impl PopupState {
         match self.empty(lib) {
             Some(Empty::NoMatch) => self.clear_filters(),
             Some(Empty::NoHistory) => self.set_list(ListKind::All),
-            // Add media is a later phase.
+            // Add media opens a panel, which the popup window does itself.
             Some(Empty::NoLibrary) | None => {}
         }
     }

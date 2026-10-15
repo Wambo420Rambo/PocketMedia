@@ -587,6 +587,8 @@ impl View {
                 self.hover = MHit::None;
             }
             MHit::AddMedia => self.add = Some(AddPanel::new()),
+            // The empty state's button: "Add media" when the library is empty, else "Clear filters".
+            MHit::EmptyAction if library::with(|lib| lib.items.is_empty()) => self.add = Some(AddPanel::new()),
             MHit::ClearFilters | MHit::EmptyAction => library::with(|lib| s.clear_filters(lib)),
             MHit::Sort => s.sort_open = if s.sort_open.is_some() { None } else { Some(s.sort.index()) },
             MHit::SortRow(i) => {
@@ -1892,10 +1894,12 @@ pub fn describe() -> String {
         let s = &v.state;
         library::with(|lib| {
             let names: Vec<&str> = s.visible(lib).iter().map(|i| i.name.as_str()).collect();
-            let scrollbar = v.layout(lib).grid.scrollbar(names.len(), s.scroll).is_some();
+            let grid = v.layout(lib).grid;
+            let scrollbar = grid.scrollbar(names.len(), s.scroll).is_some();
+            let page = grid.page();
             format!(
                 "screen=manager filter={:?} sort={:?} query={:?} focus={:?} selected={:?} rename={:?} error={:?} \
-                 can_rename={} confirming={} status={:?} scrollbar={scrollbar} opened={:?} tip={:?} total={} count={} names={}",
+                 can_rename={} confirming={} status={:?} scrollbar={scrollbar} page={page} opened={:?} tip={:?} total={} count={} names={}",
                 s.filter,
                 s.sort,
                 s.search.text(),

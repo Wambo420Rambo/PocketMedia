@@ -19,7 +19,7 @@ use windows::core::w;
 
 use crate::add_panel::{AddOutcome, AddPanel, Area};
 use crate::library::{self, Library};
-use crate::popup_state::{Focus, ListKind, PopupState, TypeFilter};
+use crate::popup_state::{Empty, Focus, ListKind, PopupState, TypeFilter};
 use crate::target::{self, NoTarget, Target};
 use crate::ui::add_view::AddHit;
 use crate::ui::d2d::Gfx;
@@ -31,7 +31,8 @@ use crate::winutil::{self, WM_MOUSELEAVE};
 use crate::{StatusKind, app, manager, paste, set_status};
 
 const EMPTY_ACTIONS: [&str; 3] = ["Clear filters", "Show all media", "Add media"];
-const WHEEL_STEP: f32 = 48.0;
+/// DIPs the gallery scrolls per wheel notch (the self-test jumps by it).
+pub const WHEEL_STEP: f32 = 48.0;
 
 struct View {
     state: PopupState,
@@ -480,6 +481,8 @@ impl View {
                     s.status = Some(format!("History cleared, but {e}."));
                 }
             }
+            // On an empty library the button is "Add media" (the other cases are plain state).
+            Hit::EmptyAction if library::with(|lib| s.empty(lib)) == Some(Empty::NoLibrary) => self.add = Some(AddPanel::new()),
             Hit::EmptyAction => library::with(|lib| s.run_empty_action(lib)),
             Hit::Tile(_) => return Effect::Activate,
             Hit::SearchClear => {
@@ -1036,13 +1039,15 @@ pub fn describe_state() -> String {
         library::with(|lib| {
             let names: Vec<&str> = s.visible(lib).iter().map(|i| i.name.as_str()).collect();
             format!(
-                "screen=gallery status={:?} list={:?} filter={:?} query={:?} focus={:?} tip={:?} count={} names={}",
+                "screen=gallery status={:?} list={:?} filter={:?} query={:?} focus={:?} tip={:?} empty={:?} scroll={:.0} count={} names={}",
                 s.status.as_deref().unwrap_or(""),
                 s.list,
                 s.filter,
                 s.search.text(),
                 s.focus,
                 v.tip.and_then(|i| names.get(i).copied()).unwrap_or(""),
+                s.empty(lib),
+                s.scroll,
                 names.len(),
                 names.join("|")
             )

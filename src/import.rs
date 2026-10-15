@@ -619,6 +619,33 @@ pub mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// The same on Windows, with real junctions (what
+    /// `mklink /J` makes; no administrator needed): one into a folder outside
+    /// the chosen one, one back to the chosen folder itself.
+    #[cfg(windows)]
+    #[test]
+    fn junctions_are_not_followed() {
+        let root = temp("junctions");
+        let media = media(&root);
+        let src = root.join("src");
+        let outside = root.join("outside");
+        write(&src.join("a.png"), b"a");
+        write(&outside.join("Outside.png"), b"outside");
+        for (link, to) in [(src.join("linked"), &outside), (src.join("loop"), &src)] {
+            let made = std::process::Command::new("cmd").arg("/C").arg("mklink").arg("/J").arg(&link).arg(to).output().unwrap();
+            assert!(made.status.success(), "mklink /J failed: {}", String::from_utf8_lossy(&made.stderr));
+            // The junction works: the file behind it can be reached through it.
+            assert!(link.join(if to == &outside { "Outside.png" } else { "a.png" }).is_file());
+        }
+        let c = scan(&Source::Folder(src.clone()), &media, &no_cancel()).unwrap();
+        let names: Vec<&str> = c.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["a.png"], "a junction was followed");
+        // remove_dir_all removes a junction itself, not what it points to.
+        let _ = fs::remove_dir_all(&src);
+        assert!(outside.join("Outside.png").is_file());
+        let _ = fs::remove_dir_all(&root);
+    }
+
     fn known(media: &Path, id: u32, rel: &str, bytes: &[u8]) -> KnownFile {
         write(&media.join(rel), bytes);
         let name = rel.rsplit('/').next().unwrap().to_string();

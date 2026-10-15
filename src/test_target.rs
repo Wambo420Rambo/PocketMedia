@@ -203,6 +203,12 @@ fn on_paste(hwnd: HWND) {
         let h = dib.get(8..12).map(|b| i32::from_le_bytes(b.try_into().unwrap_or_default())).unwrap_or(0);
         write_result("paste-dib.txt", format!("{w} {h}").as_bytes());
     }
+    // A JPEG's own bytes (compared with the library file).
+    // SAFETY: registering a format name has no preconditions.
+    let jfif = unsafe { RegisterClipboardFormatW(w!("JFIF")) };
+    if let Some(bytes) = clipboard_bytes(jfif) {
+        write_result("paste-received.jfif", &bytes);
+    }
     // SAFETY: registering a format name has no preconditions.
     let png = unsafe { RegisterClipboardFormatW(w!("PNG")) };
     match clipboard_bytes(png) {
