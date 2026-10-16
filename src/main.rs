@@ -345,11 +345,7 @@ fn run(mode: &Mode) -> Result<(), String> {
         Ok(n) => SESSION_NOTES.with(|s| *s.borrow_mut() = Some(n)),
         Err(e) => selftest::note(&e),
     }
-    if let Some(p) = paths::get()
-        && let Err(e) = watch::start(&p.media, watch::BUFFER)
-    {
-        report_watch_failure(&e);
-    }
+    let watching = paths::get().map(|p| watch::start(&p.media, watch::BUFFER));
 
     // Open faster keeps the small popup ready from the
     // start; with Use less memory it is made when it is first opened.
@@ -362,6 +358,11 @@ fn run(mode: &Mode) -> Result<(), String> {
     if let Err(reason) = hotkey::start(main, shortcut) {
         tray::set_tip(main, "PocketMedia - shortcut unavailable");
         report_hotkey_failure(&shortcut.label(), &reason);
+    }
+    // Said only now, once the tray icon and the shortcut work: the message box waits
+    // for OK, and nothing else should wait with it.
+    if let Some(Err(e)) = watching {
+        report_watch_failure(&e);
     }
 
     match mode {
