@@ -130,7 +130,7 @@ enum El {
     /// Add media's × (closes the popup while an import may still be copying).
     AddClose,
     Chip(usize),
-    /// Recently used (0) or All media (1).
+    /// All media (0) or Recently used (1).
     Tab(usize),
     GalleryGap,
     ClearHistory,
@@ -976,6 +976,8 @@ fn run_input_tests(r: &mut Report, t: &Session) -> bool {
     if !t.open(r) {
         return false;
     }
+    t.state_has(r, "the popup opens on All media", &["list=All"]);
+    t.click(r, El::Tab(1));
     t.park();
     t.shot(r, "focused-01-popup-recent");
     t.expect(r, "Recently used list (focused-01)", &RECENT);
@@ -984,7 +986,7 @@ fn run_input_tests(r: &mut Report, t: &Session) -> bool {
     t.shot(r, "focused-01-popup-recent-scrolled1");
     r.check("gallery scrolls inside the window", popup_size_unchanged(t.popup()), "window size unchanged after scrolling");
 
-    t.click(r, El::Tab(1));
+    t.click(r, El::Tab(0));
     t.park();
     t.shot(r, "focused-02-popup-all-media");
     t.expect(r, "All media list (focused-02)", &ALL);
@@ -1083,7 +1085,7 @@ fn run_input_tests(r: &mut Report, t: &Session) -> bool {
     if !t.open(r) {
         return false;
     }
-    t.click(r, El::Tab(0));
+    t.click(r, El::Tab(1));
     t.click(r, El::ClearHistory);
     t.park();
     t.shot(r, "state-history-cleared");
@@ -1538,7 +1540,7 @@ fn drag_test(r: &mut Report, t: &Session) {
     let (kind, text) = status(t.main);
     r.check("app records drag result", kind == 1, &text);
     t.open(r);
-    t.click(r, El::Tab(0));
+    t.click(r, El::Tab(1));
     let d = t.describe();
     r.check("a finished copy-drag goes to the top of Recently used", d.contains(&format!("names={dragged}|")), &d);
 }
@@ -1719,7 +1721,7 @@ fn paste_tests(r: &mut Report, t: &Session) -> bool {
         r.check(&format!("{name}: the app records the paste"), kind == 1, &text);
     }
     t.open(r);
-    t.click(r, El::Tab(0));
+    t.click(r, El::Tab(1));
     t.state_has(
         r,
         "pastes go to the top of Recently used, newest first",
@@ -1799,7 +1801,7 @@ fn paste_tests(r: &mut Report, t: &Session) -> bool {
     if !t.open(r) {
         return false;
     }
-    t.click(r, El::Tab(0));
+    t.click(r, El::Tab(1));
     let d = t.describe();
     r.check(
         "…and it is not counted as used",

@@ -194,7 +194,7 @@ pub(super) fn open_all_media(r: &mut Report, t: &Session) -> bool {
         return false;
     }
     t.click(r, El::Chip(0));
-    t.click(r, El::Tab(1));
+    t.click(r, El::Tab(0));
     t.park();
     t.describe().contains("list=All")
 }

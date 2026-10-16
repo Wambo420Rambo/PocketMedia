@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- The quick popup always opens on All media, and its tabs read All media, then Recent.
+- GIF tiles are labeled "GIF" instead of "GIF · loop".
+
 ## 1.0.0 (2026-10-16)
 
 The first release.

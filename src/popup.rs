@@ -800,8 +800,8 @@ impl View {
                 _ => {}
             },
             Focus::List => match vk {
-                VK_LEFT | VK_UP => s.set_list(ListKind::Recent),
-                VK_RIGHT | VK_DOWN => s.set_list(ListKind::All),
+                VK_LEFT | VK_UP => s.set_list(ListKind::All),
+                VK_RIGHT | VK_DOWN => s.set_list(ListKind::Recent),
                 VK_RETURN | VK_SPACE => s.set_list(if s.list == ListKind::Recent { ListKind::All } else { ListKind::Recent }),
                 _ => {}
             },

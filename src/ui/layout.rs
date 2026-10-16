@@ -1,5 +1,5 @@
 //! Quick popup geometry in DIPs (the search box is the header,
-//! a segmented type control and Recent / All media tabs under it, the gallery,
+//! a segmented type control and All media / Recent tabs under it, the gallery,
 //! and a footer with Clear history, Manager and Add). Also the Rect, text
 //! styles and the tile grid shared by every window.
 
@@ -134,7 +134,7 @@ pub enum Hit {
     Search,
     SearchClear,
     Chip(usize),
-    /// Recently used (0) or All media (1).
+    /// All media (0) or Recently used (1).
     ListTab(usize),
     Tile(usize),
     Scrollbar,
@@ -167,7 +167,7 @@ pub struct Layout {
     empty_action_w: Vec<(&'static str, f32)>,
 }
 
-pub const TAB_LABELS: [&str; 2] = ["Recent", "All media"];
+pub const TAB_LABELS: [&str; 2] = ["All media", "Recent"];
 pub const CHIP_LABELS: [&str; 4] = ["All", "GIF", "Picture", "Video"];
 pub const FOOTER_ADD: &str = "Add";
 pub const FOOTER_MANAGER: &str = "Manager";
@@ -199,8 +199,8 @@ impl Layout {
         let count_w = measure("0000", TextStyle::Small);
         let tab_label_w = TAB_LABELS.map(|l| measure(l, TextStyle::Label));
         let tab_w = |i: usize| tab_label_w[i] + 6.0 + count_w;
-        let all = Rect::new(right - tab_w(1), y2, tab_w(1), ROW2_H);
-        let recent = Rect::new(all.x - 14.0 - tab_w(0), y2, tab_w(0), ROW2_H);
+        let recent = Rect::new(right - tab_w(1), y2, tab_w(1), ROW2_H);
+        let all = Rect::new(recent.x - 14.0 - tab_w(0), y2, tab_w(0), ROW2_H);
 
         let footer = Rect::new(1.0, height - 1.0 - FOOTER_H, width - 2.0, FOOTER_H);
         let fy = footer.y + (FOOTER_H - FOOTER_BUTTON_H) / 2.0;
@@ -228,7 +228,7 @@ impl Layout {
             search_clear: sb.clear,
             chips_track,
             chips,
-            tabs: [recent, all],
+            tabs: [all, recent],
             tab_label_w,
             gallery,
             footer,

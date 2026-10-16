@@ -7,12 +7,12 @@ use crate::text_field::TextField;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ListKind {
-    Recent,
     All,
+    Recent,
 }
 
 impl ListKind {
-    pub const BOTH: [ListKind; 2] = [ListKind::Recent, ListKind::All];
+    pub const BOTH: [ListKind; 2] = [ListKind::All, ListKind::Recent];
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -112,7 +112,7 @@ impl Default for PopupState {
 impl PopupState {
     pub fn new() -> Self {
         Self {
-            list: ListKind::Recent,
+            list: ListKind::All,
             filter: TypeFilter::All,
             search: TextField::default(),
             selected: 0,
@@ -160,9 +160,10 @@ impl PopupState {
         (n > 0).then(|| self.selected.min(n - 1))
     }
 
-    /// Fresh start each time the popup opens: empty search with focus, top of the list.
-    /// The chosen list and type filter are kept.
+    /// Fresh start each time the popup opens: All media, empty search with focus, top
+    /// of the list. The chosen type filter is kept.
     pub fn reset_for_open(&mut self) {
+        self.list = ListKind::All;
         self.status = None;
         self.search.clear();
         self.focus = Focus::Search;
@@ -273,7 +274,8 @@ mod tests {
 
     #[test]
     fn recent_list_follows_usage_order() {
-        let (s, lib) = state();
+        let (mut s, lib) = state();
+        s.set_list(ListKind::Recent);
         assert_eq!(names(&s, &lib)[..3], ["Happy dance.gif", "Square.png", "Race clip.mp4"]);
         assert_eq!(names(&s, &lib)[3], "Celebration.mp4");
         assert_eq!(s.count_for(&lib, ListKind::Recent), 8);
@@ -331,6 +333,7 @@ mod tests {
     #[test]
     fn clear_history_only_clears_usage() {
         let (mut s, mut lib) = state();
+        s.set_list(ListKind::Recent);
         s.clear_history(&mut lib);
         assert_eq!(s.empty(&lib), Some(Empty::NoHistory));
         assert_eq!(lib.items.len(), 8);
@@ -360,6 +363,7 @@ mod tests {
         assert_eq!(s.focus, Focus::AddMedia);
         s.tab(&lib, false);
         assert_eq!(s.focus, Focus::Search, "wraps");
+        s.set_list(ListKind::Recent);
         s.clear_history(&mut lib);
         s.focus = Focus::List;
         s.tab(&lib, false);
@@ -377,6 +381,15 @@ mod tests {
         assert_eq!(s.count_for(&lib, ListKind::All), 3);
         lib.recent.truncate(1);
         assert_eq!(s.count_for(&lib, ListKind::Recent), 1, "Happy dance.gif");
+    }
+
+    #[test]
+    fn the_popup_starts_and_reopens_on_all_media() {
+        let (mut s, _lib) = state();
+        assert_eq!(s.list, ListKind::All);
+        s.set_list(ListKind::Recent);
+        s.reset_for_open();
+        assert_eq!(s.list, ListKind::All);
     }
 
     #[test]

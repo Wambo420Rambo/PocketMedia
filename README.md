@@ -19,7 +19,7 @@ PocketMedia is a small Windows tray app for your own GIFs, pictures and videos. 
 
 - **Open the quick popup:** press **Win + Alt + .** in any app. You can also left-click the tray icon. Press the shortcut again or Escape to close it.
 - **Tray icon:** right-click it for **Quick popup**, **Open manager**, **Settings** and **Exit**. Closing a window only hides it. PocketMedia keeps running in the tray until you choose Exit.
-- **Search:** just type. Every word you type must appear in the file name, in any order: `dance happy` finds `Happy dance.gif`. Use **All / GIF / Picture / Video** to narrow it down, and switch between **Recent** and **All media**.
+- **Search:** just type. Every word you type must appear in the file name, in any order: `dance happy` finds `Happy dance.gif`. Use **All / GIF / Picture / Video** to narrow it down, and switch between **All media** (where the popup always opens) and **Recent**.
 - **Paste:** click a tile, or press Enter. PocketMedia pastes the original file into the app you were in (Discord, Slack, a browser…).
 - **Drag out:** drag a tile into any app or folder that accepts files. This always copies; it never moves your file.
 - **Add media:** click **Add** in the popup or **Add media** in the Manager. Choose files or a folder (with its subfolders), or drop them on the window. You see a list first, where you can rename files. Identical files are skipped, and a different file with the same name gets a new name like `name (2).gif`. PocketMedia copies the files into its own Media folder; your originals stay where they are.

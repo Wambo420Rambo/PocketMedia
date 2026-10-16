@@ -49,7 +49,7 @@ pub fn paint(p: &Painter, s: &PopupState, lib: &Library, l: &Layout, ui: &Ui) {
     };
     widgets::segmented(p, l.chips_track, &l.chips, &CHIP_LABELS, chosen, hover, focus);
 
-    // Recent / All media tabs, each with its count.
+    // All media / Recent tabs, each with its count.
     for (i, (tab, kind)) in l.tabs.iter().zip(ListKind::BOTH).enumerate() {
         let on = s.list == kind;
         let label_r = Rect::new(tab.x, tab.y, l.tab_label_w[i] + 2.0, tab.h);
