@@ -12,7 +12,7 @@ pub enum MediaKind {
 impl MediaKind {
     pub fn badge(self) -> &'static str {
         match self {
-            MediaKind::Gif => "GIF · loop",
+            MediaKind::Gif => "GIF",
             MediaKind::Picture => "Picture",
             MediaKind::Video => "Video",
         }
