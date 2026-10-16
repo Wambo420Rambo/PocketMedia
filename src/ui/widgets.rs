@@ -388,7 +388,9 @@ pub fn tile(p: &Painter, item: &Item, r: Rect, look: TileLook, dpi: f32) {
         p.stroke(well.inset(-6.0), 16.0, 2.0, RING);
     }
     let name = super::layout::Layout::name(r);
-    p.text(&item.name, name, TextStyle::Small, if look.selected { SOFT_TEXT } else { TEXT }, Align::Start, true);
+    // The type badge already says what it is, so the tile shows the name without its extension.
+    let shown = crate::search::name_without_extension(&item.name);
+    p.text(shown, name, TextStyle::Small, if look.selected { SOFT_TEXT } else { TEXT }, Align::Start, true);
 }
 
 /// The thumbnail for a well, in device pixels: the media area 6px inside it.

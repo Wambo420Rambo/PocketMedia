@@ -26,7 +26,7 @@
 
 #ifndef AppVersion
   ; Keep in step with Cargo.toml.
-  #define AppVersion "0.1.0"
+  #define AppVersion "1.0.0"
 #endif
 
 #ifdef TestBuild
@@ -50,8 +50,11 @@ AppId={#AppId}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
-AppPublisher=PocketMedia
-VersionInfoVersion=0.0.0.0
+AppPublisher=Wambo420Rambo
+AppPublisherURL=https://github.com/Wambo420Rambo/PocketMedia
+AppSupportURL=https://github.com/Wambo420Rambo/PocketMedia/issues
+AppUpdatesURL=https://github.com/Wambo420Rambo/PocketMedia/releases
+VersionInfoVersion=1.0.0.0
 DefaultDirName=C:\PocketMedia
 UsePreviousAppDir=yes
 DirExistsWarning=no
@@ -59,6 +62,8 @@ DirExistsWarning=no
 DisableDirPage=yes
 DisableProgramGroupPage=yes
 DisableWelcomePage=yes
+; The license (IDGAFPL), shown before our own first page.
+LicenseFile=..\LICENSE.md
 DisableReadyPage=no
 DisableFinishedPage=no
 PrivilegesRequired=lowest
@@ -295,7 +300,7 @@ var
   T: TNewStaticText;
   Browse: TNewButton;
 begin
-  ChoicePage := CreateCustomPage(wpWelcome, 'Choose how PocketMedia behaves',
+  ChoicePage := CreateCustomPage(wpLicense, 'Choose how PocketMedia behaves',
     'Choose an option to continue. You can change it later in Settings.');
   W := ChoicePage.SurfaceWidth;
   Half := (W - ScaleX(8)) div 2;
