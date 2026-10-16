@@ -48,7 +48,7 @@ pub static FAIL_SAVES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU
 
 pub fn persist() -> Result<(), String> {
     let (items, history, next_id) = with(|lib| (lib.to_stored(), lib.recent.clone(), lib.next_id));
-    let fail = FAIL_SAVES.fetch_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |n| n.checked_sub(1)).is_ok();
+    let fail = FAIL_SAVES.try_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |n| n.checked_sub(1)).is_ok();
     crate::store::with(|s| {
         s.data.items = items;
         s.data.history = history;
