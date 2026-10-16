@@ -4,6 +4,9 @@
 //! `ui::settings_view`. Add media is an `AddPanel`, as in the popup.
 //!
 //! Created the first time it is shown. × hides it; the tray and shortcut stay.
+//! Hidden, it lets go of its window (`release_if_idle`)
+//! with both profiles, unless something in it is still in progress; its plain
+//! choices (`ManagerState`) are kept for the next time it is shown.
 
 use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -87,6 +90,12 @@ thread_local! {
     static COVERED: RefCell<Option<crate::visibility::CoverWatch>> = const { RefCell::new(None) };
     /// When a background repaint last checked for that (at most every 250 ms).
     static COVER_CHECKED: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+    /// The window class is registered once; the window may be made many times.
+    static REGISTERED: Cell<bool> = const { Cell::new(false) };
+    /// The Manager's choices while its window is released.
+    static KEPT: RefCell<Option<ManagerState>> = const { RefCell::new(None) };
+    /// Times the hidden Manager was released (for the self-test log).
+    static RELEASES: Cell<u32> = const { Cell::new(0) };
 }
 
 /// A repaint while the Manager is in the background (a GIF frame
@@ -147,22 +156,30 @@ pub fn is_visible() -> bool {
 
 fn create() -> Result<(), String> {
     let gfx = Gfx::new().map_err(|e| format!("Direct2D/DirectWrite is not available: {e}"))?;
-    // SAFETY: standard class registration and window creation; pointers are to statics.
-    let hwnd = unsafe {
-        let instance: HINSTANCE = GetModuleHandleW(None).map_err(|e| e.to_string())?.into();
-        let class = WNDCLASSEXW {
-            cbSize: size_of::<WNDCLASSEXW>() as u32,
-            hIcon: winutil::app_icon(false),
-            hIconSm: winutil::app_icon(true),
-            lpfnWndProc: Some(manager_proc),
-            hInstance: instance,
-            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
-            lpszClassName: w!("PocketMediaManager"),
-            ..Default::default()
+    // SAFETY: GetModuleHandleW(None) asks for the running exe's own module.
+    let instance: HINSTANCE = unsafe { GetModuleHandleW(None) }.map_err(|e| e.to_string())?.into();
+    if !REGISTERED.with(|r| r.get()) {
+        // SAFETY: standard class registration; the strings are static and Windows copies the struct.
+        let atom = unsafe {
+            let class = WNDCLASSEXW {
+                cbSize: size_of::<WNDCLASSEXW>() as u32,
+                hIcon: winutil::app_icon(false),
+                hIconSm: winutil::app_icon(true),
+                lpfnWndProc: Some(manager_proc),
+                hInstance: instance,
+                hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+                lpszClassName: w!("PocketMediaManager"),
+                ..Default::default()
+            };
+            RegisterClassExW(&class)
         };
-        if RegisterClassExW(&class) == 0 {
+        if atom == 0 {
             return Err("Could not register the Manager window class.".into());
         }
+        REGISTERED.with(|r| r.set(true));
+    }
+    // SAFETY: the class was registered above; all other arguments are plain values.
+    let hwnd = unsafe {
         CreateWindowExW(
             WS_EX_APPWINDOW,
             w!("PocketMediaManager"),
@@ -188,8 +205,22 @@ fn create() -> Result<(), String> {
             None
         }
     };
-    let mut state = ManagerState::new();
-    state.settings = crate::settings_state::SettingsPage::with_saved(crate::store::settings());
+    let state = match KEPT.with(|k| k.borrow_mut().take()) {
+        // Released while hidden: the same choices, with the settings as saved now
+        // (a release never happens with unsaved changes or a backup running).
+        Some(mut kept) => {
+            let saved = crate::store::settings();
+            kept.settings.saved = saved;
+            kept.settings.draft = saved;
+            kept
+        }
+        None => {
+            let mut fresh = ManagerState::new();
+            fresh.settings = crate::settings_state::SettingsPage::with_saved(crate::store::settings());
+            fresh
+        }
+    };
+    let mut state = state;
     library::with(|lib| state.sync(lib));
     VIEW.with(|v| {
         *v.borrow_mut() = Some(View {
@@ -208,6 +239,7 @@ fn create() -> Result<(), String> {
             _drop: drop,
         })
     });
+    sync_title(hwnd);
     Ok(())
 }
 
@@ -242,7 +274,15 @@ pub fn show() {
     }
     let was_visible = is_visible();
     // The library may have changed in the popup since the Manager was last shown.
-    with_view(|v| library::with(|lib| v.state.sync(lib)));
+    with_view(|v| {
+        library::with(|lib| v.state.sync(lib));
+        // While the Media folder is not watched, the status line says so.
+        if v.state.status.is_none()
+            && let Some(why) = crate::watch::problem()
+        {
+            v.state.status = Some(crate::watch::manager_notice(&why));
+        }
+    });
     if !was_visible {
         center_on_cursor_monitor();
     }
@@ -329,6 +369,53 @@ pub fn hide() {
     release_previews();
     // SAFETY: our own window; a stale HWND only makes it fail.
     let _ = unsafe { ShowWindow(hwnd(), SW_HIDE) };
+    // The window goes once this message is handled.
+    crate::release_hidden_later();
+}
+
+/// The hidden Manager lets go of its window, Direct2D target, bitmaps, text
+/// formats and drop target, with either profile (heavy windows only
+/// while needed). Not while something in it is in progress: a backup, a rename
+/// or removal, an Add media review or import, or unsaved Settings. Those ask
+/// again when they end. True if it was released.
+pub fn release_if_idle() -> bool {
+    if hwnd().is_invalid() || is_visible() || crate::backup::running() || file_op_running() {
+        return false;
+    }
+    let taken = VIEW.with(|v| {
+        let Ok(mut v) = v.try_borrow_mut() else { return None };
+        let in_progress = v.as_ref().is_some_and(|v| v.add.as_ref().is_some_and(|a| a.add.reviewing()) || v.state.settings.dirty());
+        if in_progress {
+            return None;
+        }
+        v.take()
+    });
+    let Some(view) = taken else { return false };
+    {
+        // The Direct2D target, bitmaps, text formats and the drop target's
+        // registration are dropped at the end of this block, before the window.
+        let gone = view;
+        let View { mut state, .. } = gone;
+        state.sort_open = None;
+        KEPT.with(|k| *k.borrow_mut() = Some(state));
+    }
+    COVERED.with(|c| c.borrow_mut().take());
+    TITLE_PAGE.with(|t| t.set(None));
+    let h = WINDOW.with(|c| c.replace(HWND::default()));
+    // SAFETY: our own window, hidden, with no view left that could use it.
+    let _ = unsafe { DestroyWindow(h) };
+    RELEASES.with(|r| r.set(r.get() + 1));
+    true
+}
+
+/// Exit or the end of the session while Add media copies: see `AddPanel::stop_and_wait`.
+pub fn stop_import(limit: std::time::Duration) -> Option<String> {
+    with_view(|v| v.add.as_mut().and_then(|a| a.stop_and_wait(limit))).flatten()
+}
+
+/// Self-test only: how often the hidden Manager was released.
+pub fn releases() -> u32 {
+    RELEASES.with(|r| r.get())
 }
 
 /// Hidden or minimised: thumbnail work for the Manager is cancelled and its
@@ -366,6 +453,9 @@ pub fn backup_changed(progress: &crate::backup::Progress, text: &str, running: b
         v.state.settings.set_backup_panel(panel);
     });
     winutil::invalidate(hwnd());
+    if !running && !is_visible() {
+        crate::release_hidden_later();
+    }
 }
 
 /// The library changed outside the Manager (the Media folders were changed in
@@ -408,6 +498,7 @@ pub fn destroy() {
 
 /// Self-test only: back to the state after start-up (the library is reset separately).
 pub fn reset() {
+    KEPT.with(|k| k.borrow_mut().take());
     with_view(|v| {
         v.state = ManagerState::new();
         v.state.settings = crate::settings_state::SettingsPage::with_saved(crate::store::settings());
@@ -1272,9 +1363,14 @@ fn run(effect: Effect) {
                 let id = with_view(|v| library::with(|lib| v.state.selected_item(lib).map(|i| i.id))).flatten();
                 if let Some(id) = id {
                     match crate::paste::drag_item(h, id) {
-                        crate::paste::Dragged::Copied => {
+                        crate::paste::Dragged::Copied(None) => {
                             crate::set_status("Drag from the Manager: the target accepted a copy.", crate::StatusKind::Good);
                             show_status("Dropped a copy. The original stays in your library.");
+                        }
+                        // The copy went through; its Recently used entry was not saved.
+                        crate::paste::Dragged::Copied(Some(e)) => {
+                            crate::set_status(format!("Drag from the Manager: the target accepted a copy, but {e}."), crate::StatusKind::Bad);
+                            show_status(&crate::paste::unsaved_long("Dropped a copy", &e));
                         }
                         crate::paste::Dragged::NoDrop => crate::set_status("Drag ended without a drop.", crate::StatusKind::Neutral),
                         crate::paste::Dragged::Failed(e) => {
@@ -1329,6 +1425,9 @@ pub fn on_job(ev: crate::jobs::Event) -> bool {
     let handled = effect.is_some();
     if let Some(effect) = effect {
         run(effect);
+    }
+    if handled && !is_visible() {
+        crate::release_hidden_later();
     }
     handled
 }
@@ -1497,6 +1596,9 @@ fn finish_file_op(done: FileDone) {
     FILE_OP.store(false, Ordering::SeqCst);
     crate::popup::library_changed();
     winutil::invalidate(hwnd());
+    if !is_visible() {
+        crate::release_hidden_later();
+    }
 }
 
 /// Open folder in the inspector: File Explorer with the file selected. Under
@@ -1692,10 +1794,10 @@ extern "system" fn manager_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
         }
         // Alt+F4 or the taskbar's Close: hide, like ×. Only Exit ends the app.
         WM_CLOSE => Effect::Hide,
-        // Signing out or shutting down while a backup runs: Windows
-        // asks first and shows the reason set on this window. The main window
-        // stops the backup if the session ends anyway.
-        WM_QUERYENDSESSION => return LRESULT(crate::backup::may_end_session()),
+        // Signing out or shutting down while a backup or an import runs:
+        // Windows asks first and shows the reason set on this
+        // window. The main window stops them if the session ends anyway.
+        WM_QUERYENDSESSION => return LRESULT(crate::may_end_session()),
         // SAFETY: forwarding the unchanged message.
         _ => return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     };
@@ -1816,6 +1918,11 @@ pub fn test_dialog_press(sc: Shortcut) {
 
 /// Self-test only: takes the saved settings from the store again (after it was re-read).
 pub fn reload_settings() {
+    KEPT.with(|k| {
+        if let Some(kept) = k.borrow_mut().as_mut() {
+            kept.settings = crate::settings_state::SettingsPage::with_saved(crate::store::settings());
+        }
+    });
     with_view(|v| {
         let page = crate::settings_state::SettingsPage::with_saved(crate::store::settings());
         v.state.settings = page;
@@ -1918,5 +2025,8 @@ pub fn describe() -> String {
             )
         })
     })
-    .unwrap_or_else(|| "screen=manager-not-created".into())
+    .unwrap_or_else(|| match KEPT.with(|k| k.borrow().as_ref().map(|s| s.status.clone().unwrap_or_default())) {
+        Some(status) => format!("screen=released status={status:?}"),
+        None => "screen=manager-not-created".into(),
+    })
 }

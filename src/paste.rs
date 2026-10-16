@@ -41,6 +41,29 @@ thread_local! {
 /// The line the Manager shows after Ctrl+C.
 pub const COPIED_IN_MANAGER: &str = "Copied to clipboard. Paste it with Ctrl+V.";
 
+/// The popup's footer (two short lines) when a paste or a drag-out went
+/// through but its Recently used entry could not be saved.
+pub const PASTE_UNSAVED: &str = "Pasted, but Recently used was not saved. Check the Data folder.";
+pub const DRAG_UNSAVED: &str = "Dragged, but Recently used was not saved. Check the Data folder.";
+
+/// The same for the Manager's wider status line, with the reason.
+pub fn unsaved_long(what: &str, why: &str) -> String {
+    let why = why.trim_end_matches('.');
+    format!("{what}, but Recently used could not be saved ({why}). Check that the Data folder beside PocketMedia can be written to.")
+}
+
+/// The reason a history save failed, if the user should hear of it. A library
+/// file from a newer PocketMedia is never saved; that was said at start-up.
+fn unsaved(saved: Result<(), String>) -> Option<String> {
+    saved.err().filter(|_| !crate::store::read_only())
+}
+
+/// A paste is being prepared or is waiting to send Ctrl+V: the popup must stay
+/// (it may come back to say the paste failed).
+pub fn pending() -> bool {
+    PREPARING.with(|p| p.get()).is_some() || PASTING.with(|p| p.get()).is_some()
+}
+
 /// Item `id`'s file in the Media folder.
 fn media_file(id: u32) -> Option<PathBuf> {
     library::with(|lib| lib.get(id).map(|i| i.path.clone()))
@@ -59,8 +82,8 @@ pub fn copy(id: u32) -> bool {
 
 /// How a drag of a library item ended.
 pub enum Dragged {
-    /// The target accepted a copy.
-    Copied,
+    /// The target accepted a copy. Some: its Recently used entry could not be saved (why).
+    Copied(Option<String>),
     NoDrop,
     Failed(String),
 }
@@ -78,8 +101,7 @@ pub fn drag_item(source: HWND, id: u32) -> Dragged {
     match dragged {
         Ok(effect) if effect.0 & DROPEFFECT_COPY.0 != 0 => {
             library::with_mut(|lib| lib.record_use(id));
-            let _ = library::persist();
-            Dragged::Copied
+            Dragged::Copied(unsaved(library::persist()))
         }
         Ok(_) => Dragged::NoDrop,
         Err(e) => Dragged::Failed(e),
@@ -108,6 +130,8 @@ pub fn cancel() {
     unsafe {
         let _ = KillTimer(Some(main), TIMER_PASTE);
     }
+    // A hidden popup that waited for this paste may be released now.
+    crate::release_hidden_later();
 }
 
 /// Click or Enter on a tile: start preparing item `id` for the clipboard.
@@ -253,7 +277,15 @@ pub fn tick() {
                 tray::set_tip(main, &format!("PocketMedia - last paste: {}", t.exe));
                 // History: recorded when a paste is initiated.
                 library::with_mut(|lib| lib.record_use(id));
-                let _ = library::persist();
+                if let Some(e) = unsaved(library::persist()) {
+                    // Said in the popup's footer, now if it stayed open, else at the next open.
+                    set_status(format!("Sent Ctrl+V to {}, but {e}.", t.label()), StatusKind::Bad);
+                    if popup::is_visible() {
+                        popup::show_status(PASTE_UNSAVED);
+                    } else {
+                        popup::notice_next_open(PASTE_UNSAVED);
+                    }
+                }
                 popup::refresh();
             }
             Err(e) => {

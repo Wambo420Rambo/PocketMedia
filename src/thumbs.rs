@@ -158,6 +158,9 @@ struct Queue {
     busy: Vec<Key>,
     workers: usize,
     quit: bool,
+    /// Use less memory with no window showing thumbnails: idle workers end
+    /// (their WIC factory and stack go); the next frame that wants work starts them again.
+    retire: bool,
 }
 
 impl Queue {
@@ -179,7 +182,7 @@ impl Queue {
     }
 }
 
-static QUEUE: Mutex<Queue> = Mutex::new(Queue { wanted: [Vec::new(), Vec::new()], busy: Vec::new(), workers: 0, quit: false });
+static QUEUE: Mutex<Queue> = Mutex::new(Queue { wanted: [Vec::new(), Vec::new()], busy: Vec::new(), workers: 0, quit: false, retire: false });
 static WAKE: Condvar = Condvar::new();
 /// Finished thumbnails for the UI thread; Err means the file has no preview.
 static DONE: Mutex<Vec<(Key, Result<Pixels, String>)>> = Mutex::new(Vec::new());
@@ -213,6 +216,10 @@ fn worker() {
                 }
                 if let Some(r) = q.next() {
                     break r;
+                }
+                if q.retire {
+                    q.workers -= 1;
+                    return;
                 }
                 q = WAKE.wait(q).unwrap_or_else(|p| p.into_inner());
             }
@@ -425,10 +432,14 @@ pub fn end_frame(win: Win) {
     });
     let Some(wanted) = wanted else { return };
     let mut q = queue();
-    let start = !wanted.is_empty() && q.workers == 0 && !q.quit;
+    if !wanted.is_empty() {
+        // A window wants work again: workers that were told to end stay.
+        q.retire = false;
+    }
+    let start = !wanted.is_empty() && q.workers < WORKERS && !q.quit;
     q.wanted[win.index()] = wanted;
     if start {
-        for i in 0..WORKERS {
+        for i in q.workers..WORKERS {
             if std::thread::Builder::new().name(format!("thumbs-{i}")).spawn(worker).is_ok() {
                 q.workers += 1;
             }
@@ -457,6 +468,21 @@ pub fn hidden(win: Win, profile: Profile) {
     if release {
         crate::selftest::note("thumbnail RAM cache released (Use less memory, window hidden)");
     }
+}
+
+/// Use less memory with both windows hidden: the idle thumbnail workers
+/// end. Work still running finishes first; nothing is lost.
+pub fn retire_workers() {
+    let mut q = queue();
+    if q.wanted.iter().all(Vec::is_empty) {
+        q.retire = true;
+        WAKE.notify_all();
+    }
+}
+
+/// Thumbnail worker threads alive now (for the self-test log).
+pub fn workers() -> usize {
+    queue().workers
 }
 
 /// Where `key` is drawn: (window, rect in DIPs, dpi).

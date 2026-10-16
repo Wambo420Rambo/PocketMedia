@@ -129,7 +129,7 @@ pub(super) fn other_copy(r: &mut Report, t: &Session, exe: &Path) {
     );
 
     // A plain launch of the other copy: the same message, without "backed up".
-    let popup_was = is_visible(t.popup);
+    let popup_was = is_visible(t.popup());
     if let Ok(mut child) = Command::new(&copy).spawn() {
         let mut boxed = 0isize;
         let shown = wait_until(10_000, || {
@@ -150,7 +150,7 @@ pub(super) fn other_copy(r: &mut Report, t: &Session, exe: &Path) {
         }
         r.check(
             "a plain launch of the other copy says which copy is running, exits (code 3) and does not show this one's popup",
-            shown && text.contains("did not start") && !text.contains("backed up") && code == Some(3) && is_visible(t.popup) == popup_was,
+            shown && text.contains("did not start") && !text.contains("backed up") && code == Some(3) && is_visible(t.popup()) == popup_was,
             &format!("exit code {code:?}; {}", text.replace('\n', " / ")),
         );
     }
@@ -223,13 +223,13 @@ fn names(dir: &Path) -> Vec<String> {
 }
 
 /// WM_QUERYENDSESSION's answer from a window of ours (1: Windows may end the session).
-fn end_session_answer(window: isize) -> isize {
+pub(super) fn end_session_answer(window: isize) -> isize {
     // SAFETY: SendMessageW to our own window; the handler only reads a flag.
     unsafe { SendMessageW(hwnd(window), WM_QUERYENDSESSION, Some(WPARAM(0)), Some(LPARAM(0))) }.0
 }
 
 /// The reason a window gives Windows for blocking shutdown, or "".
-fn block_reason(window: isize) -> String {
+pub(super) fn block_reason(window: isize) -> String {
     let mut buf = vec![0u16; 512];
     let mut len = buf.len() as u32;
     // SAFETY: `buf` holds `len` UTF-16 units, as the call is told.

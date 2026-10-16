@@ -64,7 +64,7 @@ pub(super) fn on_ui_command(cmd: usize, arg: isize) -> isize {
     0
 }
 
-fn find(t: &Session, rel: &str) -> String {
+pub(super) fn find(t: &Session, rel: &str) -> String {
     if let Ok(mut q) = QUERY.lock() {
         *q = rel.to_string();
     }
@@ -76,7 +76,7 @@ fn items(t: &Session) -> i64 {
     number(&find(t, ""), "items")
 }
 
-fn watch(t: &Session) -> String {
+pub(super) fn watch(t: &Session) -> String {
     send(t.main, CMD_WATCH_DESCRIBE, 0);
     DESCRIBE.lock().map(|d| d.clone()).unwrap_or_default()
 }

@@ -71,26 +71,26 @@ pub(super) fn on_ui_command(cmd: usize, arg: isize) -> isize {
     0
 }
 
-fn describe(t: &Session, win: isize) -> String {
+pub(super) fn describe(t: &Session, win: isize) -> String {
     send(t.main, CMD_PREVIEW_DESCRIBE, win);
     DESCRIBE.lock().map(|d| d.clone()).unwrap_or_default()
 }
 
 /// A number from "name=value" in a description (-1 if missing).
-fn field(d: &str, name: &str) -> i64 {
+pub(super) fn field(d: &str, name: &str) -> i64 {
     let key = format!("{name}=");
     d.split_whitespace().find_map(|w| w.strip_prefix(&key)).and_then(|v| v.parse().ok()).unwrap_or(-1)
 }
 
 /// Waits until every drawn thumbnail of `win` is ready or has no preview.
-fn settle(t: &Session, win: isize, ms: u64) -> bool {
+pub(super) fn settle(t: &Session, win: isize, ms: u64) -> bool {
     wait_until(ms, || {
         let d = describe(t, win);
         field(&d, "pending") == 0 && field(&d, "drawn") > 0 && field(&d, "busy") == 0
     })
 }
 
-fn private_bytes() -> u64 {
+pub(super) fn private_bytes() -> u64 {
     let mut c = PROCESS_MEMORY_COUNTERS_EX { cb: size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32, ..Default::default() };
     // SAFETY: the struct is an EX counters block of the size given; the pseudo
     // handle of the current process needs no closing.
@@ -135,7 +135,7 @@ fn media_point(window: isize, tile: (i32, i32)) -> (i32, i32) {
 }
 
 fn popup_media(t: &Session, i: usize) -> Option<(i32, i32)> {
-    t.point(El::Tile(i)).map(|p| media_point(t.popup, p))
+    t.point(El::Tile(i)).map(|p| media_point(t.popup(), p))
 }
 
 /// The distinct seed-GIF colours seen at `at` over `ms`.
@@ -162,7 +162,7 @@ fn stays(t: &Session, win: isize, name: &str, ms: u64) -> (bool, String) {
 }
 
 /// A counter of `name` that grows within `ms`.
-fn grows(t: &Session, win: isize, name: &str, ms: u64) -> (bool, String) {
+pub(super) fn grows(t: &Session, win: isize, name: &str, ms: u64) -> (bool, String) {
     let before = field(&describe(t, win), name);
     let ok = wait_until(ms, || field(&describe(t, win), name) > before + 2);
     let after = describe(t, win);
@@ -171,7 +171,7 @@ fn grows(t: &Session, win: isize, name: &str, ms: u64) -> (bool, String) {
 
 fn shot_popup(r: &mut Report, t: &Session, name: &str) {
     std::thread::sleep(Duration::from_millis(150));
-    if let Some(rect) = window_rect(t.popup) {
+    if let Some(rect) = window_rect(t.popup()) {
         save_capture(r, &t.out.join("screens").join(format!("{name}.png")), capture_screen(rect));
     }
 }
@@ -182,9 +182,9 @@ pub(super) fn close_windows(r: &mut Report, t: &Session) {
         post(manager, WM_CLOSE, 0, 0);
         wait_until(1500, || !is_visible(manager));
     }
-    if is_visible(t.popup) && foreground() == t.popup && guard(r, &t.allowed) {
+    if is_visible(t.popup()) && foreground() == t.popup() && guard(r, &t.allowed) {
         press(&[VK_ESCAPE]);
-        wait_until(1500, || !is_visible(t.popup));
+        wait_until(1500, || !is_visible(t.popup()));
     }
 }
 
@@ -254,7 +254,7 @@ pub(super) fn run(r: &mut Report, t: &Session) -> bool {
         return false;
     }
     press(&[VK_ESCAPE]);
-    wait_until(1500, || !is_visible(t.popup));
+    wait_until(1500, || !is_visible(t.popup()));
     std::thread::sleep(Duration::from_millis(300));
     let (still, detail) = stays(t, 0, "gif_frames", 1200);
     r.check("hiding the popup stops GIF animation", still && field(&describe(t, 0), "gifs_playing") == 0, &detail);
@@ -374,7 +374,7 @@ fn hover_tests(r: &mut Report, t: &Session) {
     if guard(r, &t.allowed) {
         press(&[VK_ESCAPE]);
     }
-    wait_until(1500, || !is_visible(t.popup));
+    wait_until(1500, || !is_visible(t.popup()));
     let stopped = wait_until(1500, || describe(t, 0).contains("video_playing=false"));
     let (ok, detail) = stays(t, 0, "video_frames", 700);
     r.check("hiding the popup stops the hover video", stopped && ok, &detail);
@@ -530,7 +530,7 @@ fn make_stress(out: &Path) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-fn mib(b: u64) -> String {
+pub(super) fn mib(b: u64) -> String {
     format!("{:.1} MiB", b as f64 / MIB)
 }
 
@@ -772,7 +772,7 @@ fn stress_test(r: &mut Report, t: &Session, quick: bool) -> bool {
         if guard(r, &t.allowed) {
             press(&[VK_ESCAPE]);
         }
-        wait_until(1500, || !is_visible(t.popup));
+        wait_until(1500, || !is_visible(t.popup()));
         std::thread::sleep(Duration::from_millis(300));
         let (still, detail) = stays(t, 0, "gif_frames", 1500);
         let d = describe(t, 0);
@@ -829,7 +829,7 @@ fn open_faster_test(r: &mut Report, t: &Session) {
     if guard(r, &t.allowed) {
         press(&[VK_ESCAPE]);
     }
-    let hidden = wait_until(1500, || !is_visible(t.popup));
+    let hidden = wait_until(1500, || !is_visible(t.popup()));
     std::thread::sleep(Duration::from_millis(300));
     let after_hide = describe(t, 0);
     r.check(
@@ -850,6 +850,6 @@ fn open_faster_test(r: &mut Report, t: &Session) {
     if guard(r, &t.allowed) {
         press(&[VK_ESCAPE]);
     }
-    wait_until(1500, || !is_visible(t.popup));
+    wait_until(1500, || !is_visible(t.popup()));
     send(t.main, CMD_SET_PROFILE, 0);
 }

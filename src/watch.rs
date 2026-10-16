@@ -187,6 +187,66 @@ static BATCHES: AtomicU64 = AtomicU64::new(0);
 static OVERFLOWS: AtomicU64 = AtomicU64::new(0);
 static RESCANS: AtomicU64 = AtomicU64::new(0);
 static RUNNING: AtomicBool = AtomicBool::new(false);
+/// Why watching is not running, while it is not.
+static PROBLEM: Mutex<Option<String>> = Mutex::new(None);
+/// Self-test only: the watcher stops as if Windows had failed it.
+static BREAK: AtomicBool = AtomicBool::new(false);
+
+/// The popup's footer while watching is not running (its two short lines).
+pub const POPUP_NOTICE: &str = "Not following changes in the Media folder. Restart PocketMedia.";
+
+/// Why the Media folder is not being watched, while it is not.
+pub fn problem() -> Option<String> {
+    PROBLEM.lock().ok().and_then(|p| p.clone())
+}
+
+fn set_problem(why: Option<String>) {
+    if let Ok(mut p) = PROBLEM.lock() {
+        *p = why;
+    }
+}
+
+/// The Manager's status line while watching is not running: what happened and what to do.
+pub fn manager_notice(why: &str) -> String {
+    let why = why.trim_end_matches('.');
+    format!(
+        "PocketMedia is not following the Media folder ({why}). Files you add, rename or delete there in File Explorer \
+         show up after a restart: choose Exit in the tray menu, then start PocketMedia again."
+    )
+}
+
+/// The message at start-up when watching could not start (shown like the shortcut's).
+pub fn start_failure_message(why: &str) -> String {
+    format!(
+        "PocketMedia could not watch its Media folder for changes.\n\n{why}\n\nPocketMedia works as usual, but files you \
+         add, rename or delete in the Media folder with File Explorer show up only after PocketMedia is started again. \
+         If this keeps happening, check that the Media folder beside PocketMedia exists and can be opened."
+    )
+}
+
+/// Watching could not start: the popup and the Manager say so from now
+/// on, and the caller shows `start_failure_message` unless the self-test runs.
+pub fn start_failed(why: &str) {
+    set_problem(Some(why.to_string()));
+    crate::selftest::note(&format!("watching could not start: {why}"));
+}
+
+/// Watching stopped on its thread: the UI thread is told (Event::WatchStopped).
+fn stopped(why: String) {
+    crate::selftest::note(&format!("watching stopped: {why}"));
+    set_problem(Some(why.clone()));
+    crate::jobs::post(Event::WatchStopped(why));
+}
+
+/// Self-test only: the watcher stops as if a read had failed, through the same path.
+pub fn test_break() {
+    BREAK.store(true, Ordering::SeqCst);
+    if let Ok(w) = WATCHER.lock()
+        && let Some(w) = w.as_ref()
+    {
+        win::signal(&w.stop);
+    }
+}
 
 // ---------------------------------------------------------------- the watcher thread
 
@@ -200,6 +260,7 @@ static WATCHER: Mutex<Option<Watcher>> = Mutex::new(None);
 /// Starts watching `media` with a notification buffer of `buffer` bytes.
 pub fn start(media: &Path, buffer: usize) -> Result<(), String> {
     stop();
+    BREAK.store(false, Ordering::SeqCst);
     let dir = win::open_dir(media)?;
     let stop = Arc::new(win::event()?);
     let (flag, media) = (stop.clone(), media.to_path_buf());
@@ -214,6 +275,7 @@ pub fn start(media: &Path, buffer: usize) -> Result<(), String> {
     if let Ok(mut w) = WATCHER.lock() {
         *w = Some(Watcher { stop, thread });
     }
+    set_problem(None);
     Ok(())
 }
 
@@ -303,7 +365,7 @@ mod win {
     pub fn run(media: &Path, dir: &OwnedHandle, stop: &OwnedHandle, buffer: usize) {
         let io = match event() {
             Ok(h) => h,
-            Err(e) => return crate::selftest::note(&format!("watching stopped: {e}")),
+            Err(e) => return stopped(e),
         };
         // u64 words keep the buffer DWORD-aligned, as Windows requires.
         let mut buf = vec![0u64; buffer.max(64).div_ceil(8)];
@@ -311,6 +373,7 @@ mod win {
         let mut pending = Pending::default();
         let mut times: Option<(Instant, Instant)> = None;
         let mut reading = false;
+        let mut failed: Option<String> = None;
         let filter = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE;
         loop {
             if !reading {
@@ -322,10 +385,9 @@ mod win {
                     ReadDirectoryChangesW(dir.0, buf.as_mut_ptr().cast(), (buf.len() * 8) as u32, true, filter, None, Some(&mut ov), None)
                 };
                 if let Err(e) = started {
-                    crate::selftest::note(&format!("watching stopped: {}", e.message()));
                     pending.rescan = true;
                     flush(media, &mut pending);
-                    return;
+                    return stopped(e.message());
                 }
                 reading = true;
             }
@@ -337,11 +399,14 @@ mod win {
             let woke = unsafe { WaitForMultipleObjects(&[stop.0, io.0], false, timeout) };
             WAKES.fetch_add(1, Ordering::Relaxed);
             if woke == WAIT_OBJECT_0 {
+                if BREAK.swap(false, Ordering::SeqCst) {
+                    failed = Some("the self-test stopped it".into());
+                }
                 break;
             }
             if woke != WAIT_TIMEOUT && woke.0 != WAIT_OBJECT_0.0 + 1 {
                 // WAIT_FAILED: never spin; stop watching and say so.
-                crate::selftest::note("watching stopped: the wait failed");
+                failed = Some("waiting for changes failed".into());
                 break;
             }
             if woke.0 == WAIT_OBJECT_0.0 + 1 {
@@ -369,10 +434,9 @@ mod win {
                         pending.rescan = true;
                     }
                     Err(e) => {
-                        crate::selftest::note(&format!("watching stopped: {}", e.message()));
                         pending.rescan = true;
                         flush(media, &mut pending);
-                        return;
+                        return stopped(e.message());
                     }
                 }
                 let now = Instant::now();
@@ -394,6 +458,9 @@ mod win {
                 let _ = GetOverlappedResult(dir.0, &ov, &mut n, true);
             }
         }
+        if let Some(why) = failed {
+            stopped(why);
+        }
     }
 }
 
@@ -413,6 +480,17 @@ pub fn on_event(ev: &Event) -> bool {
                 request_rescan();
             }
             after(applied);
+        }
+        Event::WatchStopped(why) => {
+            // Say so where the user looks (no tray notification).
+            let main = crate::app(|a| a.main.get());
+            crate::tray::set_tip(main, "PocketMedia - not following changes in the Media folder");
+            if crate::popup::is_visible() {
+                crate::popup::show_status(POPUP_NOTICE);
+            }
+            if crate::manager::is_visible() {
+                crate::manager::show_status(&manager_notice(why));
+            }
         }
         Event::Rescanned { orphans, missing, .. } => {
             RESCANS.fetch_add(1, Ordering::Relaxed);
@@ -473,8 +551,9 @@ fn after(applied: crate::library::Applied) {
 pub fn describe() -> String {
     let a = APPLIED.with(|a| a.borrow().clone());
     format!(
-        "watch running={} events={} wakes={} notices={} due={} batches={} overflows={} rescans={} added={} renamed={} replaced={} removed={} last={}",
+        "watch running={} problem={:?} events={} wakes={} notices={} due={} batches={} overflows={} rescans={} added={} renamed={} replaced={} removed={} last={}",
         RUNNING.load(Ordering::SeqCst),
+        problem().unwrap_or_default(),
         EVENTS.load(Ordering::Relaxed),
         WAKES.load(Ordering::Relaxed),
         NOTICES.load(Ordering::Relaxed),

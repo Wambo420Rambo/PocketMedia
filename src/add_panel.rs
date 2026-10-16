@@ -57,6 +57,8 @@ pub struct AddPanel {
     save_error: Option<String>,
     /// Copies recorded but not saved yet.
     saves: crate::add_media::SaveBatch,
+    /// This panel's copies hold back the end of the Windows session.
+    blocking: bool,
 }
 
 /// A panel closed before its import reported the end still saves what it recorded.
@@ -65,6 +67,36 @@ impl Drop for AddPanel {
         if self.saves.finished() {
             let _ = library::persist();
         }
+        self.block_end_session(false);
+    }
+}
+
+/// Imports copying right now, in any window.
+static COPYING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// An import is copying files: Exit and the end of the Windows session ask first.
+pub fn copies_running() -> bool {
+    COPYING.load(std::sync::atomic::Ordering::SeqCst) > 0
+}
+
+/// While an import copies, Windows asks before signing out or shutting down and
+/// shows this beside "Sign out anyway" and Cancel (as for a backup).
+pub const SHUTDOWN_REASON: &str = "An import is running. Stop it? Choose Cancel to let it finish.";
+
+/// Sets or clears SHUTDOWN_REASON on the hidden main window and on the Manager
+/// (the window Windows may list by name). A running backup keeps its own reason.
+fn set_shutdown_reason(on: bool) {
+    use windows::Win32::System::Shutdown::{ShutdownBlockReasonCreate, ShutdownBlockReasonDestroy};
+    if !on && crate::backup::running() {
+        return;
+    }
+    let reason = windows::core::HSTRING::from(SHUTDOWN_REASON);
+    for window in [crate::app(|a| a.main.get()), crate::manager::hwnd()] {
+        if window.is_invalid() {
+            continue;
+        }
+        // SAFETY: our own window, on the thread that made it; the HSTRING outlives the call.
+        let _ = unsafe { if on { ShutdownBlockReasonCreate(window, &reason) } else { ShutdownBlockReasonDestroy(window) } };
     }
 }
 
@@ -76,7 +108,66 @@ impl Default for AddPanel {
 
 impl AddPanel {
     pub fn new() -> Self {
-        Self { add: AddMedia::new(), hover: AddHit::None, pressed: AddHit::None, job: None, leave_if_no_pick: false, save_error: None, saves: Default::default() }
+        Self {
+            add: AddMedia::new(),
+            hover: AddHit::None,
+            pressed: AddHit::None,
+            job: None,
+            leave_if_no_pick: false,
+            save_error: None,
+            saves: Default::default(),
+            blocking: false,
+        }
+    }
+
+    /// Counts this panel's copies in `COPYING` (on) or stops counting them.
+    fn block_end_session(&mut self, on: bool) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.blocking == on {
+            return;
+        }
+        self.blocking = on;
+        let before = if on { COPYING.fetch_add(1, SeqCst) } else { COPYING.fetch_sub(1, SeqCst) };
+        // The first import to start sets the reason; the last one to end clears it.
+        if (on && before == 0) || (!on && before == 1) {
+            set_shutdown_reason(on);
+        }
+    }
+
+    /// Files are being copied into the library right now.
+    pub fn copying(&self) -> bool {
+        self.job.is_some() && matches!(self.add.stage, Stage::Copying { .. })
+    }
+
+    /// Exit (after Yes) or the end of the Windows session while copying.
+    /// The import is cancelled; the copy in progress either finishes or removes
+    /// its temporary file; every finished copy is recorded and the library file
+    /// saved. Waits at most `limit` for the worker. Returns the result line.
+    pub fn stop_and_wait(&mut self, limit: std::time::Duration) -> Option<String> {
+        if !self.copying() {
+            return None;
+        }
+        let id = self.job.as_ref().map(|j| j.id)?;
+        self.stop();
+        let end = std::time::Instant::now() + limit;
+        loop {
+            for ev in jobs::take_for(id) {
+                if let AddOutcome::Imported(status) = self.on_job(&ev) {
+                    return Some(status);
+                }
+            }
+            if std::time::Instant::now() >= end {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // The worker did not end in time: save what was recorded. Its temporary
+        // file, if any, is removed at the next start (`import::cleanup_partials`).
+        if self.saves.finished() {
+            self.note_save(library::persist());
+        }
+        self.block_end_session(false);
+        None
     }
 
     /// Settings' "Choose folder…": the host shows the folder picker right away;
@@ -159,9 +250,15 @@ impl AddPanel {
                 }
                 self.add.copied(*index, result);
             }
-            Event::Prepared { .. } | Event::Watched(_) | Event::Rescanned { .. } | Event::Backup { .. } | Event::FileOp { .. } => {}
+            Event::Prepared { .. }
+            | Event::Watched(_)
+            | Event::WatchStopped(_)
+            | Event::Rescanned { .. }
+            | Event::Backup { .. }
+            | Event::FileOp { .. } => {}
             Event::Finished { stopped, .. } => {
                 self.job = None;
+                self.block_end_session(false);
                 if self.saves.finished() {
                     self.note_save(library::persist());
                 }
@@ -323,6 +420,7 @@ impl AddPanel {
                 if let (Some(requests), Some(p)) = (a.begin_copy(), crate::paths::get()) {
                     self.save_error = None;
                     self.job = Some(jobs::copy(requests, p.media.clone()));
+                    self.block_end_session(true);
                 }
             }
             _ => {}

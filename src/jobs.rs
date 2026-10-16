@@ -27,6 +27,8 @@ pub enum Event {
     Prepared { job: u64, result: Result<crate::transfer::Payload, String> },
     /// Changes in the Media folders made outside PocketMedia (`watch.rs`).
     Watched(crate::watch::Batch),
+    /// Watching the Media folders stopped, and why.
+    WatchStopped(String),
     /// A full comparison of the Media folders with a snapshot of `(id, path)`:
     /// files without a record, and records whose file is gone.
     Rescanned { job: u64, orphans: Vec<crate::import::Orphan>, missing: Vec<(u32, String)> },
@@ -46,7 +48,7 @@ impl Event {
             | Event::Rescanned { job, .. }
             | Event::Backup { job, .. }
             | Event::FileOp { job, .. } => *job,
-            Event::Watched(_) => 0,
+            Event::Watched(_) | Event::WatchStopped(_) => 0,
         }
     }
 }
@@ -88,6 +90,27 @@ pub fn take_file_ops() -> Vec<Event> {
     let (mine, rest) = std::mem::take(&mut *q).into_iter().partition(|e| matches!(e, Event::FileOp { .. }));
     *q = rest;
     mine
+}
+
+/// Only the events of job `id`, leaving everything else queued (Exit stops an
+/// import and records what it copied, `AddPanel::stop_and_wait`).
+pub fn take_for(id: u64) -> Vec<Event> {
+    let Ok(mut q) = QUEUE.lock() else { return Vec::new() };
+    let (mine, rest) = std::mem::take(&mut *q).into_iter().partition(|e| e.job() == id);
+    *q = rest;
+    mine
+}
+
+/// Self-test only: a pause before each copy of an import, so Exit can be chosen
+/// while it runs. The pause ends early on Cancel.
+pub static TEST_COPY_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+
+fn test_pause(cancel: &AtomicBool) {
+    let ms = TEST_COPY_DELAY_MS.load(Ordering::Relaxed);
+    let end = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+    while std::time::Instant::now() < end && !cancel.load(Ordering::Relaxed) {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 /// A running job. Dropping it does not stop it; `cancel` does.
@@ -138,6 +161,7 @@ pub fn plan(source: Source, known: Vec<KnownFile>, media: PathBuf) -> Job {
 pub fn copy(requests: Vec<(usize, CopyRequest)>, media: PathBuf) -> Job {
     start("import", move |job, cancel| {
         for (index, req) in requests {
+            test_pause(cancel);
             if cancel.load(Ordering::Relaxed) {
                 post(Event::Finished { job, stopped: true });
                 return;

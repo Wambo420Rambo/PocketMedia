@@ -4,10 +4,16 @@
 //!
 //! Tiles show real thumbnails (thumbs.rs); visible GIFs loop and a hovered
 //! video plays (preview.rs). Hiding the popup stops both.
+//!
+//! With Use less memory the
+//! window is made when it is first opened and let go of when it is hidden
+//! (`release_if_idle`): its window, Direct2D target, bitmaps, text formats and
+//! drop target go; only its plain choices (`PopupState`: list, filter, status)
+//! are kept for the next open. Open faster makes it at start-up and keeps it.
 
 use std::cell::{Cell, RefCell};
 
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{ScreenToClient, ValidateRect};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -79,6 +85,15 @@ thread_local! {
     static POSITIONING: Cell<bool> = const { Cell::new(false) };
     /// Where the popup last opened: at the target's text caret (true) or at the pointer.
     static PLACED: Cell<Option<(bool, POINT)>> = const { Cell::new(None) };
+    /// The window class is registered once; the window may be made many times.
+    static REGISTERED: Cell<bool> = const { Cell::new(false) };
+    /// The popup's choices while its window is released (Use less memory).
+    static KEPT: RefCell<Option<PopupState>> = const { RefCell::new(None) };
+    /// Times the hidden popup was released (for the self-test log).
+    static RELEASES: Cell<u32> = const { Cell::new(0) };
+    /// A one-time line for the footer at the next open (a paste whose history
+    /// entry could not be saved).
+    static NEXT_NOTICE: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 /// Runs `f` with the view. Returns None if the view is missing or already in use
@@ -91,23 +106,36 @@ pub fn hwnd() -> HWND {
     POPUP.with(|c| c.get())
 }
 
-pub fn create(instance: HINSTANCE) -> Result<(), String> {
+/// Makes the popup window (hidden). Open faster does this at start-up; with Use
+/// less memory the first open does it, and every open after a release.
+pub fn create() -> Result<(), String> {
+    if !hwnd().is_invalid() {
+        return Ok(());
+    }
+    let instance = crate::module();
     let gfx = Gfx::new().map_err(|e| format!("Direct2D/DirectWrite is not available: {e}"))?;
-    // SAFETY: standard class registration and window creation; pointers are to statics.
-    let hwnd = unsafe {
-        let class = WNDCLASSEXW {
-            cbSize: size_of::<WNDCLASSEXW>() as u32,
-            hIcon: winutil::app_icon(false),
-            hIconSm: winutil::app_icon(true),
-            lpfnWndProc: Some(popup_proc),
-            hInstance: instance,
-            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
-            lpszClassName: w!("PocketMediaPopup"),
-            ..Default::default()
+    if !REGISTERED.with(|r| r.get()) {
+        // SAFETY: standard class registration; the strings are static and Windows copies the struct.
+        let atom = unsafe {
+            let class = WNDCLASSEXW {
+                cbSize: size_of::<WNDCLASSEXW>() as u32,
+                hIcon: winutil::app_icon(false),
+                hIconSm: winutil::app_icon(true),
+                lpfnWndProc: Some(popup_proc),
+                hInstance: instance,
+                hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+                lpszClassName: w!("PocketMediaPopup"),
+                ..Default::default()
+            };
+            RegisterClassExW(&class)
         };
-        if RegisterClassExW(&class) == 0 {
+        if atom == 0 {
             return Err("Could not register the popup window class.".into());
         }
+        REGISTERED.with(|r| r.set(true));
+    }
+    // SAFETY: the class was registered above; all other arguments are plain values.
+    let hwnd = unsafe {
         CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
             w!("PocketMediaPopup"),
@@ -133,9 +161,10 @@ pub fn create(instance: HINSTANCE) -> Result<(), String> {
             None
         }
     };
+    let state = KEPT.with(|k| k.borrow_mut().take()).unwrap_or_default();
     VIEW.with(|v| {
         *v.borrow_mut() = Some(View {
-            state: PopupState::new(),
+            state,
             add: None,
             gfx,
             layout: None,
@@ -178,6 +207,67 @@ pub fn placed() -> Option<(bool, POINT)> {
     PLACED.with(|p| p.get())
 }
 
+/// The popup window exists or was just made again. False (and said so) if it cannot be made.
+fn ensure() -> bool {
+    match create() {
+        Ok(()) => true,
+        Err(e) => {
+            if app(|a| a.quiet.get()) {
+                crate::selftest::note(&format!("the popup could not be made: {e}"));
+            } else {
+                crate::message_box(&format!("PocketMedia could not open the quick popup.\n\n{e}"), "PocketMedia - quick popup", MB_ICONERROR);
+            }
+            false
+        }
+    }
+}
+
+/// Use less memory: the hidden popup lets go of its window and everything
+/// that belongs to it. Not while an import in its Add media is still running or
+/// a paste is still handing focus over; those ask again when they end
+/// (`crate::release_hidden_later`). True if it was released.
+pub fn release_if_idle() -> bool {
+    if hwnd().is_invalid() || is_visible() || crate::store::settings().profile != crate::settings_state::Profile::LessMemory || paste::pending() {
+        return false;
+    }
+    let taken = VIEW.with(|v| {
+        let Ok(mut v) = v.try_borrow_mut() else { return None };
+        if v.as_ref().is_some_and(|v| v.add.as_ref().is_some_and(AddPanel::busy)) {
+            return None;
+        }
+        v.take()
+    });
+    let Some(view) = taken else { return false };
+    {
+        // The plain choices stay; the rest (Direct2D target, bitmaps, text
+        // formats, the drop target's registration) is dropped at the end of
+        // this block, before the window goes.
+        let gone = view;
+        let View { state, .. } = gone;
+        KEPT.with(|k| *k.borrow_mut() = Some(state));
+    }
+    let h = POPUP.with(|c| c.replace(HWND::default()));
+    // SAFETY: our own window, hidden, with no view left that could use it.
+    let _ = unsafe { DestroyWindow(h) };
+    RELEASES.with(|r| r.set(r.get() + 1));
+    true
+}
+
+/// Exit or the end of the session while Add media copies: see `AddPanel::stop_and_wait`.
+pub fn stop_import(limit: std::time::Duration) -> Option<String> {
+    with_view(|v| v.add.as_mut().and_then(|a| a.stop_and_wait(limit))).flatten()
+}
+
+/// Self-test only: how often the hidden popup was released.
+pub fn releases() -> u32 {
+    RELEASES.with(|r| r.get())
+}
+
+/// A line the footer shows the next time the popup opens (once).
+pub fn notice_next_open(text: &str) {
+    NEXT_NOTICE.with(|n| *n.borrow_mut() = Some(text.into()));
+}
+
 pub fn destroy() {
     VIEW.with(|v| v.borrow_mut().take());
     let hwnd = POPUP.with(|c| c.replace(HWND::default()));
@@ -211,9 +301,15 @@ pub fn open(captured: Result<Target, NoTarget>) {
     paste::cancel();
     let caret = captured.as_ref().ok().and_then(|t| t.caret);
     app(|a| *a.target.borrow_mut() = captured);
+    if !ensure() {
+        return;
+    }
+    // What went wrong while the popup was closed, or what is still wrong.
+    let notice = NEXT_NOTICE.with(|n| n.borrow_mut().take()).or_else(|| crate::watch::problem().map(|_| crate::watch::POPUP_NOTICE.to_string()));
     with_view(|v| {
         v.tip = None;
         v.state.reset_for_open();
+        v.state.status = notice;
         // The shortcut always opens the quick picker, never a half-finished
         // review; an import that is still copying stays on screen.
         if !v.add.as_ref().is_some_and(AddPanel::busy) {
@@ -290,6 +386,10 @@ pub fn on_job(ev: &crate::jobs::Event) -> bool {
     if let Some(effect) = effect {
         run(effect);
     }
+    // An import that ended while the popup was hidden: it may be released now.
+    if handled && !is_visible() {
+        crate::release_hidden_later();
+    }
     handled
 }
 
@@ -316,6 +416,8 @@ pub fn close(restore_focus: bool) {
     }
     // SAFETY: our own window.
     let _ = unsafe { ShowWindow(hwnd(), SW_HIDE) };
+    // Use less memory: the window goes once this message is handled.
+    crate::release_hidden_later();
 }
 
 /// The popup is hidden: thumbnail work for it is cancelled and its GIFs and
@@ -330,6 +432,8 @@ fn release_previews() {
 
 /// Self-test only: back to the state after start-up (the library is reset separately).
 pub fn reset() {
+    KEPT.with(|k| k.borrow_mut().take());
+    NEXT_NOTICE.with(|n| n.borrow_mut().take());
     with_view(|v| {
         v.state = PopupState::new();
         v.add = None;
@@ -817,7 +921,12 @@ fn drag_out() {
     let result = paste::drag_item(hwnd(), id);
     DRAGGING.with(|d| d.set(false));
     match result {
-        paste::Dragged::Copied => set_status("Drag: the target accepted a copy.", StatusKind::Good),
+        paste::Dragged::Copied(None) => set_status("Drag: the target accepted a copy.", StatusKind::Good),
+        // The copy went through; its Recently used entry was not saved.
+        paste::Dragged::Copied(Some(e)) => {
+            set_status(format!("Drag: the target accepted a copy, but {e}."), StatusKind::Bad);
+            show_status(paste::DRAG_UNSAVED);
+        }
         paste::Dragged::NoDrop => set_status("Drag ended without a drop.", StatusKind::Neutral),
         paste::Dragged::Failed(e) => set_status(e, StatusKind::Bad),
     }
@@ -1031,27 +1140,34 @@ pub fn element_center(target: TestTarget) -> Option<POINT> {
 
 /// "screen=gallery list=… filter=… count=… names=a|b|c" for self-test checks.
 pub fn describe_state() -> String {
+    if hwnd().is_invalid() {
+        // Released (Use less memory): what the next open starts from.
+        return KEPT.with(|k| describe_gallery(k.borrow().as_ref().unwrap_or(&PopupState::new()), None, "released"));
+    }
     with_view(|v| {
         if let Some(add) = v.add.as_ref() {
             return add.describe();
         }
-        let s = &v.state;
-        library::with(|lib| {
-            let names: Vec<&str> = s.visible(lib).iter().map(|i| i.name.as_str()).collect();
-            format!(
-                "screen=gallery status={:?} list={:?} filter={:?} query={:?} focus={:?} tip={:?} empty={:?} scroll={:.0} count={} names={}",
-                s.status.as_deref().unwrap_or(""),
-                s.list,
-                s.filter,
-                s.search.text(),
-                s.focus,
-                v.tip.and_then(|i| names.get(i).copied()).unwrap_or(""),
-                s.empty(lib),
-                s.scroll,
-                names.len(),
-                names.join("|")
-            )
-        })
+        describe_gallery(&v.state, v.tip, "open")
     })
     .unwrap_or_default()
+}
+
+fn describe_gallery(s: &PopupState, tip: Option<usize>, window: &str) -> String {
+    library::with(|lib| {
+        let names: Vec<&str> = s.visible(lib).iter().map(|i| i.name.as_str()).collect();
+        format!(
+            "screen=gallery status={:?} list={:?} filter={:?} query={:?} focus={:?} tip={:?} empty={:?} scroll={:.0} window={window} count={} names={}",
+            s.status.as_deref().unwrap_or(""),
+            s.list,
+            s.filter,
+            s.search.text(),
+            s.focus,
+            tip.and_then(|i| names.get(i).copied()).unwrap_or(""),
+            s.empty(lib),
+            s.scroll,
+            names.len(),
+            names.join("|")
+        )
+    })
 }

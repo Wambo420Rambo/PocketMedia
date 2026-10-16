@@ -79,6 +79,9 @@ use crate::target::{NoTarget, Target};
 
 pub const WM_TRAY: u32 = WM_APP + 1;
 pub const WM_SELFTEST: u32 = WM_APP + 2;
+/// Posted when a window was hidden or work in a hidden window ended: hidden
+/// windows may be released now (`release_hidden`).
+pub const WM_RELEASE: u32 = WM_APP + 7;
 pub const TIMER_PASTE: usize = 1;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -231,10 +234,17 @@ fn main() {
     {
         message_box(&text, "PocketMedia - library file", MB_ICONWARNING);
     }
-    if let Some(text) = load_library(&media)
+    let (missing, unsaved) = load_library(&media);
+    if let Some(text) = missing
         && !quiet
     {
         message_box(&text, "PocketMedia - library", MB_ICONINFORMATION);
+    }
+    // The comparison changed the library, but the file could not be saved.
+    if let Some(text) = unsaved
+        && !quiet
+    {
+        message_box(&text, "PocketMedia - library file", MB_ICONWARNING);
     }
     // Ignore failure: it only fails if awareness was already set (e.g. by a manifest).
     // SAFETY: called once at startup, before any window exists.
@@ -259,8 +269,8 @@ fn main() {
 /// (an interrupted import leaves no orphan or half-written file):
 /// leftover temporary copies are deleted, finished copies without a record are
 /// added, and records whose file is gone are removed. Returns a message when
-/// files were missing.
-fn load_library(media: &std::path::Path) -> Option<String> {
+/// files were missing, and one when the changed library could not be saved.
+fn load_library(media: &std::path::Path) -> (Option<String>, Option<String>) {
     let data = store::with(|s| s.data.clone()).unwrap_or_default();
     let mut lib = library::Library::from_store(&data);
     import::cleanup_partials(media);
@@ -276,29 +286,45 @@ fn load_library(media: &std::path::Path) -> Option<String> {
     }
     let changed = !orphans.is_empty() || !missing.is_empty();
     library::set(lib);
-    if changed {
-        let _ = library::persist();
-    }
-    (!missing_names.is_empty()).then(|| {
+    let unsaved = if changed { library::persist().err().filter(|_| !store::read_only()) } else { None };
+    let missing = (!missing_names.is_empty()).then(|| {
         format!(
             "{} file(s) were no longer in the Media folder and were removed from the library:\n\n{}",
             missing_names.len(),
             missing_names.join("\n")
         )
-    })
+    });
+    (missing, unsaved.map(|e| unsaved_after_compare(&e, orphans.len(), missing_names.len())))
+}
+
+/// What to say when the start-up comparison changed the library but the
+/// library file could not be saved.
+fn unsaved_after_compare(why: &str, added: usize, removed: usize) -> String {
+    let what = match (added, removed) {
+        (a, 0) => format!("added {a} file(s) it found in the Media folder to the library"),
+        (0, r) => format!("removed {r} missing file(s) from the library"),
+        (a, r) => format!("added {a} file(s) it found in the Media folder and removed {r} missing file(s)"),
+    };
+    let why = why.trim_end_matches('.');
+    format!(
+        "PocketMedia {what}, but {why}.\n\nNothing is lost: the library is right while PocketMedia runs, and the \
+         same check runs again at the next start. If this message comes back, check that the Data folder beside \
+         PocketMedia can be written to (not read-only and not full)."
+    )
 }
 
 /// `--check-library`: what a start finds in the library beside this program.
 fn check_library(paths: paths::Paths, report: &std::path::Path) -> i32 {
     let outcome = store::init(&paths.data);
     let media = paths.media.clone();
-    let message = load_library(&media);
+    let (message, unsaved) = load_library(&media);
     let names = library::with(|lib| lib.items.iter().map(|i| i.name.clone()).collect::<Vec<_>>());
     let text = format!(
-        "store={}\nitems={}\nmissing={}\nnames={}\n",
+        "store={}\nitems={}\nmissing={}\nunsaved={}\nnames={}\n",
         outcome.label(),
         names.len(),
         message.unwrap_or_default().replace('\n', " / "),
+        unsaved.unwrap_or_default().replace('\n', " / "),
         names.join("|")
     );
     if std::fs::write(report, text).is_ok() { 0 } else { 1 }
@@ -322,10 +348,14 @@ fn run(mode: &Mode) -> Result<(), String> {
     if let Some(p) = paths::get()
         && let Err(e) = watch::start(&p.media, watch::BUFFER)
     {
-        selftest::note(&e);
+        report_watch_failure(&e);
     }
 
-    popup::create(module())?;
+    // Open faster keeps the small popup ready from the
+    // start; with Use less memory it is made when it is first opened.
+    if store::settings().profile == settings_state::Profile::OpenFaster {
+        popup::create()?;
+    }
     tray::add(main);
 
     let shortcut = store::settings().shortcut;
@@ -347,7 +377,7 @@ fn run(mode: &Mode) -> Result<(), String> {
 }
 
 /// This program's module handle.
-fn module() -> windows::Win32::Foundation::HINSTANCE {
+pub(crate) fn module() -> windows::Win32::Foundation::HINSTANCE {
     // SAFETY: None asks for the running exe's own module, which always exists.
     unsafe { GetModuleHandleW(None) }.map(Into::into).unwrap_or_default()
 }
@@ -383,6 +413,16 @@ fn create_main_window() -> Result<HWND, String> {
         )
     }
     .map_err(|e| format!("Could not create the main window: {e}"))
+}
+
+/// Watching the Media folder could not start. Said like a shortcut that
+/// could not be registered: a message now, and a line in the popup and the
+/// Manager for as long as it lasts (`watch::problem`).
+pub fn report_watch_failure(reason: &str) {
+    watch::start_failed(reason);
+    if !app(|a| a.quiet.get()) {
+        message_box(&watch::start_failure_message(reason), "PocketMedia - Media folder not watched", MB_ICONWARNING);
+    }
 }
 
 fn report_hotkey_failure(label: &str, reason: &str) {
@@ -446,6 +486,10 @@ extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             LRESULT(0)
         }
         WM_SELFTEST => selftest::on_ui_command(wparam, lparam),
+        WM_RELEASE => {
+            release_hidden();
+            LRESULT(0)
+        }
         jobs::WM_JOB => {
             for ev in jobs::take() {
                 if watch::on_event(&ev) || backup::on_event(&ev) {
@@ -466,13 +510,16 @@ extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             paste::tick();
             LRESULT(0)
         }
-        // Signing out or shutting down while a backup runs: Windows asks first,
-        // showing backup::SHUTDOWN_REASON (set when the backup started).
-        WM_QUERYENDSESSION => LRESULT(backup::may_end_session()),
+        // Signing out or shutting down while a backup or an import runs: Windows
+        // asks first, showing backup::SHUTDOWN_REASON or add_panel::SHUTDOWN_REASON
+        // (set when it started).
+        WM_QUERYENDSESSION => LRESULT(may_end_session()),
         WM_ENDSESSION => {
             if wparam.0 != 0 {
-                // The session ends anyway: stop the backup and let it clean up.
+                // The session ends anyway: stop the backup and let it clean up,
+                // and stop an import, recording and saving what it copied.
                 backup::shutdown();
+                stop_imports(std::time::Duration::from_secs(3));
             }
             LRESULT(0)
         }
@@ -521,27 +568,84 @@ extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
     }
 }
 
-/// The tray menu's Exit. While a backup runs it asks first; No
-/// keeps PocketMedia and the backup running.
+/// Windows that are hidden let go of what they hold, if nothing in them
+/// is in progress. With Use less memory and both windows hidden, the thumbnail
+/// workers and the GIF and video threads end too (they start again when needed).
+fn release_hidden() {
+    popup::release_if_idle();
+    manager::release_if_idle();
+    let less = store::settings().profile == settings_state::Profile::LessMemory;
+    if less && !popup::is_visible() && !manager::is_visible() {
+        thumbs::retire_workers();
+        preview::stop_threads();
+    }
+}
+
+/// Asks for `release_hidden` once the current message is handled (from any window code).
+pub fn release_hidden_later() {
+    let main = app(|a| a.main.get());
+    // SAFETY: posting to our own window; a destroyed window only makes it fail.
+    let _ = unsafe { PostMessageW(Some(main), WM_RELEASE, WPARAM(0), LPARAM(0)) };
+}
+
+/// WM_QUERYENDSESSION, for the main window and the Manager: "not yet" (0) while a
+/// backup or an import runs, so Windows shows the reason and lets the user choose.
+pub fn may_end_session() -> isize {
+    isize::from(backup::may_end_session() == 1 && !add_panel::copies_running())
+}
+
+/// The question Exit asks now, if any (the self-test reads it without exiting).
+pub fn exit_question() -> Option<(&'static str, &'static str)> {
+    if backup::running() {
+        Some((STOP_BACKUP_TEXT, STOP_BACKUP_TITLE))
+    } else if add_panel::copies_running() {
+        Some((STOP_IMPORT_TEXT, STOP_IMPORT_TITLE))
+    } else {
+        None
+    }
+}
+
+/// The tray menu's Exit. While a backup or an import runs
+/// it asks first; No keeps PocketMedia and the work running. Yes stops an import
+/// cleanly before exiting: the copy in progress finishes or is removed, and what
+/// was copied is recorded and saved.
 pub fn request_exit() {
     if backup::running() && !ask_yes_no(STOP_BACKUP_TEXT, STOP_BACKUP_TITLE) {
         return;
     }
+    if add_panel::copies_running() && !ask_yes_no(STOP_IMPORT_TEXT, STOP_IMPORT_TITLE) {
+        return;
+    }
+    stop_imports(std::time::Duration::from_secs(10));
     exit();
 }
+
+/// Stops the imports that are copying, in the popup and the Manager, and waits
+/// (at most `limit` each) until they have recorded and saved what they copied.
+fn stop_imports(limit: std::time::Duration) {
+    for line in [popup::stop_import(limit), manager::stop_import(limit)].into_iter().flatten() {
+        selftest::note(&format!("import stopped for Exit: {line}"));
+    }
+}
+
+pub const STOP_IMPORT_TITLE: &str = "PocketMedia - import running";
+pub const STOP_IMPORT_TEXT: &str = "An import is running. Stop it?\n\n\
+    Yes stops the import, keeps the files already copied and exits PocketMedia.\n\
+    No lets the import finish; you can exit PocketMedia afterwards.";
 
 pub const STOP_BACKUP_TITLE: &str = "PocketMedia - backup running";
 pub const STOP_BACKUP_TEXT: &str = "A backup is running. Stop it?\n\n\
     Yes stops the backup, removes the unfinished copy and exits PocketMedia.\n\
     No lets the backup finish; you can exit PocketMedia afterwards.";
 
-/// A Yes/No question with No as the default button. True for Yes.
+/// A Yes/No question with No as the default button. True for Yes. Topmost, so
+/// the quick popup (itself topmost, with an import in its Add media) cannot hide it.
 fn ask_yes_no(text: &str, caption: &str) -> bool {
     let text = transfer::to_wide(text);
     let caption = transfer::to_wide(caption);
     // SAFETY: both strings are null-terminated UTF-16 that outlive the call.
     let answer = unsafe {
-        MessageBoxW(None, PCWSTR(text.as_ptr()), PCWSTR(caption.as_ptr()), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_SETFOREGROUND)
+        MessageBoxW(None, PCWSTR(text.as_ptr()), PCWSTR(caption.as_ptr()), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_SETFOREGROUND | MB_TOPMOST)
     };
     answer == IDYES
 }
@@ -561,4 +665,39 @@ pub fn message_box(text: &str, caption: &str, icon: MESSAGEBOX_STYLE) {
 
 fn fatal(text: &str) {
     message_box(text, "PocketMedia - cannot start", MB_ICONERROR);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The start-up message names what the comparison did, the reason, and what to do.
+    #[test]
+    fn unsaved_comparison_says_what_and_what_to_do() {
+        let why = "the library file could not be saved: Access is denied.";
+        let added = unsaved_after_compare(why, 2, 0);
+        assert!(added.starts_with("PocketMedia added 2 file(s) it found in the Media folder to the library, but the library file"));
+        assert!(unsaved_after_compare(why, 0, 3).contains("removed 3 missing file(s) from the library"));
+        assert!(unsaved_after_compare(why, 1, 1).contains("added 1 file(s) it found in the Media folder and removed 1 missing file(s)"));
+        for text in [added, unsaved_after_compare(why, 0, 1)] {
+            assert!(text.contains("Access is denied") && text.contains("Nothing is lost") && text.contains("Data folder"), "{text}");
+        }
+    }
+
+    /// The question reads like the backup's, and both start with the question itself.
+    #[test]
+    fn exit_questions_start_with_the_question() {
+        assert!(STOP_IMPORT_TEXT.starts_with("An import is running. Stop it?\n\nYes stops the import"));
+        assert!(STOP_BACKUP_TEXT.starts_with("A backup is running. Stop it?\n\nYes stops the backup"));
+        assert!(add_panel::SHUTDOWN_REASON.starts_with("An import is running. Stop it?"));
+    }
+
+    /// The popup's footer holds two short lines; these notices fit in them
+    /// (about 36 characters a line at 12 px in its 225 DIP).
+    #[test]
+    fn popup_notices_are_short() {
+        for text in [watch::POPUP_NOTICE, paste::PASTE_UNSAVED, paste::DRAG_UNSAVED] {
+            assert!(text.chars().count() <= 70, "{text}");
+        }
+    }
 }

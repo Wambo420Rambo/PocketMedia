@@ -388,6 +388,11 @@ pub fn init(dir: &Path) -> LoadOutcome {
 /// silent success.
 pub const NOT_OPEN: &str = "the library file is not open";
 
+/// The library file is from a newer PocketMedia and is never saved (said at start-up).
+pub fn read_only() -> bool {
+    with(|s| s.read_only).unwrap_or(false)
+}
+
 pub fn with<R>(f: impl FnOnce(&mut Store) -> R) -> Option<R> {
     STORE.with(|s| s.try_borrow_mut().ok().and_then(|mut s| s.as_mut().map(f)))
 }

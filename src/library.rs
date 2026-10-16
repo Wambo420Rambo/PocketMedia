@@ -43,14 +43,21 @@ pub fn set(lib: Library) {
 }
 
 /// Writes the library into the store and saves it. Returns a message on failure.
+/// Self-test only: this many of the next saves fail as if the disk refused them.
+pub static FAIL_SAVES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 pub fn persist() -> Result<(), String> {
     let (items, history, next_id) = with(|lib| (lib.to_stored(), lib.recent.clone(), lib.next_id));
+    let fail = FAIL_SAVES.fetch_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |n| n.checked_sub(1)).is_ok();
     crate::store::with(|s| {
         s.data.items = items;
         s.data.history = history;
         s.data.next_id = next_id;
         if s.read_only {
             return Err("the library file is from a newer PocketMedia, so changes are not saved".to_string());
+        }
+        if fail {
+            return Err("the library file could not be saved: the self-test made this save fail".to_string());
         }
         s.save().map(|_| ()).map_err(|e| format!("the library file could not be saved: {e}"))
     })

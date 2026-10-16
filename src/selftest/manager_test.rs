@@ -169,7 +169,7 @@ pub(super) fn run(r: &mut Report, t: &Session) -> bool {
     let hwnd = send(t.main, CMD_MANAGER, 0);
     let shown = wait_until(2000, || hwnd != 0 && is_visible(hwnd) && foreground() == hwnd);
     r.check("Open manager shows the Manager", shown, &describe_foreground());
-    r.check("Open manager closes the popup", wait_until(1000, || !is_visible(t.popup)), "");
+    r.check("Open manager closes the popup", wait_until(1000, || !is_visible(t.popup())), "");
     if !shown {
         return false;
     }
@@ -376,15 +376,21 @@ pub(super) fn run(r: &mut Report, t: &Session) -> bool {
     if guard(r, &t.allowed) {
         press(&[VK_ESCAPE]);
     }
-    wait_until(1500, || !is_visible(t.popup));
+    wait_until(1500, || !is_visible(t.popup()));
 
     // × hides the Manager; the app keeps running in the tray.
     send(t.main, CMD_FOCUS, hwnd);
     wait_until(1500, || foreground() == hwnd);
     m.click(r, MHit::Close);
     r.check("× hides the Manager", wait_until(1500, || !is_visible(hwnd)), "");
-    // The UI thread still answers and the (hidden) window still exists.
-    r.check("the app is still running after ×", send(t.main, CMD_MANAGER, 0) == hwnd, "");
+    // The UI thread still answers; the hidden Manager lets go of its window
+    // and is made again the next time it is opened.
+    let released = wait_until(1500, || send(t.main, CMD_MANAGER, 0) == 0);
+    r.check(
+        "the app is still running after ×, and the hidden Manager let go of its window",
+        released && send(t.main, CMD_HOTKEY_OK, 0) == 1,
+        &format!("Manager window now {:#x} (was {hwnd:#x})", send(t.main, CMD_MANAGER, 0)),
+    );
     true
 }
 

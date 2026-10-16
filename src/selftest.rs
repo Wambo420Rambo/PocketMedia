@@ -37,6 +37,7 @@ use crate::ui::add_view::AddHit;
 use crate::ui::layout::Hit;
 use crate::{StatusKind, WM_SELFTEST, app, exit, manager, popup, test_target};
 
+mod release_test;
 mod manager_test;
 mod media_gen;
 mod watch_test;
@@ -126,6 +127,8 @@ enum El {
     AddAdd,
     AddBack,
     AddMain,
+    /// Add media's × (closes the popup while an import may still be copying).
+    AddClose,
     Chip(usize),
     /// Recently used (0) or All media (1).
     Tab(usize),
@@ -153,6 +156,7 @@ impl El {
             El::AddAdd => 232,
             El::AddBack => 233,
             El::AddMain => 234,
+            El::AddClose => 235,
             El::Chip(i) => 10 + i as isize,
             El::Tab(i) => 30 + i as isize,
             El::GalleryGap => 40,
@@ -174,6 +178,7 @@ impl El {
             232 => AddHit::Add,
             233 => AddHit::Back,
             234 => AddHit::Main,
+            235 => AddHit::Close,
             _ => return Target::Gallery(Self::hit(code)),
         })
     }
@@ -402,6 +407,7 @@ pub fn on_ui_command(wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         cmd @ preview_test::CMD_PREVIEW_DESCRIBE..=preview_test::CMD_SET_PROFILE => preview_test::on_ui_command(cmd, lparam.0),
         cmd @ watch_test::CMD_LIB_FIND..=watch_test::CMD_WATCH_RESTART => watch_test::on_ui_command(cmd, lparam.0),
         cmd @ shortcut_test::CMD_SC_TRY..=shortcut_test::CMD_SC_FREE => shortcut_test::on_ui_command(cmd, lparam.0),
+        cmd @ release_test::CMD_H_DESCRIBE..=release_test::CMD_EXIT_QUESTION => release_test::on_ui_command(cmd, lparam.0),
         _ => 0,
     };
     LRESULT(value)
@@ -423,7 +429,8 @@ fn first_start() -> Result<(), String> {
     }
     crate::store::init(&p.data);
     crate::autostart::sync_store();
-    if let Some(message) = crate::load_library(&p.media) {
+    let (missing, unsaved) = crate::load_library(&p.media);
+    for message in [missing, unsaved].into_iter().flatten() {
         note(&message);
     }
     if let Err(e) = crate::watch::start(&p.media, crate::watch::BUFFER) {
@@ -445,7 +452,8 @@ fn many_items(n: u32) -> Result<usize, String> {
     for i in 0..n {
         std::fs::write(p.pictures.join(format!("Page item {i:02}.png")), seed::png(40, 30, 300 + i)).map_err(|e| e.to_string())?;
     }
-    if let Some(message) = crate::load_library(&p.media) {
+    let (missing, unsaved) = crate::load_library(&p.media);
+    for message in [missing, unsaved].into_iter().flatten() {
         note(&message);
     }
     if let Err(e) = crate::watch::start(&p.media, crate::watch::BUFFER) {
@@ -584,7 +592,7 @@ fn script(r: &mut Report, out: &Path, main: isize) {
     r.info(&format!("junction in the import source: {junction:?}"));
     send(main, CMD_RESET, 0);
 
-    let t = Session { main, out: out.to_path_buf(), allowed: allowed.to_vec(), target, popup: send(main, CMD_POPUP, 0) };
+    let t = Session { main, out: out.to_path_buf(), allowed: allowed.to_vec(), target };
     if let Some(sections) = only() {
         quick_run(r, &t, &sections);
         stop_child(&mut target_proc);
@@ -593,9 +601,9 @@ fn script(r: &mut Report, out: &Path, main: isize) {
     if !run_input_tests(r, &t) {
         r.info("input tests stopped early");
     }
-    if is_visible(t.popup) && foreground() == t.popup && guard(r, &t.allowed) {
+    if is_visible(t.popup()) && foreground() == t.popup() && guard(r, &t.allowed) {
         press(&[VK_ESCAPE]);
-        wait_until(1500, || !is_visible(t.popup));
+        wait_until(1500, || !is_visible(t.popup()));
     }
     // A second start must keep what is already in the folders.
     let marker = crate::paths::get().map(|p| p.data.join("self-test-marker.txt"));
@@ -609,13 +617,21 @@ fn script(r: &mut Report, out: &Path, main: isize) {
         let _ = std::fs::remove_file(m);
     }
     blocked_folder_test(r, out, &exe);
+    // The hidden windows let go of what they hold and failures
+    // are said. Exit during an import ends the run, as Exit did.
+    for (name, section) in [("release", release_test::release as fn(&mut Report, &Session) -> bool), ("notices", release_test::notices)] {
+        if !section(r, &t) {
+            r.info(&format!("section {name} stopped early"));
+        }
+    }
+    release_test::exit_during_import(r, &t);
     stop_child(&mut target_proc);
-    exit_test(r, main);
 }
 
 /// Sections a quick run can be limited to (`--self-test <dir> --only a,b`), for
 /// checks that changed while the rest did not.
-const SECTIONS: [&str; 4] = ["empty-library", "page-keys", "stress", "jump"];
+/// `exit-import` ends PocketMedia, so it must come last.
+const SECTIONS: [&str; 7] = ["empty-library", "page-keys", "stress", "jump", "release", "notices", "exit-import"];
 
 /// The sections named after `--only`, if any.
 fn only() -> Option<Vec<String>> {
@@ -635,16 +651,23 @@ fn quick_run(r: &mut Report, t: &Session, sections: &[String]) {
             "page-keys" => manager_test::page_keys(r, t),
             "stress" => preview_test::stress_only(r, t, true),
             "jump" => preview_test::stress_only(r, t, false),
+            "release" => release_test::release(r, t),
+            "notices" => release_test::notices(r, t),
+            "exit-import" => {
+                release_test::exit_during_import(r, t);
+                // PocketMedia has exited: nothing after this can run.
+                return;
+            }
             other => r.check(&format!("quick run: a section named {other:?}"), false, &format!("known sections: {}", SECTIONS.join(", "))),
         };
+        // Each section starts from a reset library, so the next one still runs.
         if !ok {
             r.info(&format!("section {name} stopped early"));
-            break;
         }
     }
-    if is_visible(t.popup) && foreground() == t.popup && guard(r, &t.allowed) {
+    if is_visible(t.popup()) && foreground() == t.popup() && guard(r, &t.allowed) {
         press(&[VK_ESCAPE]);
-        wait_until(1500, || !is_visible(t.popup));
+        wait_until(1500, || !is_visible(t.popup()));
     }
 }
 
@@ -667,6 +690,11 @@ fn exit_test(r: &mut Report, main: isize) {
     // SAFETY: IsWindow accepts any value, including a destroyed window's.
     let gone = wait_until(5000, || !unsafe { IsWindow(Some(hwnd(main))) }.as_bool());
     r.check("Exit from the tray menu closes PocketMedia's main window without asking (no backup runs)", gone, "");
+    after_exit(r, main, shortcut, gone);
+}
+
+/// After Exit: the tray icon, the shortcut and the message loop are gone.
+fn after_exit(r: &mut Report, main: isize, shortcut: crate::hotkey::Shortcut, gone: bool) {
     let icon = tray_icon_rect(main);
     r.check("…and removes the tray icon", gone && icon.is_none(), &format!("icon place now {icon:?}"));
     let free = gone && shortcut_free(shortcut);
@@ -727,10 +755,21 @@ struct Session {
     out: PathBuf,
     allowed: Vec<u32>,
     target: isize,
-    popup: isize,
 }
 
 impl Session {
+    /// The popup's window now. Asked each time: with Use less memory the hidden
+    /// popup is released and made again on the next open, so a
+    /// handle kept from earlier may be gone.
+    fn popup(&self) -> isize {
+        send(self.main, CMD_POPUP, 0)
+    }
+
+    /// The Manager's window now (0 while it is released), for the same reason.
+    fn manager(&self) -> isize {
+        send(self.main, CMD_MANAGER, 0)
+    }
+
     fn point(&self, el: El) -> Option<(i32, i32)> {
         unpack(send(self.main, CMD_POINT, el.code()))
     }
@@ -765,20 +804,20 @@ impl Session {
 
     fn shot(&self, r: &mut Report, name: &str) {
         std::thread::sleep(Duration::from_millis(150));
-        if let Some(rect) = window_rect(self.popup) {
+        if let Some(rect) = window_rect(self.popup()) {
             save_capture(r, &self.out.join("screens").join(format!("{name}.png")), capture_screen(rect));
         }
     }
 
     fn open(&self, r: &mut Report) -> bool {
-        if is_visible(self.popup) && foreground() == self.popup {
+        if is_visible(self.popup()) && foreground() == self.popup() {
             return true;
         }
         if !guard(r, &self.allowed) {
             return false;
         }
         press_hotkey();
-        let ok = wait_until(2000, || is_visible(self.popup) && foreground() == self.popup);
+        let ok = wait_until(2000, || is_visible(self.popup()) && foreground() == self.popup());
         std::thread::sleep(Duration::from_millis(200));
         ok
     }
@@ -860,7 +899,7 @@ const ALL: [&str; 8] = [
 ];
 
 fn run_input_tests(r: &mut Report, t: &Session) -> bool {
-    let (main, target, popup) = (t.main, t.target, t.popup);
+    let (main, target) = (t.main, t.target);
 
     // 3. Tray menu (opened the way a right-click on the icon does).
     tray_menu_test(r);
@@ -875,13 +914,13 @@ fn run_input_tests(r: &mut Report, t: &Session) -> bool {
         return false;
     }
     press_hotkey();
-    r.check("shortcut opens popup", wait_until(2000, || is_visible(popup)), "");
+    r.check("shortcut opens popup", wait_until(2000, || is_visible(t.popup())), "");
     let remembered = send(main, CMD_TARGET, 0);
     r.check("popup remembers previous app", remembered == target, &format!("remembered {remembered:#x}, target {target:#x}"));
-    r.check("popup has focus", wait_until(1000, || foreground() == popup), &describe_foreground());
-    if let Some(rect) = window_rect(popup) {
+    r.check("popup has focus", wait_until(1000, || foreground() == t.popup()), &describe_foreground());
+    if let Some(rect) = window_rect(t.popup()) {
         // SAFETY: GetDpiForWindow tolerates any HWND.
-        let dpi = unsafe { GetDpiForWindow(hwnd(popup)) };
+        let dpi = unsafe { GetDpiForWindow(hwnd(t.popup())) };
         let scale = dpi as f32 / 96.0;
         let (w, h) = ((rect.right - rect.left) as f32 / scale, (rect.bottom - rect.top) as f32 / scale);
         r.info(&format!("popup rect {rect:?}, dpi {dpi}, size {w:.0}x{h:.0} DIP"));
@@ -894,20 +933,20 @@ fn run_input_tests(r: &mut Report, t: &Session) -> bool {
         return false;
     }
     press(&[VK_ESCAPE]);
-    r.check("Escape closes popup", wait_until(1500, || !is_visible(popup)), "");
+    r.check("Escape closes popup", wait_until(1500, || !is_visible(t.popup())), "");
     r.check("focus returns to previous app after Escape", wait_until(1500, || foreground() == target), &describe_foreground());
 
     // 5b. The popup's × hides it the same way (focused-10).
     if !t.open(r) {
         return false;
     }
-    let before = window_rect(popup);
+    let before = window_rect(t.popup());
     if let Some((x, y)) = t.point(El::Close) {
         mouse_to(x, y);
         t.shot(r, "state-popup-close-hover");
     }
     t.click(r, El::Close);
-    let closed = wait_until(1500, || !is_visible(popup));
+    let closed = wait_until(1500, || !is_visible(t.popup()));
     r.check("the popup's × closes it", closed, &t.describe());
     r.check("…and focus returns to the previous app", wait_until(1500, || foreground() == target), &describe_foreground());
     r.check(
@@ -929,7 +968,7 @@ fn run_input_tests(r: &mut Report, t: &Session) -> bool {
         return false;
     }
     press_hotkey();
-    r.check("shortcut toggles popup closed", wait_until(1500, || !is_visible(popup)), "");
+    r.check("shortcut toggles popup closed", wait_until(1500, || !is_visible(t.popup())), "");
     r.check("focus returns to previous app after toggle", wait_until(1500, || foreground() == target), &describe_foreground());
     caret_test(r, t);
 
@@ -943,7 +982,7 @@ fn run_input_tests(r: &mut Report, t: &Session) -> bool {
     t.wheel_gallery(r, 5);
     t.park();
     t.shot(r, "focused-01-popup-recent-scrolled1");
-    r.check("gallery scrolls inside the window", popup_size_unchanged(popup), "window size unchanged after scrolling");
+    r.check("gallery scrolls inside the window", popup_size_unchanged(t.popup()), "window size unchanged after scrolling");
 
     t.click(r, El::Tab(1));
     t.park();
@@ -1067,7 +1106,7 @@ fn run_input_tests(r: &mut Report, t: &Session) -> bool {
         std::thread::sleep(Duration::from_millis(60));
         mouse_button(true);
         mouse_button(false);
-        r.check("clicking outside closes popup", wait_until(1500, || !is_visible(popup)), "");
+        r.check("clicking outside closes popup", wait_until(1500, || !is_visible(t.popup())), "");
     }
 
     // 11b. A first start: no library yet.
@@ -1090,9 +1129,9 @@ fn run_input_tests(r: &mut Report, t: &Session) -> bool {
 /// folders; the popup says the library is empty and offers Add media, and the
 /// Manager has nothing in it. The next section resets the library.
 fn first_start_test(r: &mut Report, t: &Session) -> bool {
-    if is_visible(t.popup) {
-        post(t.popup, WM_CLOSE, 0, 0);
-        wait_until(1500, || !is_visible(t.popup));
+    if is_visible(t.popup()) {
+        post(t.popup(), WM_CLOSE, 0, 0);
+        wait_until(1500, || !is_visible(t.popup()));
     }
     send(t.main, CMD_FOCUS, t.target);
     wait_until(1500, || foreground() == t.target);
@@ -1350,7 +1389,7 @@ fn add_media_test(r: &mut Report, t: &Session) -> bool {
     press(&[VK_ESCAPE]);
     std::thread::sleep(Duration::from_millis(150));
     t.state_has(r, "Escape leaves Add media without closing the popup", &["screen=gallery"]);
-    r.check("popup still open after Escape in Add media", is_visible(t.popup), "");
+    r.check("popup still open after Escape in Add media", is_visible(t.popup()), "");
     popup_drop_test(r, t);
     true
 }
@@ -1370,9 +1409,9 @@ fn popup_drop_test(r: &mut Report, t: &Session) {
         return;
     }
     t.click(r, El::AddMediaButton);
-    let Some(p) = window_rect(t.popup) else { return };
+    let Some(p) = window_rect(t.popup()) else { return };
     let to = (p.left + (p.right - p.left) / 2, p.top + (p.bottom - p.top) / 3);
-    if drag_from_target(r, t, &file, to, t.popup) {
+    if drag_from_target(r, t, &file, to, t.popup()) {
         let reviewed = t.wait_state("Dropped on popup.png:ok", 8000);
         let result = std::fs::read_to_string(t.out.join("drag-from-result.txt")).unwrap_or_default();
         r.check(
@@ -1380,13 +1419,13 @@ fn popup_drop_test(r: &mut Report, t: &Session) {
             reviewed && t.describe().contains("stage=review"),
             &format!("drag: {result}; {}", t.describe()),
         );
-        r.check("…the popup stayed open while the other app was used for the drag", is_visible(t.popup), "");
+        r.check("…the popup stayed open while the other app was used for the drag", is_visible(t.popup()), "");
         r.check("…the dropped file is still where it was (a copy is made only on Add)", file.is_file(), &file.display().to_string());
         t.shot(r, "state-popup-dropped");
     }
     // Back to the gallery without adding, so the library stays as the next checks expect.
-    send(t.main, CMD_FOCUS, t.popup);
-    wait_until(1500, || foreground() == t.popup);
+    send(t.main, CMD_FOCUS, t.popup());
+    wait_until(1500, || foreground() == t.popup());
     for _ in 0..3 {
         if !t.describe().contains("screen=add") || !guard(r, &t.allowed) {
             break;
@@ -1418,10 +1457,10 @@ fn tray_menu_test(r: &mut Report) {
 /// callback (a left button released), as Windows does for a real click.
 fn tray_click_test(r: &mut Report, t: &Session) {
     post(t.main, crate::WM_TRAY, 0, WM_LBUTTONUP as isize);
-    let shown = wait_until(2000, || is_visible(t.popup));
+    let shown = wait_until(2000, || is_visible(t.popup()));
     r.check("a left click on the tray icon opens the quick popup (its callback, posted)", shown, &describe_foreground());
-    post(t.popup, WM_CLOSE, 0, 0);
-    wait_until(1500, || !is_visible(t.popup));
+    post(t.popup(), WM_CLOSE, 0, 0);
+    wait_until(1500, || !is_visible(t.popup()));
     send(t.main, CMD_FOCUS, t.target);
     wait_until(1500, || foreground() == t.target);
 }
@@ -1438,14 +1477,14 @@ fn caret_test(r: &mut Report, t: &Session) {
         return;
     }
     press(&[VK_ESCAPE]);
-    wait_until(1500, || !is_visible(t.popup) && foreground() == t.target);
+    wait_until(1500, || !is_visible(t.popup()) && foreground() == t.target);
     std::thread::sleep(Duration::from_millis(200));
     let mut caret = windows::Win32::Foundation::POINT { x: test_target::CARET.0, y: test_target::CARET.1 };
     // SAFETY: the target's own window; caret is a local.
     let _ = unsafe { windows::Win32::Graphics::Gdi::ClientToScreen(hwnd(t.target), &mut caret) };
     let opened = t.open(r);
     let placed = unpack(send(t.main, CMD_POPUP_PLACED, 0));
-    let rect = window_rect(t.popup);
+    let rect = window_rect(t.popup());
     // The caret's bottom-left corner: same x, a caret's height (18 px at 96 DPI) lower.
     let near = placed.is_some_and(|(x, y)| x == caret.x && (caret.y..=caret.y + 60).contains(&y));
     let beside = match (rect, placed) {
@@ -1461,7 +1500,7 @@ fn caret_test(r: &mut Report, t: &Session) {
     if guard(r, &t.allowed) {
         press(&[VK_ESCAPE]);
     }
-    wait_until(1500, || !is_visible(t.popup));
+    wait_until(1500, || !is_visible(t.popup()));
     wait_until(1500, || foreground() == t.target);
 }
 
@@ -1474,7 +1513,7 @@ fn drag_test(r: &mut Report, t: &Session) {
         r.check("drag tile and target found", false, "");
         return;
     };
-    if let Some(p) = window_rect(t.popup)
+    if let Some(p) = window_rect(t.popup())
         && overlaps(&p, &to)
     {
         r.check("drag test layout", false, "popup overlaps the target window; screen too small");
@@ -1646,7 +1685,7 @@ fn paste_tests(r: &mut Report, t: &Session) -> bool {
         if !paste(r, t, query) {
             return false;
         }
-        r.check(&format!("paste of {name} closes the popup"), wait_until(3000, || !is_visible(t.popup)), "");
+        r.check(&format!("paste of {name} closes the popup"), wait_until(3000, || !is_visible(t.popup())), "");
         let formats_file = t.out.join("paste-formats.txt");
         let got = wait_until(3000, || formats_file.exists());
         let formats = std::fs::read_to_string(&formats_file).unwrap_or_default();
@@ -1689,7 +1728,7 @@ fn paste_tests(r: &mut Report, t: &Session) -> bool {
     if guard(r, &t.allowed) {
         press(&[VK_ESCAPE]);
     }
-    wait_until(1500, || !is_visible(t.popup));
+    wait_until(1500, || !is_visible(t.popup()));
 
     // Close after inserting off: the popup stays (without focus), the paste still arrives.
     send(t.main, CMD_SET_CLOSE_AFTER, 0);
@@ -1699,7 +1738,7 @@ fn paste_tests(r: &mut Report, t: &Session) -> bool {
     let formats_file = t.out.join("paste-formats.txt");
     let got = wait_until(3000, || formats_file.exists());
     r.check("with Close after inserting off, the paste still arrives", got, "");
-    r.check("…and the popup stays on screen", is_visible(t.popup), "");
+    r.check("…and the popup stays on screen", is_visible(t.popup()), "");
     r.check("…without taking focus from the app", foreground() == t.target, &describe_foreground());
     t.shot(r, "state-popup-stays-open");
     // A second paste from the popup that stayed open (a click on the tile).
@@ -1713,28 +1752,28 @@ fn paste_tests(r: &mut Report, t: &Session) -> bool {
         again && hdrop == hello.display().to_string(),
         &format!("target got: {hdrop:?}; {}", t.describe()),
     );
-    r.check("…the popup still stays on screen", is_visible(t.popup), "");
+    r.check("…the popup still stays on screen", is_visible(t.popup()), "");
     r.check("…and the app has the focus again", wait_until(1500, || foreground() == t.target), &describe_foreground());
     t.shot(r, "state-popup-second-paste");
     send(t.main, CMD_SET_CLOSE_AFTER, 1);
     if t.open(r) && guard(r, &t.allowed) {
         press(&[VK_ESCAPE]);
     }
-    wait_until(1500, || !is_visible(t.popup));
+    wait_until(1500, || !is_visible(t.popup()));
 
     // A paste that cannot be sent: the popup comes back and says so.
     send(t.main, CMD_FAIL_NEXT_PASTE, 0);
     if !paste(r, t, "wallpaper") {
         return false;
     }
-    let back = wait_until(4000, || is_visible(t.popup) && t.describe().contains("Paste didn't go through"));
+    let back = wait_until(4000, || is_visible(t.popup()) && t.describe().contains("Paste didn't go through"));
     r.check("a failed paste brings the popup back and says so", back, &t.describe());
     r.check("nothing was sent to the app", !t.out.join("paste-formats.txt").exists(), "");
     t.shot(r, "state-popup-paste-failed");
     if guard(r, &t.allowed) {
         press(&[VK_ESCAPE]);
     }
-    wait_until(1500, || !is_visible(t.popup));
+    wait_until(1500, || !is_visible(t.popup()));
 
     // When Windows cannot say whether the app runs as administrator,
     // Ctrl+V might be dropped without a word, so it is not sent at all.
@@ -1754,7 +1793,7 @@ fn paste_tests(r: &mut Report, t: &Session) -> bool {
     if guard(r, &t.allowed) {
         press(&[VK_ESCAPE]);
     }
-    wait_until(1500, || !is_visible(t.popup));
+    wait_until(1500, || !is_visible(t.popup()));
     send(t.main, CMD_FOCUS, t.target);
     wait_until(1500, || foreground() == t.target);
     if !t.open(r) {
@@ -1770,7 +1809,7 @@ fn paste_tests(r: &mut Report, t: &Session) -> bool {
     if guard(r, &t.allowed) {
         press(&[VK_ESCAPE]);
     }
-    wait_until(1500, || !is_visible(t.popup));
+    wait_until(1500, || !is_visible(t.popup()));
     true
 }
 
@@ -1794,14 +1833,14 @@ fn lost_target_test(r: &mut Report, t: &Session) {
     t.shot(r, "state-popup-after-lost-target");
     r.check(
         "after its drawing target is lost, the popup draws itself again",
-        redrawn && is_visible(t.popup),
+        redrawn && is_visible(t.popup()),
         &format!("drawing targets made {before} -> {after}; {}", t.describe()),
     );
     if t.select_all_and_type(r, "") && guard(r, &t.allowed) {
         press(&[VK_BACK]);
         press(&[VK_ESCAPE]);
     }
-    wait_until(1500, || !is_visible(t.popup));
+    wait_until(1500, || !is_visible(t.popup()));
 }
 
 /// The folders beside the program.
@@ -1881,27 +1920,27 @@ fn instance_test(r: &mut Report, t: &Session, exe: &Path) {
         }
         code
     };
-    let popup_hidden = !is_visible(t.popup);
+    let popup_hidden = !is_visible(t.popup());
     let code = launch(&[]);
     r.check("a second launch exits at once (exit code 0)", code == Some(0), &format!("exit code {code:?}"));
-    let shown = wait_until(3000, || is_visible(t.popup));
+    let shown = wait_until(3000, || is_visible(t.popup()));
     // In front only when Windows lets it be (a launch from Explorer does).
-    wait_until(1000, || foreground() == t.popup);
+    wait_until(1000, || foreground() == t.popup());
     r.check(
         "…and the running PocketMedia shows its popup instead",
         popup_hidden && shown,
         &format!("hidden before: {popup_hidden}; {}", describe_foreground()),
     );
-    if is_visible(t.popup) {
-        post(t.popup, WM_CLOSE, 0, 0);
-        wait_until(1500, || !is_visible(t.popup));
+    if is_visible(t.popup()) {
+        post(t.popup(), WM_CLOSE, 0, 0);
+        wait_until(1500, || !is_visible(t.popup()));
     }
     let code = launch(&[crate::autostart::ARG]);
     std::thread::sleep(Duration::from_millis(800));
     r.check(
         "a second launch from autostart exits quietly (no popup)",
-        code == Some(0) && !is_visible(t.popup),
-        &format!("exit code {code:?}, popup visible {}", is_visible(t.popup)),
+        code == Some(0) && !is_visible(t.popup()),
+        &format!("exit code {code:?}, popup visible {}", is_visible(t.popup())),
     );
     r.check("the tray icon and shortcut stay with the running copy", tray_icon_rect(t.main).is_some() && send(t.main, CMD_HOTKEY_OK, 0) == 1, "");
 
@@ -2338,6 +2377,11 @@ mod tests {
             watch_test::CMD_WATCH_RESTART,
             shortcut_test::CMD_SC_TRY,
             shortcut_test::CMD_SC_FREE,
+            release_test::CMD_H_DESCRIBE,
+            release_test::CMD_WATCH_START_FAIL,
+            release_test::CMD_WATCH_RESUME,
+            release_test::CMD_STARTUP_COMPARE,
+            release_test::CMD_EXIT_QUESTION,
         ];
         let mut sorted = all.to_vec();
         sorted.sort_unstable();
@@ -2348,6 +2392,7 @@ mod tests {
             let in_preview = (preview_test::CMD_PREVIEW_DESCRIBE..=preview_test::CMD_SET_PROFILE).contains(&c);
             let in_watch = (watch_test::CMD_LIB_FIND..=watch_test::CMD_WATCH_RESTART).contains(&c);
             let in_shortcut = (shortcut_test::CMD_SC_TRY..=shortcut_test::CMD_SC_FREE).contains(&c);
+            let in_release = (release_test::CMD_H_DESCRIBE..=release_test::CMD_EXIT_QUESTION).contains(&c);
             let own = [
                 preview_test::CMD_PREVIEW_DESCRIBE,
                 preview_test::CMD_THUMBS_RESET,
@@ -2359,9 +2404,14 @@ mod tests {
                 watch_test::CMD_WATCH_RESTART,
                 shortcut_test::CMD_SC_TRY,
                 shortcut_test::CMD_SC_FREE,
+                release_test::CMD_H_DESCRIBE,
+                release_test::CMD_WATCH_START_FAIL,
+                release_test::CMD_WATCH_RESUME,
+                release_test::CMD_STARTUP_COMPARE,
+                release_test::CMD_EXIT_QUESTION,
             ]
             .contains(&c);
-            assert!(own || !(in_preview || in_watch || in_shortcut), "command {c} falls in another module's range");
+            assert!(own || !(in_preview || in_watch || in_shortcut || in_release), "command {c} falls in another module's range");
         }
     }
 }

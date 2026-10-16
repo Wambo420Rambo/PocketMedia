@@ -327,9 +327,20 @@ fn ui<R>(f: impl FnOnce(&mut Ui) -> R) -> R {
     UI.with(|u| f(&mut u.borrow_mut()))
 }
 
+/// GIF and video threads running right now (for the self-test log).
+static LIVE: AtomicUsize = AtomicUsize::new(0);
+
 fn spawn<C: Send + 'static>(name: &str, run: fn(Receiver<C>)) -> Option<Sender<C>> {
     let (tx, rx) = mpsc::channel();
-    std::thread::Builder::new().name(name.into()).spawn(move || run(rx)).ok().map(|_| tx)
+    std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            LIVE.fetch_add(1, Ordering::SeqCst);
+            run(rx);
+            LIVE.fetch_sub(1, Ordering::SeqCst);
+        })
+        .ok()
+        .map(|_| tx)
 }
 
 /// The moving frame to draw for `key`, if it is playing.
@@ -493,6 +504,29 @@ pub fn on_wake() {
     for key in &changed {
         thumbs::invalidate(key);
     }
+}
+
+/// Use less memory with both windows hidden: the GIF and video threads
+/// end (their decoders, WIC factory, COM and stacks go). They start again when
+/// a window next shows a GIF or a hovered video. Nothing is playing by now.
+pub fn stop_threads() {
+    ui(|u| {
+        if !u.sent.is_empty() || u.hover.is_some() {
+            return;
+        }
+        if let Some(tx) = u.gif_tx.take() {
+            let _ = tx.send(GifCmd::Quit);
+        }
+        if let Some(tx) = u.video_tx.take() {
+            let _ = tx.send(VideoCmd::Quit);
+        }
+        u.frames.clear();
+    });
+}
+
+/// GIF and video threads still running (for the self-test log).
+pub fn threads() -> usize {
+    LIVE.load(Ordering::SeqCst)
 }
 
 /// Stops both threads (Exit); players release their decoders as they stop.

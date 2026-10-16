@@ -36,14 +36,14 @@ pub(super) fn run(r: &mut Report, t: &Session) -> bool {
     mouse_button(true);
     std::thread::sleep(Duration::from_millis(40));
     mouse_button(false);
-    let switched = wait_until(2000, || !is_visible(manager) && is_visible(t.popup) && foreground() == t.popup);
+    let switched = wait_until(2000, || !is_visible(manager) && is_visible(t.popup()) && foreground() == t.popup());
     r.check("Quick popup hides the Manager and opens the popup", switched, &super::describe_foreground());
     if !switched {
         return false;
     }
 
     // The popup moves by its header (the logo is a handle).
-    let (Some(before), Some((sx, sy))) = (window_rect(t.popup), t.point(El::Handle)) else {
+    let (Some(before), Some((sx, sy))) = (window_rect(t.popup()), t.point(El::Handle)) else {
         return r.check("find the popup's handle", false, "");
     };
     if !guard(r, &t.allowed) {
@@ -60,14 +60,14 @@ pub(super) fn run(r: &mut Report, t: &Session) -> bool {
     std::thread::sleep(Duration::from_millis(80));
     mouse_button(false);
     std::thread::sleep(Duration::from_millis(250));
-    let after = window_rect(t.popup);
+    let after = window_rect(t.popup());
     let moved = after.is_some_and(|a| (a.left - before.left - dx).abs() <= 2 && (a.top - before.top - dy).abs() <= 2);
-    r.check("the popup can be dragged by its header", moved && is_visible(t.popup), &format!("{before:?} -> {after:?}"));
-    r.check("the popup stays in front after the drag", foreground() == t.popup, &super::describe_foreground());
+    r.check("the popup can be dragged by its header", moved && is_visible(t.popup()), &format!("{before:?} -> {after:?}"));
+    r.check("the popup stays in front after the drag", foreground() == t.popup(), &super::describe_foreground());
     if guard(r, &t.allowed) {
         press(&[VK_ESCAPE]);
     }
-    wait_until(1500, || !is_visible(t.popup));
+    wait_until(1500, || !is_visible(t.popup()));
 
     // No app to paste into (as when opened from the tray): copy, stay open, say so.
     if !t.open(r) {
@@ -78,14 +78,14 @@ pub(super) fn run(r: &mut Report, t: &Session) -> bool {
     std::thread::sleep(Duration::from_millis(300));
     t.park();
     t.shot(r, "state-popup-copied");
-    r.check("with no app to paste into, the popup stays open", is_visible(t.popup), "");
+    r.check("with no app to paste into, the popup stays open", is_visible(t.popup()), "");
     t.state_has(r, "the popup says \"Copied to clipboard\"", &["status=\"Copied to clipboard\""]);
     let (_, text) = status(t.main);
     r.check("the image is on the clipboard and nothing else is reported", text.starts_with("Copied to clipboard"), &text);
     if guard(r, &t.allowed) {
         press(&[VK_ESCAPE]);
     }
-    wait_until(1500, || !is_visible(t.popup));
+    wait_until(1500, || !is_visible(t.popup()));
     remembered_app_expires(r, t)
 }
 
@@ -124,10 +124,10 @@ fn remembered_app_expires(r: &mut Report, t: &Session) -> bool {
             if guard(r, &t.allowed) {
                 press(&[VK_ESCAPE]);
             }
-            wait_until(1500, || !is_visible(t.popup));
+            wait_until(1500, || !is_visible(t.popup()));
         } else {
             r.check("from the Manager's Quick popup, a tile pastes into the app remembered just now", arrived, &text);
-            wait_until(1500, || !is_visible(t.popup));
+            wait_until(1500, || !is_visible(t.popup()));
         }
     }
     true
@@ -146,6 +146,6 @@ fn quick_popup(r: &mut Report, t: &Session, manager: isize) -> bool {
     mouse_button(true);
     std::thread::sleep(Duration::from_millis(40));
     mouse_button(false);
-    let switched = wait_until(2000, || !is_visible(manager) && is_visible(t.popup) && foreground() == t.popup);
+    let switched = wait_until(2000, || !is_visible(manager) && is_visible(t.popup()) && foreground() == t.popup());
     r.check("Quick popup opens the popup in front", switched, &super::describe_foreground())
 }
