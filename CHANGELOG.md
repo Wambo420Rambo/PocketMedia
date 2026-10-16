@@ -1,17 +1,13 @@
 # Changelog
 
-## Unreleased
-
-- The quick popup always opens on All media, and its tabs read All media, then Recent.
-- GIF tiles are labeled "GIF" instead of "GIF · loop".
-
 ## 1.0.0 (2026-10-16)
 
 The first release.
 
 - Quick popup on a global shortcut (Win + Alt + . by default, changeable in Settings), placed near the text cursor.
-- Search by file name: every word must appear, in any order. Filters for GIF, Picture and Video, plus Recently used and All media lists.
+- Search by file name: every word must appear, in any order. Filters for GIF, Picture and Video, plus All media and Recently used lists; the popup always opens on All media.
 - Paste the original file into the app you were in with a click or Enter, or drag it out as a copy.
+- Tiles carry a type badge (GIF, Picture, Video) and show the name without its extension.
 - GIFs loop while visible; videos can preview on hover (or not at all).
 - Add media from files, a folder with its subfolders, or by dropping them. A review list lets you rename files first. Duplicates are skipped and nothing is ever overwritten. Your originals stay where they are.
 - Manager: browse, sort, rename, open the folder, move to the Recycle Bin.
