@@ -26,7 +26,7 @@
 
 #ifndef AppVersion
   ; Keep in step with Cargo.toml.
-  #define AppVersion "1.0.0"
+  #define AppVersion "1.1.0"
 #endif
 
 #ifdef TestBuild
@@ -54,7 +54,7 @@ AppPublisher=Wambo420Rambo
 AppPublisherURL=https://github.com/Wambo420Rambo/PocketMedia
 AppSupportURL=https://github.com/Wambo420Rambo/PocketMedia/issues
 AppUpdatesURL=https://github.com/Wambo420Rambo/PocketMedia/releases
-VersionInfoVersion=1.0.0.0
+VersionInfoVersion=1.1.0.0
 DefaultDirName=C:\PocketMedia
 UsePreviousAppDir=yes
 DirExistsWarning=no

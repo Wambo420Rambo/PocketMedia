@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.0 (2026-10-22)
+
+- Add media: **Download from Twitter**. Paste one or more post links (twitter.com or x.com); their pictures (original size), videos and GIFs are downloaded, shown in the usual review list, and added to Pictures, Videos and GIFs. Twitter's GIFs are turned back into .gif files. This is the only feature that uses the network.
+
 ## 1.0.0 (2026-10-16)
 
 The first release.

@@ -20,6 +20,8 @@ const COL_GAP: f32 = 10.0;
 const ROUTE_W: f32 = 70.0;
 /// The × at the end of each review row (leaves a file out).
 const REMOVE_W: f32 = 28.0;
+/// A post link's text box (taller than a review name: it is the page's main field).
+const LINK_H: f32 = 36.0;
 /// The panel is at most this wide and centred, so it reads well in the wide
 /// Manager window too.
 const HOST_MAX_W: f32 = 680.0;
@@ -31,6 +33,12 @@ pub enum AddHit {
     Back,
     ChooseFiles,
     ImportExisting,
+    DownloadTwitter,
+    /// A post link's text box, and the × beside it.
+    LinkInput(usize),
+    RemoveLink(usize),
+    AddLink,
+    PasteLinks,
     RowInput(usize),
     /// The × that leaves a file out of the import.
     Remove(usize),
@@ -49,6 +57,15 @@ pub struct RowGeom {
     pub route: Rect,
     /// The × (while the list can be edited).
     pub remove: Option<Rect>,
+}
+
+/// One post link on the Download from Twitter page.
+pub struct LinkGeom {
+    pub input: Rect,
+    /// The × (while the links can be edited).
+    pub remove: Option<Rect>,
+    /// Why the link was not downloaded, under it.
+    pub error: Option<(Rect, String)>,
 }
 
 /// Everything positioned for one frame. Content rects are already shifted by scroll.
@@ -72,6 +89,7 @@ pub struct AddLayout {
     pub drop: Rect,
     pub choose_files: Rect,
     pub import_existing: Rect,
+    pub download_twitter: Rect,
     pub choice_text_w: f32,
     /// Why choosing failed, under the choices.
     pub error: Option<Rect>,
@@ -80,6 +98,18 @@ pub struct AddLayout {
     pub rows: Vec<RowGeom>,
     pub note: Rect,
     pub choose_again: Rect,
+    // Download from Twitter page
+    pub links_label: Rect,
+    pub links: Vec<LinkGeom>,
+    /// "Add another link" (None at the most links) and "Paste links", while editable.
+    pub add_link: Option<Rect>,
+    pub paste_links: Option<Rect>,
+    pub links_hint: Rect,
+    /// A message for all the links (`AddMedia::error`), under the hint.
+    pub links_error: Option<Rect>,
+    /// While downloading: the status line and the progress bar under it.
+    pub status: Option<Rect>,
+    pub bar: Option<Rect>,
     pub content_h: f32,
 }
 
@@ -89,6 +119,13 @@ const IMPORT_EXISTING: (&str, &str) = (
     "Import your existing media",
     "Select a folder. Supported files from it and all subfolders are sorted and copied into Pictures, GIFs and Videos. Original files stay where they are.",
 );
+const DOWNLOAD_TWITTER: (&str, &str) =
+    ("Download from Twitter", "Paste links to posts to save their pictures, videos and GIFs.");
+const LINKS_HINT: &str = "Links to posts on twitter.com or x.com. Pasting several links at once fills one row each.";
+const LINK_PLACEHOLDER: &str = "https://x.com/name/status/1234567890";
+pub const ADD_LINK: &str = "Add another link";
+pub const PASTE_LINKS: &str = "Paste links";
+const LINKS_SAFETY: &str = "Only public posts can be downloaded.";
 
 impl AddLayout {
     pub fn compute(a: &AddMedia, width: f32, height: f32, gfx: &Gfx) -> Self {
@@ -109,7 +146,7 @@ impl AddLayout {
 
         // Footer: the safety line (or a notice, which may wrap and makes the footer
         // taller), then the actions (review only) at its right.
-        let review = a.reviewing();
+        let review = a.reviewing() || a.links_page();
         let add_w = widgets::text_button_w(gfx, &a.add_label(), TextStyle::Medium);
         let cancel_w = widgets::text_button_w(gfx, "Cancel", TextStyle::Body);
         let safety_w = if review { inner_w - add_w - 8.0 - cancel_w - 12.0 } else { inner_w };
@@ -131,7 +168,58 @@ impl AddLayout {
         let choice_h = |small: &str| 32.0 + TextStyle::Medium.line() + 4.0 + gfx.wrapped_height(small, TextStyle::Small, choice_text_w);
         let choose_files = Rect::new(x0, drop.bottom() + 14.0, inner_w, choice_h(CHOOSE_FILES.1));
         let import_existing = Rect::new(x0, choose_files.bottom() + 10.0, inner_w, choice_h(IMPORT_EXISTING.1));
-        let error = a.error.as_deref().map(|e| Rect::new(x0, import_existing.bottom() + 12.0, inner_w, gfx.wrapped_height(e, TextStyle::Small, inner_w)));
+        let download_twitter = Rect::new(x0, import_existing.bottom() + 10.0, inner_w, choice_h(DOWNLOAD_TWITTER.1));
+        let error = a.error.as_deref().map(|e| Rect::new(x0, download_twitter.bottom() + 12.0, inner_w, gfx.wrapped_height(e, TextStyle::Small, inner_w)));
+
+        // Download from Twitter page.
+        let links_label = Rect::new(x0, top, inner_w, TextStyle::Medium.line());
+        let editable = a.links_editable();
+        let input_w = inner_w - 8.0 - REMOVE_W;
+        let mut y = links_label.bottom() + 10.0;
+        let mut links = Vec::new();
+        for (i, _) in a.links.iter().enumerate() {
+            let input = Rect::new(x0, y, input_w, LINK_H);
+            let remove = editable.then(|| Rect::new(x0 + inner_w - REMOVE_W, y + (LINK_H - REMOVE_W) / 2.0, REMOVE_W, REMOVE_W));
+            y = input.bottom();
+            let error = a.link_errors.get(i).cloned().flatten().map(|m| {
+                let r = Rect::new(x0, y + 4.0, input_w, gfx.wrapped_height(&m, TextStyle::Small, input_w));
+                y = r.bottom();
+                (r, m)
+            });
+            links.push(LinkGeom { input, remove, error });
+            y += 8.0;
+        }
+        let (mut add_link, mut paste_links) = (None, None);
+        if editable {
+            let mut x = x0;
+            if a.links.len() < crate::twitter::MAX_LINKS {
+                let w = widgets::text_button_w(gfx, ADD_LINK, TextStyle::Body);
+                add_link = Some(Rect::new(x, y + 2.0, w, BUTTON_H));
+                x += w + 8.0;
+            }
+            let w = widgets::text_button_w(gfx, PASTE_LINKS, TextStyle::Body);
+            paste_links = Some(Rect::new(x, y + 2.0, w, BUTTON_H));
+            y += 2.0 + BUTTON_H;
+        }
+        let links_hint = Rect::new(x0, y + 12.0, inner_w, gfx.wrapped_height(LINKS_HINT, TextStyle::Small, inner_w));
+        y = links_hint.bottom();
+        let links_error = (a.links_page() && a.error.is_some()).then(|| {
+            let h = gfx.wrapped_height(a.error.as_deref().unwrap_or(""), TextStyle::Small, inner_w);
+            let r = Rect::new(x0, y + 8.0, inner_w, h);
+            y = r.bottom();
+            r
+        });
+        let status = a.download_status().map(|_| {
+            let r = Rect::new(x0, y + 14.0, inner_w, TextStyle::Small.line());
+            y = r.bottom();
+            r
+        });
+        let bar = status.map(|_| {
+            let r = Rect::new(x0, y + 6.0, inner_w, 4.0);
+            y = r.bottom();
+            r
+        });
+        let links_bottom = y;
 
         // Review page.
         let summary = Rect::new(x0, top, inner_w, TextStyle::Small.line());
@@ -168,10 +256,12 @@ impl AddLayout {
         let ca_w = widgets::text_button_w(gfx, "Choose again", TextStyle::Body);
         let choose_again = Rect::new(x0, note.bottom() + 10.0, ca_w, BUTTON_H);
 
-        let content_h = if review {
+        let content_h = if a.links_page() {
+            links_bottom + 18.0 - top
+        } else if review {
             choose_again.bottom() + 18.0 - top
         } else {
-            error.map_or(import_existing.bottom(), |e| e.bottom()) + 18.0 - top
+            error.map_or(download_twitter.bottom(), |e| e.bottom()) + 18.0 - top
         };
 
         AddLayout {
@@ -191,12 +281,21 @@ impl AddLayout {
             drop,
             choose_files,
             import_existing,
+            download_twitter,
             choice_text_w,
             error,
             summary,
             rows,
             note,
             choose_again,
+            links_label,
+            links,
+            add_link,
+            paste_links,
+            links_hint,
+            links_error,
+            status,
+            bar,
             content_h,
         }
     }
@@ -224,6 +323,10 @@ impl AddLayout {
             AddFocus::ChooseAgain => Some(self.choose_again),
             AddFocus::ChooseFiles => Some(self.choose_files),
             AddFocus::ImportExisting => Some(self.import_existing),
+            AddFocus::DownloadTwitter => Some(self.download_twitter),
+            AddFocus::Link(i) | AddFocus::RemoveLink(i) => self.links.get(i).map(|g| g.input),
+            AddFocus::AddLink => self.add_link,
+            AddFocus::PasteLinks => self.paste_links,
             _ => None,
         }
     }
@@ -235,7 +338,7 @@ impl AddLayout {
         if self.back.contains(x, y) {
             return AddHit::Back;
         }
-        if a.reviewing() && self.footer.contains(x, y) {
+        if (a.reviewing() || a.links_page()) && self.footer.contains(x, y) {
             if self.add.contains(x, y) {
                 return AddHit::Add;
             }
@@ -246,6 +349,24 @@ impl AddLayout {
         }
         if !self.main.contains(x, y) {
             return AddHit::None;
+        }
+        if a.links_page() {
+            if !a.links_editable() {
+                return AddHit::Main;
+            }
+            if let Some(i) = self.links.iter().position(|g| g.input.contains(x, y)) {
+                return AddHit::LinkInput(i);
+            }
+            if let Some(i) = self.links.iter().position(|g| g.remove.is_some_and(|r| r.contains(x, y))) {
+                return AddHit::RemoveLink(i);
+            }
+            if self.add_link.is_some_and(|r| r.contains(x, y)) {
+                return AddHit::AddLink;
+            }
+            if self.paste_links.is_some_and(|r| r.contains(x, y)) {
+                return AddHit::PasteLinks;
+            }
+            return AddHit::Main;
         }
         if a.reviewing() {
             if !a.editable() {
@@ -264,6 +385,8 @@ impl AddLayout {
             return AddHit::ChooseFiles;
         } else if self.import_existing.contains(x, y) {
             return AddHit::ImportExisting;
+        } else if self.download_twitter.contains(x, y) {
+            return AddHit::DownloadTwitter;
         }
         AddHit::Main
     }
@@ -275,6 +398,8 @@ pub struct AddUi {
     /// Caret x within the focused row's text, from DirectWrite hit-testing.
     pub caret_x: f32,
     pub selection_w: f32,
+    /// How far the focused link's text is moved left so the caret shows.
+    pub text_shift: f32,
 }
 
 pub fn paint(p: &Painter, a: &AddMedia, l: &AddLayout, ui: &AddUi) {
@@ -291,6 +416,8 @@ pub fn paint(p: &Painter, a: &AddMedia, l: &AddLayout, ui: &AddUi) {
     widgets::close_button(p, l.close, ui.hover == AddHit::Close, focused(AddFocus::Close));
     let (heading, sub) = if a.reviewing() {
         ("Review files", "Check the files before adding them.")
+    } else if a.links_page() {
+        ("Download from Twitter", "Save pictures, videos and GIFs from one or more posts.")
     } else {
         ("Add media", "Pictures, GIFs and videos, in one place.")
     };
@@ -299,7 +426,9 @@ pub fn paint(p: &Painter, a: &AddMedia, l: &AddLayout, ui: &AddUi) {
 
     // Scrolling area
     p.push_clip(l.main);
-    if a.reviewing() {
+    if a.links_page() {
+        links_page(p, a, l, ui, &ring);
+    } else if a.reviewing() {
         review(p, a, l, ui, &ring);
     } else {
         start(p, l, ui, &ring);
@@ -319,11 +448,15 @@ pub fn paint(p: &Painter, a: &AddMedia, l: &AddLayout, ui: &AddUi) {
     p.line(l.footer.x + PAD, l.footer.y + 0.5, l.footer.right() - PAD, l.footer.y + 0.5, 1.0, LINE);
     match (l.notice, a.notice.as_deref()) {
         (Some(r), Some(n)) => p.text_wrapped(n, r.x, r.y, r.w, TextStyle::Small, ACCENT),
-        _ => p.text("Your originals stay where they are.", l.safety, TextStyle::Small, SUBTLE, Align::Start, true),
+        _ => {
+            let safety = if a.links_page() || a.from_download { LINKS_SAFETY } else { "Your originals stay where they are." };
+            p.text(safety, l.safety, TextStyle::Small, SUBTLE, Align::Start, true)
+        }
     }
-    if a.reviewing() {
+    if a.reviewing() || a.links_page() {
+        let enabled = if a.links_page() { a.can_download() } else { a.can_add() };
         widgets::button(p, l.cancel, &["Cancel"], ui.hover == AddHit::Cancel, focused(AddFocus::Cancel));
-        widgets::primary_button(p, l.add, &a.add_label(), a.can_add(), ui.hover == AddHit::Add, focused(AddFocus::Add));
+        widgets::primary_button(p, l.add, &a.add_label(), enabled, ui.hover == AddHit::Add, focused(AddFocus::Add));
     }
 
     p.stroke(Rect::new(0.0, 0.0, l.width, l.height), 8.0, 1.0, BORDER);
@@ -357,6 +490,7 @@ fn start(p: &Painter, l: &AddLayout, ui: &AddUi, ring: &dyn Fn(AddFocus, Rect, f
     for (r, (title, small), hit, focus) in [
         (l.choose_files, CHOOSE_FILES, AddHit::ChooseFiles, AddFocus::ChooseFiles),
         (l.import_existing, IMPORT_EXISTING, AddHit::ImportExisting, AddFocus::ImportExisting),
+        (l.download_twitter, DOWNLOAD_TWITTER, AddHit::DownloadTwitter, AddFocus::DownloadTwitter),
     ] {
         let hovered = ui.hover == hit;
         p.fill(r, 12.0, if hovered { RAISED } else { SURFACE });
@@ -424,5 +558,67 @@ fn review(p: &Painter, a: &AddMedia, l: &AddLayout, ui: &AddUi, ring: &dyn Fn(Ad
     if a.editable() {
         let focus = a.focus_visible && a.focus == AddFocus::ChooseAgain;
         widgets::button(p, l.choose_again, &["Choose again"], ui.hover == AddHit::ChooseAgain, focus);
+    }
+}
+
+fn links_page(p: &Painter, a: &AddMedia, l: &AddLayout, ui: &AddUi, ring: &dyn Fn(AddFocus, Rect, f32)) {
+    p.text("Post links", l.links_label, TextStyle::Medium, TEXT, Align::Start, true);
+    let editable = a.links_editable();
+    for (i, (field, g)) in a.links.iter().zip(&l.links).enumerate() {
+        if g.input.bottom() < l.main.y || g.input.y > l.main.bottom() {
+            continue;
+        }
+        let input = g.input;
+        let focused = editable && a.focus == AddFocus::Link(i);
+        p.fill(input, widgets::RADIUS, FIELD);
+        let text_r = Rect::new(input.x + 10.0, input.y, input.w - 20.0, input.h);
+        let shift = if focused { ui.text_shift } else { 0.0 };
+        p.push_clip(text_r);
+        if field.is_empty() {
+            p.text(LINK_PLACEHOLDER, Rect::new(text_r.x, text_r.y, 10_000.0, text_r.h), TextStyle::Row, SUBTLE, Align::Start, true);
+        } else {
+            if focused && field.all_selected() {
+                p.fill(Rect::new(text_r.x - shift, input.y + 8.0, ui.selection_w, input.h - 16.0), 0.0, ACCENT.alpha(0.35));
+            }
+            let c = if editable { TEXT } else { MUTED };
+            p.text(field.text(), Rect::new(text_r.x - shift, text_r.y, 10_000.0, text_r.h), TextStyle::Row, c, Align::Start, true);
+        }
+        p.pop_clip();
+        if g.error.is_some() {
+            p.stroke(input, widgets::RADIUS, 1.5, ERROR);
+        } else if focused {
+            p.stroke(input, widgets::RADIUS, 2.0, ACCENT);
+        }
+        if focused {
+            let x = (text_r.x + ui.caret_x - shift).round() + 0.5;
+            p.line(x, input.y + 9.0, x, input.bottom() - 9.0, 1.0, TEXT);
+        }
+        if let Some((r, m)) = &g.error {
+            p.text_wrapped(m, r.x, r.y, r.w, TextStyle::Small, ERROR);
+        }
+        if let Some(r) = g.remove {
+            widgets::close_button(p, r, ui.hover == AddHit::RemoveLink(i), false);
+            ring(AddFocus::RemoveLink(i), r, widgets::RADIUS);
+        }
+    }
+    if let Some(r) = l.add_link {
+        widgets::button(p, r, &[ADD_LINK], ui.hover == AddHit::AddLink, a.focus_visible && a.focus == AddFocus::AddLink);
+    }
+    if let Some(r) = l.paste_links {
+        widgets::button(p, r, &[PASTE_LINKS], ui.hover == AddHit::PasteLinks, a.focus_visible && a.focus == AddFocus::PasteLinks);
+    }
+    let h = l.links_hint;
+    p.text_wrapped(LINKS_HINT, h.x, h.y, h.w, TextStyle::Small, SUBTLE);
+    if let (Some(r), Some(e)) = (l.links_error, a.error.as_deref()) {
+        p.text_wrapped(e, r.x, r.y, r.w, TextStyle::Small, ERROR);
+    }
+    if let (Some(r), Some(status)) = (l.status, a.download_status()) {
+        p.text(&status, r, TextStyle::Small, MUTED, Align::Start, true);
+    }
+    if let Some(bar) = l.bar {
+        p.fill(bar, 2.0, RAISED);
+        if let Some(f) = a.download_fraction() {
+            p.fill(Rect::new(bar.x, bar.y, (bar.w * f).max(4.0), bar.h), 2.0, ACCENT);
+        }
     }
 }

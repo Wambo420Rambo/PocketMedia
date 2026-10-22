@@ -36,6 +36,8 @@ pub enum Event {
     Backup { job: u64, progress: crate::backup::Progress },
     /// A Manager rename or move to the Recycle Bin finished (`manager.rs`).
     FileOp { job: u64, done: crate::manager::FileDone },
+    /// Download from Twitter progress or its result (`download.rs`).
+    Download { job: u64, step: crate::download::Step },
 }
 
 impl Event {
@@ -47,7 +49,8 @@ impl Event {
             | Event::Prepared { job, .. }
             | Event::Rescanned { job, .. }
             | Event::Backup { job, .. }
-            | Event::FileOp { job, .. } => *job,
+            | Event::FileOp { job, .. }
+            | Event::Download { job, .. } => *job,
             Event::Watched(_) | Event::WatchStopped(_) => 0,
         }
     }

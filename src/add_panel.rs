@@ -59,6 +59,8 @@ pub struct AddPanel {
     saves: crate::add_media::SaveBatch,
     /// This panel's copies hold back the end of the Windows session.
     blocking: bool,
+    /// The temporary folder of a Twitter download being reviewed or added.
+    download_dir: Option<std::path::PathBuf>,
 }
 
 /// A panel closed before its import reported the end still saves what it recorded.
@@ -68,6 +70,15 @@ impl Drop for AddPanel {
             let _ = library::persist();
         }
         self.block_end_session(false);
+        // A copy may still be reading the downloads: then the next start removes them.
+        if !self.copying()
+            && let Some(dir) = self.download_dir.take()
+        {
+            crate::download::discard(dir);
+        }
+        if let (Some(job), Stage::Downloading { .. }) = (&self.job, self.add.stage) {
+            job.cancel();
+        }
     }
 }
 
@@ -117,6 +128,26 @@ impl AddPanel {
             save_error: None,
             saves: Default::default(),
             blocking: false,
+            download_dir: None,
+        }
+    }
+
+    /// Removes the downloaded files once nothing needs them: the review was
+    /// left, or the import ended.
+    fn tidy(&mut self) {
+        if !self.add.from_download && !self.add.busy()
+            && let Some(dir) = self.download_dir.take()
+        {
+            crate::download::discard(dir);
+        }
+    }
+
+    /// Download pressed on the links page.
+    fn start_download(&mut self) {
+        let Some(links) = self.add.begin_download() else { return };
+        match crate::download::start(links) {
+            Ok(job) => self.job = Some(job),
+            Err(e) => self.add.download_ended(&[], false, Some(e)),
         }
     }
 
@@ -250,6 +281,22 @@ impl AddPanel {
                 }
                 self.add.copied(*index, result);
             }
+            Event::Download { step: crate::download::Step::Progress(p), .. } => self.add.download_progress(*p),
+            Event::Download { step: crate::download::Step::Done(result), .. } => {
+                self.job = None;
+                match result {
+                    Ok(d) if !d.files.is_empty() => {
+                        self.add.download_ended(&d.problems, true, None);
+                        self.download_dir = Some(d.dir.clone());
+                        let outcome = self.picked(Some(Source::Files(d.files.clone())));
+                        self.tidy();
+                        return outcome;
+                    }
+                    Ok(d) => self.add.download_ended(&d.problems, false, None),
+                    Err(e) if e == crate::http::STOPPED => self.add.download_ended(&[], false, None),
+                    Err(e) => self.add.download_ended(&[], false, Some(e.clone())),
+                }
+            }
             Event::Prepared { .. }
             | Event::Watched(_)
             | Event::WatchStopped(_)
@@ -266,9 +313,11 @@ impl AddPanel {
                 if let Some(e) = self.save_error.take() {
                     status = format!("{status} Warning: {e}.");
                 }
+                self.tidy();
                 return AddOutcome::Imported(status);
             }
         }
+        self.tidy();
         AddOutcome::None
     }
 
@@ -284,13 +333,20 @@ impl AddPanel {
             job.cancel();
         }
         match self.add.stage {
+            Stage::Scanning if self.add.from_download => {
+                self.job = None;
+                self.add.back_to_links();
+            }
             Stage::Scanning => {
                 self.job = None;
                 self.add.reset();
             }
+            // The worker removes what it saved, then reports; the links stay.
+            Stage::Downloading { .. } => self.add.stop_download(),
             Stage::Copying { .. } => self.add.stop(),
             _ => {}
         }
+        self.tidy();
     }
 
     pub fn layout(&self, gfx: &Gfx, area: Area) -> AddLayout {
@@ -310,15 +366,23 @@ impl AddPanel {
                 let name = &self.add.rows[i].name;
                 (gfx.caret_x(name.text(), TextStyle::Row, name.caret_utf16()), gfx.measure(name.text(), TextStyle::Row))
             }
+            AddFocus::Link(i) if i < self.add.links.len() => {
+                let link = &self.add.links[i];
+                (gfx.caret_x(link.text(), TextStyle::Row, link.caret_utf16()), gfx.measure(link.text(), TextStyle::Row))
+            }
             _ => (0.0, 0.0),
         };
-        let ui = AddUi { hover: self.hover, caret_x, selection_w };
+        let text_shift = match self.add.focus {
+            AddFocus::Link(i) => link_shift(&l, i, caret_x),
+            _ => 0.0,
+        };
+        let ui = AddUi { hover: self.hover, caret_x, selection_w, text_shift };
         let _ = gfx.draw(hwnd, dpi, None, |p| add_view::paint(p, &self.add, &l, &ui));
     }
 
     /// The mouse cursor should be an I-beam (over a name field).
     pub fn text_hover(&self) -> bool {
-        matches!(self.hover, AddHit::RowInput(_))
+        matches!(self.hover, AddHit::RowInput(_) | AddHit::LinkInput(_))
     }
 
     pub fn clear_hover(&mut self) {
@@ -357,18 +421,39 @@ impl AddPanel {
                 name.set_caret_utf16(pos);
                 AddOutcome::None
             }
-            AddHit::None | AddHit::Main | AddHit::RowInput(_) => AddOutcome::None,
+            AddHit::LinkInput(i) if a.links_editable() => {
+                let shift = match a.focus {
+                    AddFocus::Link(f) if f == i => {
+                        let link = &a.links[i];
+                        link_shift(&l, i, gfx.caret_x(link.text(), TextStyle::Row, link.caret_utf16()))
+                    }
+                    _ => 0.0,
+                };
+                a.focus = AddFocus::Link(i);
+                let input_x = l.links.get(i).map_or(0.0, |g| g.input.x + 10.0);
+                let link = &mut a.links[i];
+                let pos = gfx.position_at(link.text(), TextStyle::Row, x - input_x + shift);
+                link.set_caret_utf16(pos);
+                a.check_links();
+                AddOutcome::None
+            }
+            AddHit::None | AddHit::Main | AddHit::RowInput(_) | AddHit::LinkInput(_) => AddOutcome::None,
             other => {
                 a.focus = match other {
                     AddHit::Close => AddFocus::Close,
                     AddHit::Back => AddFocus::Back,
                     AddHit::ChooseFiles => AddFocus::ChooseFiles,
                     AddHit::ImportExisting => AddFocus::ImportExisting,
+                    AddHit::DownloadTwitter => AddFocus::DownloadTwitter,
+                    AddHit::RemoveLink(i) => AddFocus::RemoveLink(i),
+                    AddHit::AddLink => AddFocus::AddLink,
+                    AddHit::PasteLinks => AddFocus::PasteLinks,
                     AddHit::ChooseAgain => AddFocus::ChooseAgain,
                     AddHit::Cancel => AddFocus::Cancel,
                     AddHit::Remove(i) => AddFocus::Remove(i),
                     _ => AddFocus::Add,
                 };
+                a.check_links();
                 self.pressed = other;
                 AddOutcome::Capture(true)
             }
@@ -408,8 +493,18 @@ impl AddPanel {
                 }
             }
             AddHit::Cancel => return AddOutcome::Leave,
+            AddHit::Back if a.stage == Stage::Links => a.reset(),
             AddHit::Back if !a.reviewing() => return AddOutcome::Leave,
+            AddHit::Back | AddHit::ChooseAgain if a.from_download => a.back_to_links(),
             AddHit::Back | AddHit::ChooseAgain => a.reset(),
+            AddHit::DownloadTwitter => a.open_links(),
+            AddHit::AddLink if a.links_editable() => a.add_link(),
+            AddHit::RemoveLink(i) => a.remove_link(i),
+            AddHit::PasteLinks if a.links_editable() => {
+                a.paste_target();
+                return AddOutcome::PasteText;
+            }
+            AddHit::Add if a.links_page() => self.start_download(),
             AddHit::Remove(i) if a.editable() => library::with(|lib| a.remove(i, &lib.names())),
             AddHit::ChooseFiles => return AddOutcome::Pick(Pick::Files),
             AddHit::ImportExisting => return AddOutcome::Pick(Pick::Folder),
@@ -425,6 +520,7 @@ impl AddPanel {
             }
             _ => {}
         }
+        self.tidy();
         self.clamp_scroll(gfx, area, true);
         AddOutcome::None
     }
@@ -432,16 +528,73 @@ impl AddPanel {
     pub fn key(&mut self, gfx: &Gfx, area: Area, vk: VIRTUAL_KEY, ctrl: bool, shift: bool) -> AddOutcome {
         if vk == VK_ESCAPE {
             if self.add.busy() {
-                let scanning = self.add.stage == Stage::Scanning;
+                let scanning = self.add.stage == Stage::Scanning && !self.add.from_download;
                 self.stop();
                 return if scanning { AddOutcome::Leave } else { AddOutcome::None };
             }
             return AddOutcome::Leave;
         }
         let editable = self.add.editable();
+        let links_editable = self.add.links_editable();
         let a = &mut self.add;
         match (vk, a.focus) {
             (VK_TAB, _) => a.tab(shift),
+            (VK_RETURN, AddFocus::Link(_)) if links_editable => {
+                a.check_links();
+                return self.activate(gfx, area, AddHit::Add);
+            }
+            (_, AddFocus::Link(i)) if links_editable && i < a.links.len() => {
+                let f = &mut a.links[i];
+                let edited = match vk {
+                    VK_LEFT => {
+                        f.left();
+                        false
+                    }
+                    VK_RIGHT => {
+                        f.right();
+                        false
+                    }
+                    VK_HOME => {
+                        f.home();
+                        false
+                    }
+                    VK_END => {
+                        f.end();
+                        false
+                    }
+                    VK_A if ctrl => {
+                        f.select_all();
+                        false
+                    }
+                    VK_BACK if ctrl => {
+                        f.delete_word_back();
+                        true
+                    }
+                    VK_BACK => {
+                        f.backspace();
+                        true
+                    }
+                    VK_DELETE => {
+                        f.delete();
+                        true
+                    }
+                    VK_V if ctrl => return AddOutcome::PasteText,
+                    VK_UP if i > 0 => {
+                        a.focus = AddFocus::Link(i - 1);
+                        a.check_links();
+                        false
+                    }
+                    VK_DOWN if i + 1 < a.links.len() => {
+                        a.focus = AddFocus::Link(i + 1);
+                        a.check_links();
+                        false
+                    }
+                    _ => false,
+                };
+                if edited {
+                    a.link_edited(i, false);
+                }
+            }
             (_, AddFocus::Row(i)) if editable => {
                 let f = &mut a.rows[i].name;
                 // Caret moves leave the name as it is; edits re-validate the batch.
@@ -501,6 +654,11 @@ impl AddPanel {
                     AddFocus::Back => AddHit::Back,
                     AddFocus::ChooseFiles => AddHit::ChooseFiles,
                     AddFocus::ImportExisting => AddHit::ImportExisting,
+                    AddFocus::DownloadTwitter => AddHit::DownloadTwitter,
+                    AddFocus::RemoveLink(i) => AddHit::RemoveLink(i),
+                    AddFocus::AddLink => AddHit::AddLink,
+                    AddFocus::PasteLinks => AddHit::PasteLinks,
+                    AddFocus::Link(_) => AddHit::None,
                     AddFocus::ChooseAgain => AddHit::ChooseAgain,
                     AddFocus::Cancel => AddHit::Cancel,
                     AddFocus::Add => AddHit::Add,
@@ -518,6 +676,9 @@ impl AddPanel {
     /// Typed or pasted text for the focused name field.
     pub fn insert(&mut self, text: &str) {
         let a = &mut self.add;
+        if let (AddFocus::Link(i), true) = (a.focus, a.links_editable()) {
+            return a.insert_links(i, text);
+        }
         if let (AddFocus::Row(i), true) = (a.focus, a.editable()) {
             a.rows[i].name.insert(text);
             library::with(|lib| a.edited(i, &lib.names()));
@@ -546,6 +707,8 @@ impl AddPanel {
             "screen=add stage={} can_add={} label={:?} summary={:?} error={:?} notice={:?} rows={}",
             match a.stage {
                 Stage::Start => "start",
+                Stage::Links => "links",
+                Stage::Downloading { .. } => "downloading",
                 Stage::Scanning => "scanning",
                 Stage::Review => "review",
                 Stage::Copying { .. } => "copying",
@@ -568,6 +731,11 @@ impl AddPanel {
             AddHit::Back => l.back,
             AddHit::ChooseFiles if !a.reviewing() => l.choose_files,
             AddHit::ImportExisting if !a.reviewing() => l.import_existing,
+            AddHit::DownloadTwitter if a.stage == Stage::Start => l.download_twitter,
+            AddHit::LinkInput(i) => l.links.get(i)?.input,
+            AddHit::RemoveLink(i) => l.links.get(i)?.remove?,
+            AddHit::AddLink => l.add_link?,
+            AddHit::PasteLinks => l.paste_links?,
             AddHit::RowInput(i) => l.rows.get(i)?.input?,
             AddHit::Remove(i) => l.rows.get(i)?.remove?,
             AddHit::ChooseAgain if a.editable() => l.choose_again,
@@ -578,4 +746,10 @@ impl AddPanel {
             _ => return None,
         })
     }
+}
+
+/// How far link `i`'s text moves left so a caret at `caret_x` stays in view.
+fn link_shift(l: &AddLayout, i: usize, caret_x: f32) -> f32 {
+    let visible = l.links.get(i).map_or(0.0, |g| g.input.w - 20.0);
+    (caret_x - visible + 2.0).max(0.0)
 }

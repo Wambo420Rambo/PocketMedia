@@ -23,11 +23,14 @@ mod autostart;
 mod backup;
 mod compose;
 mod dialogs;
+mod download;
 mod drop_target;
 mod digest;
 mod fileops;
 mod gif;
+mod gif_writer;
 mod hotkey;
+mod http;
 mod import;
 mod instance;
 mod jobs;
@@ -56,6 +59,7 @@ mod thumb_store;
 mod thumbs;
 mod transfer;
 mod tray;
+mod twitter;
 mod ui;
 mod video;
 mod visibility;
@@ -274,6 +278,8 @@ fn load_library(media: &std::path::Path) -> (Option<String>, Option<String>) {
     let data = store::with(|s| s.data.clone()).unwrap_or_default();
     let mut lib = library::Library::from_store(&data);
     import::cleanup_partials(media);
+    // Twitter downloads an earlier run did not import (off this thread: it may be large).
+    let _ = std::thread::Builder::new().name("download-cleanup".into()).spawn(download::cleanup_stale);
     let records: Vec<(u32, String)> = lib.items.iter().map(|i| (i.id, i.path.clone())).collect();
     let (orphans, missing) = import::reconcile(media, &records);
     let missing_names: Vec<String> =

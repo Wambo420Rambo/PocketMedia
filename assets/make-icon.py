@@ -12,7 +12,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 FONT = sys.argv[1] if len(sys.argv) > 1 else "/usr/share/fonts/opentype/inter/Inter-Bold.otf"
 ACCENT, INK = (0xAB, 0x93, 0xFF, 255), (0x20, 0x15, 0x33, 255)
 SIZES = [16, 20, 24, 32, 40, 48, 64, 256]
-VERSION = (1, 0, 0, 0)
+VERSION = (1, 1, 0, 0)
 
 def master(s=1024):
     im = Image.new("RGBA", (s, s), (0, 0, 0, 0))

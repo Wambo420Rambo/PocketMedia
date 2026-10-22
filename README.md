@@ -10,7 +10,7 @@ PocketMedia is a small Windows tray app for your own GIFs, pictures and videos. 
 
 ## Download and install
 
-- Download `PocketMedia-Setup-1.0.0.exe` from the [Releases page](https://github.com/Wambo420Rambo/PocketMedia/releases) and run it.
+- Download `PocketMedia-Setup-1.1.0.exe` from the [Releases page](https://github.com/Wambo420Rambo/PocketMedia/releases) and run it.
 - **Needs Windows 11, 64-bit (Intel or AMD).** Setup refuses Windows 10, Arm64 and 32-bit Windows.
 - **The installer is not signed**, so Windows SmartScreen may warn you. Click **More info**, then **Run anyway**. Each release lists the file's SHA-256 checksum, so you can check your download.
 - Setup asks how PocketMedia should behave (see [Settings](#settings-that-matter)), whether to start it with Windows, and where to install it (default `C:\PocketMedia`).
@@ -23,6 +23,7 @@ PocketMedia is a small Windows tray app for your own GIFs, pictures and videos. 
 - **Paste:** click a tile, or press Enter. PocketMedia pastes the original file into the app you were in (Discord, Slack, a browser…).
 - **Drag out:** drag a tile into any app or folder that accepts files. This always copies; it never moves your file.
 - **Add media:** click **Add** in the popup or **Add media** in the Manager. Choose files or a folder (with its subfolders), or drop them on the window. You see a list first, where you can rename files. Identical files are skipped, and a different file with the same name gets a new name like `name (2).gif`. PocketMedia copies the files into its own Media folder; your originals stay where they are.
+- **Download from Twitter:** in Add media, choose **Download from Twitter** and paste one or more links to posts (twitter.com or x.com). PocketMedia downloads each post's pictures (at their original size), videos and GIFs in the best quality the post offers, then shows the same review list as for files. Pictures go to Pictures, videos to Videos; Twitter's GIFs (which Twitter keeps as small videos) are turned back into real .gif files for GIFs.
 - **Manager:** browse everything, rename, open the file's folder, or move a file to the Recycle Bin.
 
 **Supported formats:** `.jpg` `.jpeg` `.png` `.gif` `.mp4`
@@ -63,7 +64,7 @@ Measured from outside the app on the packaged build of PocketMedia (the 1.0.0 co
 
 ## Privacy
 
-PocketMedia never connects to the network. It has no update check, no telemetry and no crash reporting, and it contains no code that opens a network connection. It only reads and writes files on your computer: its own folder, and the files and folders you choose (Add media, Back up library, drag and paste).
+PocketMedia connects to the network only when you use **Download from Twitter**: then it asks Twitter for the posts you pasted and downloads their pictures, videos and GIFs, nothing else. It sends no other data, and it has no update check, no telemetry and no crash reporting. Otherwise it only reads and writes files on your computer: its own folder, and the files and folders you choose (Add media, Back up library, drag and paste). Downloads wait in a temporary folder until they are added, and are removed afterwards.
 
 ## Where your data is kept
 
@@ -92,6 +93,7 @@ Open **Windows Settings → Apps → Installed apps → PocketMedia → Uninstal
 - **Built-in self-test:** the program file also contains PocketMedia's own test code, which makes it about 2.3 MB. It only runs when started with `--self-test`.
 - **Pasting:** PocketMedia can start a paste, but it cannot know whether the other app accepted or uploaded the file. If an app does not take a paste, drag the tile instead.
 - **No automatic updates:** to update, download and run the newer installer.
+- **Download from Twitter:** PocketMedia reads posts through the address Twitter's own embedded posts use. It needs no account, but it is not an official API, so a change on Twitter's side can stop it working until PocketMedia is updated. Only public posts work (not private, deleted or age-restricted ones). A GIF longer than a minute stays a video.
 
 ## Build from source
 
@@ -109,7 +111,7 @@ For the installer, install [Inno Setup](https://jrsoftware.org/isdl.php) 6.3 or 
 ISCC installer\pocketmedia.iss
 ```
 
-This makes `installer\Output\PocketMedia-Setup-1.0.0.exe`.
+This makes `installer\Output\PocketMedia-Setup-1.1.0.exe`.
 
 ## License
 

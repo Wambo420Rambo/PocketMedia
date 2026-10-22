@@ -74,6 +74,10 @@ impl ImportRow {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Stage {
     Start,
+    /// Download from Twitter: the post links.
+    Links,
+    /// Downloading the links' pictures, videos and GIFs (then Scanning, as for chosen files).
+    Downloading { progress: Option<crate::download::Progress>, stopping: bool },
     /// Listing and checking the chosen files.
     Scanning,
     Review,
@@ -120,6 +124,12 @@ pub enum AddFocus {
     Back,
     ChooseFiles,
     ImportExisting,
+    DownloadTwitter,
+    /// A post link's text box, and the × that removes it.
+    Link(usize),
+    RemoveLink(usize),
+    AddLink,
+    PasteLinks,
     Row(usize),
     /// The × that leaves row `i` out of the import.
     Remove(usize),
@@ -139,7 +149,17 @@ pub struct AddMedia {
     /// Shown in the footer on every page, in place of the safety line: something
     /// waits for this panel to close (the uninstaller's Back up library).
     pub notice: Option<String>,
+    /// Download from Twitter: the post links, and why a link was not downloaded.
+    pub links: Vec<TextField>,
+    pub link_errors: Vec<Option<String>>,
+    /// The files under review were downloaded: ← and Choose again go back to
+    /// the links, and nothing is said about originals.
+    pub from_download: bool,
+    /// Links that gave nothing, counted in the review's summary.
+    pub link_failures: usize,
 }
+
+pub const NOT_A_LINK: &str = "Not a link to a post on Twitter.";
 
 /// The uninstaller asked for Back up library while Add media was open.
 pub const BACKUP_WAITS: &str = "Back up library is waiting: finish or cancel Add media first, then choose Back up library in Settings.";
@@ -156,17 +176,34 @@ fn plural(n: usize, word: &str) -> String {
 
 impl AddMedia {
     pub fn new() -> Self {
-        Self { rows: Vec::new(), stage: Stage::Start, focus: AddFocus::ChooseFiles, focus_visible: false, scroll: 0.0, error: None, notice: None }
+        Self {
+            rows: Vec::new(),
+            stage: Stage::Start,
+            focus: AddFocus::ChooseFiles,
+            focus_visible: false,
+            scroll: 0.0,
+            error: None,
+            notice: None,
+            links: Vec::new(),
+            link_errors: Vec::new(),
+            from_download: false,
+            link_failures: 0,
+        }
     }
 
-    /// Any page after the start page.
+    /// The pages about files: checking, review and copying.
     pub fn reviewing(&self) -> bool {
-        self.stage != Stage::Start
+        matches!(self.stage, Stage::Scanning | Stage::Review | Stage::Copying { .. })
+    }
+
+    /// The Download from Twitter page (while editing the links or downloading).
+    pub fn links_page(&self) -> bool {
+        matches!(self.stage, Stage::Links | Stage::Downloading { .. })
     }
 
     /// Work is running on the worker thread.
     pub fn busy(&self) -> bool {
-        matches!(self.stage, Stage::Scanning | Stage::Copying { .. })
+        matches!(self.stage, Stage::Scanning | Stage::Downloading { .. } | Stage::Copying { .. })
     }
 
     /// Names can be edited only while reviewing.
@@ -243,6 +280,225 @@ impl AddMedia {
         self.stage = Stage::Start;
         self.focus = AddFocus::ChooseFiles;
         self.error = None;
+        self.links.clear();
+        self.link_errors.clear();
+        self.from_download = false;
+        self.link_failures = 0;
+    }
+
+    // ---- Download from Twitter ----
+
+    /// Opens the links page, with one empty link to type or paste into.
+    pub fn open_links(&mut self) {
+        self.reset();
+        self.stage = Stage::Links;
+        self.add_link();
+        self.focus_visible = false;
+    }
+
+    /// The review of downloaded files goes back to the links (kept as they were).
+    pub fn back_to_links(&mut self) {
+        self.rows.clear();
+        self.scroll = 0.0;
+        self.error = None;
+        self.from_download = false;
+        self.link_failures = 0;
+        self.stage = Stage::Links;
+        self.focus = AddFocus::Link(0);
+        if self.links.is_empty() {
+            self.add_link();
+        }
+    }
+
+    pub fn links_editable(&self) -> bool {
+        self.stage == Stage::Links
+    }
+
+    /// "Add another link": a new empty row at the end, focused.
+    pub fn add_link(&mut self) {
+        if self.links.len() < crate::twitter::MAX_LINKS {
+            self.links.push(TextField::default());
+            self.link_errors.push(None);
+        }
+        self.focus = AddFocus::Link(self.links.len() - 1);
+    }
+
+    /// The × beside a link. The last link is emptied rather than removed.
+    pub fn remove_link(&mut self, i: usize) {
+        if !self.links_editable() || i >= self.links.len() {
+            return;
+        }
+        self.links.remove(i);
+        self.link_errors.remove(i);
+        if self.links.is_empty() {
+            self.add_link();
+        }
+        self.focus = AddFocus::RemoveLink(i.min(self.links.len() - 1));
+        self.error = None;
+    }
+
+    /// "Paste links": the first empty link takes the clipboard (a new one if
+    /// none is empty). The host then pastes with `insert_links`.
+    pub fn paste_target(&mut self) {
+        match self.links.iter().position(TextField::is_empty) {
+            Some(i) => self.focus = AddFocus::Link(i),
+            None => self.add_link(),
+        }
+    }
+
+    /// Typed or pasted text for link `i`. Several links (separated by spaces or
+    /// line breaks) go one per row: the first into this link (or a new row after
+    /// it when it already holds text), the others into new rows after it.
+    pub fn insert_links(&mut self, i: usize, text: &str) {
+        if !self.links_editable() || i >= self.links.len() {
+            return;
+        }
+        // From pasted text with several words, only the post links are kept.
+        let parts = crate::twitter::split_links(text);
+        let posts: Vec<&String> = parts.iter().filter(|p| crate::twitter::post_id(p).is_some()).collect();
+        if parts.len() <= 1 || posts.is_empty() {
+            self.links[i].insert(text.trim());
+            self.link_edited(i, text.chars().count() > 1);
+            return;
+        }
+        let mut at = i;
+        for (k, part) in posts.into_iter().enumerate() {
+            let keep = k == 0 && (self.links[at].is_empty() || self.links[at].all_selected());
+            if !keep {
+                if self.links.len() >= crate::twitter::MAX_LINKS {
+                    self.error = Some(format!("At most {} links at a time.", crate::twitter::MAX_LINKS));
+                    break;
+                }
+                at += 1;
+                self.links.insert(at, TextField::default());
+                self.link_errors.insert(at, None);
+            }
+            self.links[at].insert(part);
+            self.link_edited(at, true);
+        }
+        self.focus = AddFocus::Link(at);
+    }
+
+    /// Call after link `i` changes. A pasted link is checked at once; while
+    /// typing, the message waits until focus leaves the link (`check_links`).
+    pub fn link_edited(&mut self, i: usize, pasted: bool) {
+        // The text changed, so an earlier message about it no longer applies.
+        if let Some(e) = self.link_errors.get_mut(i) {
+            *e = None;
+        }
+        if pasted {
+            self.check_link(i);
+        }
+        self.error = None;
+    }
+
+    /// Shows or clears "not a link" for link `i` (a download's message stays).
+    fn check_link(&mut self, i: usize) {
+        if let (Some(f), Some(e)) = (self.links.get(i), self.link_errors.get_mut(i)) {
+            let t = f.text().trim();
+            if !t.is_empty() && crate::twitter::post_id(t).is_none() {
+                *e = Some(NOT_A_LINK.into());
+            } else if e.as_deref() == Some(NOT_A_LINK) {
+                *e = None;
+            }
+        }
+    }
+
+    /// Says which links are not post links, except the one being typed in.
+    pub fn check_links(&mut self) {
+        for i in 0..self.links.len() {
+            if self.focus != AddFocus::Link(i) {
+                self.check_link(i);
+            }
+        }
+    }
+
+    /// The links to download: (row, post number), each post once.
+    pub fn valid_links(&self) -> Vec<(usize, u64)> {
+        let mut seen = HashSet::new();
+        self.links
+            .iter()
+            .enumerate()
+            .filter_map(|(i, f)| crate::twitter::post_id(f.text()).map(|id| (i, id)))
+            .filter(|(_, id)| seen.insert(*id))
+            .collect()
+    }
+
+    /// Download is possible: at least one post link and no text that is not one.
+    pub fn can_download(&self) -> bool {
+        self.stage == Stage::Links
+            && !self.valid_links().is_empty()
+            && self.links.iter().all(|f| f.text().trim().is_empty() || crate::twitter::post_id(f.text()).is_some())
+    }
+
+    /// Starts the download stage. Returns the links to download.
+    pub fn begin_download(&mut self) -> Option<Vec<(usize, u64)>> {
+        if !self.can_download() {
+            return None;
+        }
+        self.link_errors.iter_mut().for_each(|e| *e = None);
+        self.error = None;
+        self.stage = Stage::Downloading { progress: None, stopping: false };
+        self.focus = AddFocus::Cancel;
+        Some(self.valid_links())
+    }
+
+    pub fn download_progress(&mut self, p: crate::download::Progress) {
+        if let Stage::Downloading { progress, .. } = &mut self.stage {
+            *progress = Some(p);
+        }
+    }
+
+    /// Cancel while downloading: the worker stops and removes what it saved.
+    pub fn stop_download(&mut self) {
+        if let Stage::Downloading { stopping, .. } = &mut self.stage {
+            *stopping = true;
+        }
+    }
+
+    /// The download ended. `problems`: (link row, why) for links that gave
+    /// nothing. With `files`, the files go on to the review; without, the links
+    /// page shows why (and `message`, a reason for all of them).
+    pub fn download_ended(&mut self, problems: &[(usize, String)], files: bool, message: Option<String>) {
+        self.stage = Stage::Links;
+        for (row, why) in problems {
+            if let Some(e) = self.link_errors.get_mut(*row) {
+                *e = Some(why.clone());
+            }
+        }
+        self.error = message;
+        self.focus = AddFocus::Link(problems.first().map_or(0, |p| p.0).min(self.links.len().saturating_sub(1)));
+        self.from_download = files;
+        self.link_failures = if files { problems.len() } else { 0 };
+    }
+
+    /// The line under the links while downloading.
+    pub fn download_status(&self) -> Option<String> {
+        let Stage::Downloading { progress, stopping } = self.stage else { return None };
+        if stopping {
+            return Some("Stopping…".into());
+        }
+        let Some(p) = progress else { return Some("Finding the posts…".into()) };
+        let post = if p.posts > 1 { format!("Post {} of {} · ", p.post + 1, p.posts) } else { String::new() };
+        let mb = |b: u64| format!("{:.1}", b as f64 / (1024.0 * 1024.0));
+        Some(match (p.converting, p.done, p.total) {
+            (true, ..) => format!("{post}Making the GIF…"),
+            (_, 0, _) => format!("{post}Finding the media…"),
+            (_, done, Some(total)) => format!("{post}Downloading {} of {} MB…", mb(done), mb(total)),
+            (_, done, None) => format!("{post}Downloading {} MB…", mb(done)),
+        })
+    }
+
+    /// How far the current video is, 0 to 1, when its size is known.
+    pub fn download_fraction(&self) -> Option<f32> {
+        match self.stage {
+            Stage::Downloading { progress: Some(p), stopping: false } if !p.converting => {
+                let total = p.total.filter(|t| *t > 0)?;
+                let one = (p.done as f64 / total as f64).min(1.0);
+                Some(((p.post as f64 + one) / p.posts.max(1) as f64) as f32)
+            }
+            _ => None,
+        }
     }
 
     /// The × on a review row: leaves that file out of this import (the row goes).
@@ -350,6 +606,9 @@ impl AddMedia {
             Stage::Copying { done, total, .. } => format!("Adding {} of {total}…", (done + 1).min(total)),
             _ => {
                 let mut text = format!("{} ready to add", self.ready());
+                if self.link_failures > 0 {
+                    text += &format!(" · {} could not be downloaded", plural(self.link_failures, "link"));
+                }
                 let d = self.duplicates();
                 if d > 0 {
                     text += &format!(" · {} skipped", plural(d, "duplicate"));
@@ -370,6 +629,11 @@ impl AddMedia {
     pub fn add_label(&self) -> String {
         match self.stage {
             Stage::Copying { .. } => "Adding…".into(),
+            Stage::Downloading { .. } => "Downloading…".into(),
+            Stage::Links => match self.valid_links().len() {
+                0 | 1 => "Download".into(),
+                n => format!("Download {n} links"),
+            },
             _ => format!("Add {}", plural(self.ready(), "file")),
         }
     }
@@ -443,10 +707,17 @@ impl AddMedia {
             };
             text += &format!(" · {} could not be added ({}: {why})", failed.len(), first.source);
         }
+        if self.link_failures > 0 {
+            text += &format!(" · {} could not be downloaded", plural(self.link_failures, "link"));
+        }
         if stopped {
             text += " · Stopped before the rest";
         }
-        text += " · Originals left where they were.";
+        if self.from_download {
+            text += ".";
+        } else {
+            text += " · Originals left where they were.";
+        }
         self.reset();
         text
     }
@@ -454,7 +725,19 @@ impl AddMedia {
     pub fn focus_order(&self) -> Vec<AddFocus> {
         let mut order = vec![AddFocus::Close, AddFocus::Back];
         match self.stage {
-            Stage::Start => order.extend([AddFocus::ChooseFiles, AddFocus::ImportExisting]),
+            Stage::Start => order.extend([AddFocus::ChooseFiles, AddFocus::ImportExisting, AddFocus::DownloadTwitter]),
+            Stage::Links => {
+                for i in 0..self.links.len() {
+                    order.extend([AddFocus::Link(i), AddFocus::RemoveLink(i)]);
+                }
+                if self.links.len() < crate::twitter::MAX_LINKS {
+                    order.push(AddFocus::AddLink);
+                }
+                order.extend([AddFocus::PasteLinks, AddFocus::Cancel]);
+                if self.can_download() {
+                    order.push(AddFocus::Add);
+                }
+            }
             Stage::Review => {
                 for i in 0..self.rows.len() {
                     if self.rows[i].status == RowStatus::Copy {
@@ -467,7 +750,7 @@ impl AddMedia {
                     order.push(AddFocus::Add);
                 }
             }
-            Stage::Scanning | Stage::Copying { .. } => order.push(AddFocus::Cancel),
+            Stage::Scanning | Stage::Downloading { .. } | Stage::Copying { .. } => order.push(AddFocus::Cancel),
         }
         order
     }
@@ -478,6 +761,7 @@ impl AddMedia {
         let next = if back { (cur + order.len() - 1) % order.len() } else { (cur + 1) % order.len() };
         self.focus = order[next];
         self.focus_visible = true;
+        self.check_links();
     }
 }
 
@@ -705,5 +989,130 @@ mod tests {
         assert!(pos(AddFocus::Row(0)) < pos(AddFocus::Remove(0)));
         assert!(pos(AddFocus::Remove(0)) < pos(AddFocus::Row(1)));
         assert!(order.contains(&AddFocus::Remove(5)), "skipped rows have an × too");
+    }
+
+    const A: &str = "https://twitter.com/name/status/111";
+    const B: &str = "https://x.com/other/status/222?s=20";
+
+    #[test]
+    fn the_links_page_opens_with_one_empty_link() {
+        let mut a = AddMedia::new();
+        a.open_links();
+        assert_eq!(a.stage, Stage::Links);
+        assert!(a.links_page() && !a.reviewing() && !a.busy());
+        assert_eq!(a.links.len(), 1);
+        assert_eq!(a.focus, AddFocus::Link(0));
+        assert!(!a.can_download());
+        assert_eq!(a.add_label(), "Download");
+    }
+
+    #[test]
+    fn pasting_several_links_fills_one_row_each_and_keeps_only_links() {
+        let mut a = AddMedia::new();
+        a.open_links();
+        a.insert_links(0, &format!("look at this {A}\r\n and {B} too"));
+        assert_eq!(a.links.iter().map(|f| f.text()).collect::<Vec<_>>(), vec![A, B]);
+        assert_eq!(a.focus, AddFocus::Link(1));
+        assert!(a.can_download());
+        assert_eq!(a.add_label(), "Download 2 links");
+        // Into a link that already has text: the new ones go after it.
+        a.focus = AddFocus::Link(0);
+        a.insert_links(0, &format!("{B} {A}"));
+        assert_eq!(a.links.len(), 4);
+        assert_eq!(a.links[1].text(), B);
+        // The same post twice is downloaded once.
+        assert_eq!(a.valid_links(), vec![(0, 111), (1, 222)]);
+    }
+
+    #[test]
+    fn text_without_a_link_stays_in_one_row_and_is_flagged() {
+        let mut a = AddMedia::new();
+        a.open_links();
+        a.insert_links(0, "hello there");
+        assert_eq!(a.links.len(), 1);
+        assert_eq!(a.link_errors[0].as_deref(), Some(NOT_A_LINK));
+        assert!(!a.can_download());
+    }
+
+    #[test]
+    fn a_typed_link_is_checked_when_focus_leaves_it() {
+        let mut a = AddMedia::new();
+        a.open_links();
+        a.insert_links(0, "h");
+        assert_eq!(a.link_errors[0], None, "no message while typing");
+        a.tab(false);
+        assert_eq!(a.link_errors[0].as_deref(), Some(NOT_A_LINK));
+        a.focus = AddFocus::Link(0);
+        a.links[0].select_all();
+        a.insert_links(0, A);
+        assert_eq!(a.link_errors[0], None);
+        assert!(a.can_download());
+    }
+
+    #[test]
+    fn at_most_twenty_links() {
+        let mut a = AddMedia::new();
+        a.open_links();
+        let many: Vec<String> = (1..=25).map(|n| format!("https://x.com/a/status/{n}")).collect();
+        a.insert_links(0, &many.join("\n"));
+        assert_eq!(a.links.len(), crate::twitter::MAX_LINKS);
+        assert!(a.error.is_some());
+        a.add_link();
+        assert_eq!(a.links.len(), crate::twitter::MAX_LINKS);
+        assert!(!a.focus_order().contains(&AddFocus::AddLink));
+    }
+
+    #[test]
+    fn removing_the_last_link_leaves_an_empty_one() {
+        let mut a = AddMedia::new();
+        a.open_links();
+        a.insert_links(0, A);
+        a.remove_link(0);
+        assert_eq!(a.links.len(), 1);
+        assert!(a.links[0].is_empty());
+    }
+
+    #[test]
+    fn a_download_reports_progress_and_problems_per_link() {
+        let mut a = AddMedia::new();
+        a.open_links();
+        a.insert_links(0, &format!("{A} {B}"));
+        assert_eq!(a.begin_download(), Some(vec![(0, 111), (1, 222)]));
+        assert!(a.busy() && a.links_page());
+        assert_eq!(a.focus_order(), vec![AddFocus::Close, AddFocus::Back, AddFocus::Cancel]);
+        assert_eq!(a.download_status().as_deref(), Some("Finding the posts…"));
+        a.download_progress(crate::download::Progress { post: 1, posts: 2, done: 1_048_576, total: Some(4_194_304), converting: false });
+        assert_eq!(a.download_status().as_deref(), Some("Post 2 of 2 · Downloading 1.0 of 4.0 MB…"));
+        assert_eq!(a.download_fraction(), Some(0.625));
+        a.stop_download();
+        assert_eq!(a.download_status().as_deref(), Some("Stopping…"));
+        // One link gave nothing: the other's files go on to the review.
+        a.download_ended(&[(1, crate::twitter::NOTHING.into())], true, None);
+        assert_eq!(a.stage, Stage::Links);
+        assert_eq!(a.link_errors[1].as_deref(), Some(crate::twitter::NOTHING));
+        assert!(a.from_download);
+        assert_eq!(a.link_failures, 1);
+    }
+
+    #[test]
+    fn the_review_of_downloads_goes_back_to_the_links_and_says_nothing_about_originals() {
+        let mut a = review();
+        a.links.push(TextField::default());
+        a.links[0].insert(A);
+        a.link_errors.push(None);
+        a.from_download = true;
+        a.link_failures = 1;
+        assert!(a.summary().contains("1 link could not be downloaded"), "{}", a.summary());
+        a.back_to_links();
+        assert_eq!(a.stage, Stage::Links);
+        assert_eq!(a.links[0].text(), A);
+        assert!(!a.from_download && a.rows.is_empty());
+
+        let mut b = review();
+        b.from_download = true;
+        b.begin_copy().unwrap();
+        let text = b.finish(false);
+        assert!(!text.contains("Originals"), "{text}");
+        assert!(b.links.is_empty() && !b.from_download, "the start page again");
     }
 }
